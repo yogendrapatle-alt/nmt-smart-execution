@@ -1,0 +1,196 @@
+{
+    "Metric Groups": {
+        "PodAndContainerMetrics": {
+            "CPU": {
+                "container_cpu_load_average_10s": 0.15,
+                "container_cpu_system_seconds_total": 60,
+                "container_cpu_user_seconds_total": 120,
+                "container_cpu_cfs_throttled_seconds_total": 5,
+                "container_cpu_cfs_throttled_periods_total": 10
+            },
+            "Memory": {
+                "container_memory_max_usage_bytes": 268435456,
+                "container_memory_usage_bytes": 201326592,
+                "container_memory_working_set_bytes": 150994944,
+                "container_spec_memory_limit_bytes": 536870912
+            },
+            "Disk": {
+                "container_fs_usage_bytes": 104857600,
+                "container_fs_limit_bytes": 1073741824,
+                "container_fs_reads_total": 500,
+                "container_fs_writes_total": 1200
+            },
+            "Network": {
+                "container_network_receive_bytes_total": 104857600,
+                "container_network_receive_packets_total": 25000,
+                "container_network_transmit_bytes_total": 157286400,
+                "container_network_transmit_packets_total": 28000,
+                "container_network_receive_errors_total": 0,
+                "container_network_transmit_errors_total": 0
+            },
+            "Lifecycle": {
+                "container_start_time_seconds": 1721788800,
+                "container_last_seen": 1721792400
+            }
+        },
+        "ContainerSpecMetrics": {
+            "container_spec_cpu_period": 100000,
+            "container_spec_cpu_quota": 50000,
+            "container_spec_cpu_shares": 1024
+        },
+        "PodMetricsAggregated": {
+            "kube_pod_info": 1,
+            "kube_pod_status_phase": "Running",
+            "kube_pod_status_ready": 1,
+            "kube_pod_status_scheduled": 1,
+            "kube_pod_container_status_restarts_total": 0,
+            "kube_pod_container_status_running": 1,
+            "kube_pod_container_status_terminated": 0,
+            "kube_pod_container_status_waiting": 0,
+            "kube_pod_deletion_timestamp": 0
+        },
+        "NodeMetrics": {
+            "node_cpu_seconds_total": 5400,
+            "node_memory_MemAvailable_bytes": 4294967296,
+            "node_memory_MemTotal_bytes": 8589934592,
+            "node_filesystem_size_bytes": 107374182400,
+            "node_filesystem_avail_bytes": 64424509440,
+            "node_disk_io_time_seconds_total": 120,
+            "node_disk_read_bytes_total": 2147483648,
+            "node_disk_written_bytes_total": 3221225472,
+            "node_network_receive_bytes_total": 1073741824,
+            "node_network_transmit_bytes_total": 1073741824
+        },
+        "APIServerMetrics": {
+            "apiserver_request_total": 10000,
+            "apiserver_request_duration_seconds": 0.25,
+            "apiserver_storage_objects": 2500,
+            "apiserver_current_inflight_requests": 15
+        },
+        "SchedulerAndControllerMetrics": {
+            "scheduler_e2e_scheduling_latency_seconds": 0.1,
+            "scheduler_scheduling_attempts_total": 800,
+            "workqueue_depth": 5,
+            "workqueue_queue_duration_seconds": 0.03,
+            "controller_runtime_reconcile_total": 300
+        },
+        "ClusterObjectStateMetrics": {
+            "kube_node_status_condition": "Ready",
+            "kube_node_spec_unschedulable": 0,
+            "kube_pod_container_info": 1,
+            "kube_resourcequota": 0,
+            "kube_namespace_status_phase": "Active"
+        }
+    }
+}
+
+
+
+{
+  "Metric Groups": {
+    "PodAndContainerMetrics": {
+      "CPU": {
+        "metrics": {
+          "container_cpu_load_average_10s": 0.15,
+          "container_cpu_system_seconds_total": 60,
+          "container_cpu_user_seconds_total": 120,
+          "container_cpu_cfs_throttled_seconds_total": 5,
+          "container_cpu_cfs_throttled_periods_total": 10
+        }
+      },
+      "Memory": {
+        "metrics": {
+          "container_memory_max_usage_bytes": 268435456,
+          "container_memory_usage_bytes": 201326592,
+          "container_memory_working_set_bytes": 150994944,
+          "container_spec_memory_limit_bytes": 536870912
+        }
+      },
+      "Disk": {
+        "metrics": {
+          "container_fs_usage_bytes": 104857600,
+          "container_fs_limit_bytes": 1073741824,
+          "container_fs_reads_total": 500,
+          "container_fs_writes_total": 1200
+        }
+      },
+      "Network": {
+        "metrics": {
+          "container_network_receive_bytes_total": 104857600,
+          "container_network_receive_packets_total": 25000,
+          "container_network_transmit_bytes_total": 157286400,
+          "container_network_transmit_packets_total": 28000,
+          "container_network_receive_errors_total": 0,
+          "container_network_transmit_errors_total": 0
+        }
+      },
+      "Lifecycle": {
+        "metrics": {
+          "container_start_time_seconds": 1721788800,
+          "container_last_seen": 1721792400
+        }
+      }
+    },
+    "ContainerSpecMetrics": {
+      "metrics": {
+        "container_spec_cpu_period": 100000,
+        "container_spec_cpu_quota": 50000,
+        "container_spec_cpu_shares": 1024
+      }
+    },
+    "PodMetricsAggregated": {
+      "metrics": {
+        "kube_pod_info": 1,
+        "kube_pod_status_phase": "Running",
+        "kube_pod_status_ready": 1,
+        "kube_pod_status_scheduled": 1,
+        "kube_pod_container_status_restarts_total": 0,
+        "kube_pod_container_status_running": 1,
+        "kube_pod_container_status_terminated": 0,
+        "kube_pod_container_status_waiting": 0,
+        "kube_pod_deletion_timestamp": 0
+      }
+    },
+    "NodeMetrics": {
+      "metrics": {
+        "node_cpu_seconds_total": 5400,
+        "node_memory_MemAvailable_bytes": 4294967296,
+        "node_memory_MemTotal_bytes": 8589934592,
+        "node_filesystem_size_bytes": 107374182400,
+        "node_filesystem_avail_bytes": 64424509440,
+        "node_disk_io_time_seconds_total": 120,
+        "node_disk_read_bytes_total": 2147483648,
+        "node_disk_written_bytes_total": 3221225472,
+        "node_network_receive_bytes_total": 1073741824,
+        "node_network_transmit_bytes_total": 1073741824
+      }
+    },
+    "APIServerMetrics": {
+      "metrics": {
+        "apiserver_request_total": 10000,
+        "apiserver_request_duration_seconds": 0.25,
+        "apiserver_storage_objects": 2500,
+        "apiserver_current_inflight_requests": 15
+      }
+    },
+    "SchedulerAndControllerMetrics": {
+      "metrics": {
+        "scheduler_e2e_scheduling_latency_seconds": 0.1,
+        "scheduler_scheduling_attempts_total": 800,
+        "workqueue_depth": 5,
+        "workqueue_queue_duration_seconds": 0.03,
+        "controller_runtime_reconcile_total": 300
+      }
+    },
+    "ClusterObjectStateMetrics": {
+      "metrics": {
+        "kube_node_status_condition": "Ready",
+        "kube_node_spec_unschedulable": 0,
+        "kube_pod_container_info": 1,
+        "kube_resourcequota": 0,
+        "kube_namespace_status_phase": "Active"
+      }
+    }
+  }
+}
+

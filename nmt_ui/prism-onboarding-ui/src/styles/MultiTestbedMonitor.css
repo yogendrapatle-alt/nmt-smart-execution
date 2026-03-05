@@ -1,0 +1,280 @@
+/* Multi-Testbed Monitor Page Styles */
+
+.multi-testbed-monitor {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 24px;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.loading, .error {
+  text-align: center;
+  padding: 60px;
+  font-size: 18px;
+  color: #64748b;
+}
+
+.status-card {
+  background: white;
+  border: 2px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
+.status-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.status-header h2 {
+  font-size: 20px;
+  font-weight: 600;
+  color: #1e293b;
+  margin: 0;
+}
+
+.status-badge {
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.status-completed {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.status-running {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.status-failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.status-pending {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+/* Progress Section */
+.progress-section {
+  margin-bottom: 24px;
+}
+
+.progress-info {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 14px;
+  color: #64748b;
+}
+
+.progress-percentage {
+  font-size: 20px;
+  font-weight: 700;
+  color: #3b82f6;
+}
+
+.progress-bar {
+  height: 12px;
+  background: #e5e7eb;
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6 0%, #2563eb 100%);
+  transition: width 0.5s ease;
+}
+
+.progress-details {
+  display: flex;
+  gap: 24px;
+  font-size: 14px;
+  color: #64748b;
+}
+
+/* Aggregate Metrics */
+.aggregate-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  padding: 20px;
+  background: #f8fafc;
+  border-radius: 8px;
+}
+
+.metric-item {
+  text-align: center;
+}
+
+.metric-label {
+  font-size: 13px;
+  color: #64748b;
+  margin-bottom: 8px;
+}
+
+.metric-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+/* Monitor Controls */
+.monitor-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 20px;
+  border-top: 1px solid #e5e7eb;
+  margin-top: 20px;
+}
+
+.auto-refresh-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.auto-refresh-toggle input {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+/* Testbed Grid */
+.testbed-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.testbed-card {
+  background: white;
+  border: 2px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 16px;
+  transition: all 0.2s;
+}
+
+.testbed-card.status-completed {
+  border-color: #10b981;
+  background: #f0fdf4;
+}
+
+.testbed-card.status-running {
+  border-color: #3b82f6;
+  background: #eff6ff;
+}
+
+.testbed-card.status-failed {
+  border-color: #ef4444;
+  background: #fef2f2;
+}
+
+.testbed-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.status-icon {
+  font-size: 24px;
+}
+
+.testbed-id {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+  font-family: 'Monaco', monospace;
+}
+
+.testbed-card-body {
+  margin-bottom: 12px;
+}
+
+.testbed-status-text {
+  font-size: 14px;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: capitalize;
+  margin-bottom: 8px;
+}
+
+.testbed-execution-id,
+.testbed-error {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.testbed-error {
+  color: #ef4444;
+}
+
+.btn-small {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+/* Timeline */
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.timeline-item {
+  display: flex;
+  gap: 16px;
+}
+
+.timeline-icon {
+  font-size: 24px;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f8fafc;
+  border-radius: 50%;
+}
+
+.timeline-content {
+  flex: 1;
+}
+
+.timeline-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #1e293b;
+  margin-bottom: 4px;
+}
+
+.timeline-time {
+  font-size: 14px;
+  color: #64748b;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .aggregate-metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  
+  .testbed-grid {
+    grid-template-columns: 1fr;
+  }
+}

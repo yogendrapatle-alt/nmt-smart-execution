@@ -1,0 +1,30 @@
+global:
+  resolve_timeout: 1m
+  slack_api_url: 'YOUR_SLACK_WEBHOOK_URL_HERE'
+
+route:
+
+  group_wait: 0s
+  group_interval: 10s
+  repeat_interval: 3m
+  receiver: 'slack-notifications'
+  routes:
+    - receiver: 'db-webhook'
+
+receivers:
+  - name: 'slack-notifications'
+    slack_configs:
+      - channel: '#ncm_monitoring'
+        send_resolved: false
+        text: |-
+          *[{{ .Status | toUpper }}]* {{ .CommonLabels.alertname }}
+          {{ range .Alerts }}
+          • *Summary:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          *Triggered At:* {{ .StartsAt | date "2006-01-02 15:04:05 MST" }}
+          --------------------------------------------------------------
+          {{ end }}
+  - name: 'db-webhook'
+    webhook_configs:
+      - url: 'http://10.53.61.226:5002/webhook'
+        send_resolved: true

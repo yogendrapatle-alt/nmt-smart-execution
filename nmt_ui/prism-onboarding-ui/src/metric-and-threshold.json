@@ -1,0 +1,77 @@
+{
+  "PodCPUUsage": [
+    "72%"
+  ],
+  "PodMemoryUsage": [
+    "18 GB"
+  ],
+  "NodeCPUUsage": [
+    "85%"
+  ],
+  "NodeMemoryUsage": [
+    "64 GB"
+  ],
+  "LoadAverage": [
+    "2.3"
+  ],
+  "PodRestarts": [
+    "3"
+  ],
+  "ContainerRestarts": [
+    "7"
+  ],
+  "DiskUsage": [
+    "78%"
+  ],
+  "NodeSwapUsage": [
+    "1.2 GB"
+  ],
+  "NodeNetworkUsage": [
+    "1.5 Gbps"
+  ],
+  "DiskIOLatency": [
+    "3.2 ms"
+  ],
+  "NodeStorageUsage": [
+    "2.1 TB"
+  ],
+  "CHCPUUsage": [
+    "68%"
+  ],
+  "CHMemoryUsage": [
+    "22 GB"
+  ],
+  "IDFCPUUsage": [
+    "54%"
+  ],
+  "IDFMemoryUsage": [
+    "16 GB"
+  ],
+  "DiskLatency": [
+    "4.7 ms"
+  ],
+  "NodeReadiness": [
+    "Ready"
+  ],
+  "KubeletCPUUsage": [
+    "12%"
+  ],
+  "KubeletMemoryUsage": [
+    "950 MB"
+  ],
+  "PacketDropRate": [
+    "0.02%"
+  ],
+  "FilesystemErrors": [
+    "0"
+  ],
+  "InodeUsage": [
+    "45%"
+  ],
+  "ContainerCPUThrottling": [
+    "9%"
+  ],
+  "HighCPUThrottling": [
+    "true"
+  ]
+}

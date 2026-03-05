@@ -1,0 +1,141 @@
+{
+  "aiops": {
+    "generate_alerts" : {
+      "alert_count": 250000
+    },
+    "generate_events" : {
+      "event_count": 250000
+    },
+    "generate_audits" : {
+      "audit_count": 250000
+    },
+    "generate_reports" : {
+      "predefined_reports_count": 10,
+      "predefined_instance_count": 10,
+      "user_defined_reports_count": 10,
+      "user_defined_instance_count": 10,
+      "scheduled_reports_count": 10,
+      "scheduled_instance_count": 10,
+      "batch_size": 10
+    },
+    "create_capacity_scenarios": {
+      "Nutanix": 5,
+      "HP": 5,
+      "Lenovo": 5,
+      "Xen": 5,
+      "AWS": 5,
+      "Cisco": 5,
+      "Fujitsu": 5,
+      "IBM": 5,
+      "existing_cluster_scenarios": 5
+    },
+    "create_analysis_sessions" : {
+      "analysis_session_count": 50
+    },
+    "sda_uda_workflow" : {
+      "pc_type":"large",
+      "total_nodes": 5
+    },
+    "vm_efficiency_workflow": {
+      "inactive_vm": 10,
+      "over_provisioned_vm": 10,
+      "constrained_vm": 10
+    },
+    "dynamic_activities_workflow" : {
+      "num_schemas_per_serv" : 10,
+      "num_of_parallel_schemas" : 20,
+      "number_of_audits" : 50,
+      "number_of_events" : 50
+    },
+    "one_click_report_workflow": {
+      "analysis_report_count": 10,
+      "playbook_report_count": 10,
+      "alert_report_count": 10,
+      "event_report_count": 10,
+      "dashboard_report_count": 10,
+      "cluster_report_count": 10,
+      "batch_size": 2
+    },
+    "sql_integration": {
+      "pc_type": "large",
+      "sql_vm_count": 200,
+      "add_sql_instances": false,
+      "test_sql_server_uda_policy": false,
+      "metrics_collection_time": 0
+    },
+    "vc_integration": {
+      "vc_ips": ["10.117.64.68"],
+      "include_vcsim": false,
+      "vcsim_count": 0,
+      "vcsim_cluster_count": 0,
+      "vcsim_node_count": 0,
+      "vcsim_vm_count": 0,
+      "metric_collection_time": 300,
+      "pc_type": "large"
+    }
+  },
+  "self-service": {
+    "blueprint_creation_workflows": {
+      "single_vm_blueprint_creation": {
+        "no_of_blueprints": 2000,
+        "iterations": 5,
+        "batch_size": 10,
+        "spec_file": "st_single_vm_blueprint_spec.json",
+        "vm_type": "single",
+        "bp_name_prefix": "ST_Single_vm_blueprint_",
+        "vlan_name_prefix": "ST_Subnet",
+        "image_prefix": "centos"
+      },
+      "multi_vm_blueprint_creation_service": {
+        "no_of_blueprints": 500,
+        "iterations": 4,
+        "batch_size": 1,
+        "spec_file": "st_multi_vm_blueprint_spec.json",
+        "vm_type": "multi",
+        "bp_name_prefix": "ST_Multi_vm_blueprint_",
+        "vlan_name_prefix": "ST_Subnet",
+        "image_prefix": "centos"
+      },
+      "multi_vm_blueprint_creation_replica": {
+        "no_of_blueprints": 500,
+        "iterations": 4,
+        "batch_size": 1,
+        "spec_file": "multi_vm_blueprint_replica_spec.json",
+        "vm_type": "multi",
+        "bp_name_prefix": "ST_Multi_vm_blueprint_replica_",
+        "vlan_name_prefix": "ST_Subnet",
+        "image_prefix": "centos"
+      },
+      "project_prefix": "ST_Project_"
+    },
+    "runbook_and_endpoint_creation": {
+      "no_of_runbooks": 500,
+      "no_of_endpoints": 500,
+      "endpoint_type_list": ["Linux", "Windows", "HTTP"],
+      "endpoint_urls" : ["https://www.nutanix.dev/"],
+      "runbook_name_prefix": "ST_Runbook_",
+      "endpoint_name_prefix": "ST_Endpoint_",
+      "project_prefix": "ST_Project_"
+    },
+    "library_tasks_and_variables_creation": {
+      "no_of_tasks": 1000,
+      "no_of_variables": 1000,
+      "task_name_prefix": "ST_Task_",
+      "variable_name_prefix": "ST_Variable_",
+      "project_prefix": "ST_Project_"
+    },
+    "accounts_creations": {
+      "duplicate_accounts": true,
+      "ntnx_accounts":{
+        "name": "ST_NTNX_",
+        "no_of_accounts": 95
+      },
+      "no_of_aws_accounts": 1,
+      "no_of_gcp_accounts": 1,
+      "no_of_azure_accounts": 1,
+      "no_of_k8s_accounts": 1,
+      "no_of_vmware_accounts": 1
+    }
+  },
+  "cost-governance": {}
+}

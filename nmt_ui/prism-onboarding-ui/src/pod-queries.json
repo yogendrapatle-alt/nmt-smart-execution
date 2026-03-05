@@ -1,0 +1,14 @@
+{
+  "queries": [
+    "PodCPUUsage",
+    "PodMemoryUsage",
+    "PodRestarts",
+    "ContainerRestarts",
+    "CHCPUUsage",
+    "CHMemoryUsage",
+    "IDFCPUUsage",
+    "IDFMemoryUsage",
+    "ContainerCPUThrottling",
+    "HighCPUThrottling"
+  ]
+}

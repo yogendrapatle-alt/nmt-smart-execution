@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Execution Report — {{ execution_id[:12] }}</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+    <style>
+        :root {
+            --pass: #22c55e; --warn: #f59e0b; --fail: #ef4444;
+            --blue: #3b82f6; --purple: #8b5cf6; --teal: #14b8a6;
+            --dark: #1e293b; --muted: #64748b; --light: #f8fafc;
+            --border: #e2e8f0; --card-shadow: 0 1px 3px rgba(0,0,0,.08);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', -apple-system, system-ui, sans-serif; background: var(--light); color: var(--dark); line-height: 1.6; }
+        .container { max-width: 1280px; margin: 0 auto; padding: 24px; }
+
+        /* Verdict Banner */
+        .verdict-banner { padding: 28px 32px; border-radius: 12px; margin-bottom: 28px; display: flex; align-items: center; gap: 20px; }
+        .verdict-pass { background: linear-gradient(135deg, #dcfce7 0%, #bbf7d0 100%); border-left: 6px solid var(--pass); }
+        .verdict-warn { background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); border-left: 6px solid var(--warn); }
+        .verdict-fail { background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); border-left: 6px solid var(--fail); }
+        .verdict-icon { font-size: 48px; }
+        .verdict-label { font-size: 28px; font-weight: 800; letter-spacing: 1px; }
+        .verdict-summary { color: var(--muted); margin-top: 4px; }
+        .verdict-issues { margin-top: 10px; list-style: none; padding: 0; }
+        .verdict-issues li { padding: 4px 0; color: var(--muted); }
+        .verdict-issues li::before { content: "⚠ "; }
+
+        /* Cards */
+        .card { background: white; border-radius: 12px; box-shadow: var(--card-shadow); border: 1px solid var(--border); margin-bottom: 24px; overflow: hidden; }
+        .card-header { padding: 20px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+        .card-header h2 { font-size: 18px; font-weight: 700; }
+        .card-header .icon { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 20px; color: white; }
+        .card-body { padding: 24px; }
+
+        /* Stat Grid */
+        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .stat-card { background: white; border: 1px solid var(--border); border-radius: 10px; padding: 20px; text-align: center; }
+        .stat-value { font-size: 32px; font-weight: 800; }
+        .stat-label { color: var(--muted); font-size: 13px; font-weight: 600; text-transform: uppercase; margin-top: 4px; }
+
+        /* Tables */
+        table { width: 100%; border-collapse: collapse; }
+        th { background: #f1f5f9; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; padding: 12px 16px; text-align: left; position: sticky; top: 0; }
+        td { padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 14px; }
+        tr:hover { background: #f8fafc; }
+
+        /* Badges */
+        .badge { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; }
+        .badge-pass { background: #dcfce7; color: #166534; }
+        .badge-warn { background: #fef3c7; color: #92400e; }
+        .badge-fail { background: #fee2e2; color: #991b1b; }
+        .badge-info { background: #dbeafe; color: #1e40af; }
+        .badge-high { background: #fee2e2; color: #991b1b; }
+        .badge-medium { background: #fef3c7; color: #92400e; }
+        .badge-low { background: #dcfce7; color: #166534; }
+
+        /* Charts */
+        .chart-container { position: relative; width: 100%; height: 380px; margin: 16px 0; }
+
+        /* Spike Cards */
+        .spike-card { border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 16px; background: #fefce8; }
+        .spike-card.high { border-left: 4px solid var(--fail); background: #fef2f2; }
+        .spike-card.medium { border-left: 4px solid var(--warn); background: #fffbeb; }
+        .spike-card.low { border-left: 4px solid var(--pass); background: #f0fdf4; }
+        .spike-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        .spike-title { font-weight: 700; font-size: 16px; }
+        .spike-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+        .spike-detail-item { }
+        .spike-detail-label { font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; }
+        .spike-detail-value { font-size: 15px; font-weight: 600; }
+        .spike-pods { margin-top: 12px; }
+        .spike-ops { margin-top: 12px; }
+
+        /* Heatmap */
+        .heatmap-table td { text-align: center; font-size: 12px; min-width: 70px; }
+        .heatmap-cell { border-radius: 4px; padding: 6px; }
+
+        /* Stability */
+        .stability-bar { height: 8px; border-radius: 4px; background: #e2e8f0; overflow: hidden; }
+        .stability-fill { height: 100%; border-radius: 4px; transition: width .3s; }
+
+        /* Sections */
+        .section-title { font-size: 14px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px; }
+
+        /* Collapsible */
+        .collapsible-header { cursor: pointer; user-select: none; }
+        .collapsible-header::after { content: " ▼"; font-size: 12px; }
+        .collapsible-content { display: none; }
+        .collapsible-content.open { display: block; }
+
+        /* Print */
+        @media print {
+            body { background: white; }
+            .no-print { display: none; }
+            .card { break-inside: avoid; box-shadow: none; }
+            .chart-container { height: 300px; }
+        }
+
+        /* Footer */
+        .report-footer { text-align: center; color: var(--muted); padding: 32px; font-size: 13px; }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <!-- VERDICT BANNER -->
+    <div class="verdict-banner verdict-{{ verdict.result|lower }}">
+        <div class="verdict-icon">
+            {% if verdict.result == 'PASS' %}✅{% elif verdict.result == 'WARN' %}⚠️{% else %}❌{% endif %}
+        </div>
+        <div>
+            <div class="verdict-label">{{ verdict.result }}</div>
+            <div class="verdict-summary">{{ verdict.summary }}</div>
+            {% if verdict.issues %}
+            <ul class="verdict-issues">
+                {% for issue in verdict.issues %}
+                <li>{{ issue }}</li>
+                {% endfor %}
+            </ul>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- EXECUTIVE SUMMARY -->
+    <div class="stat-grid">
+        <div class="stat-card">
+            <div class="stat-value" style="color: var(--blue);">{{ total_operations }}</div>
+            <div class="stat-label">Total Operations</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color: {% if success_rate > 90 %}var(--pass){% elif success_rate > 70 %}var(--warn){% else %}var(--fail){% endif %};">{{ success_rate|round(1) }}%</div>
+            <div class="stat-label">Success Rate</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color: var(--teal);">{{ duration_minutes|round(1) }}m</div>
+            <div class="stat-label">Duration</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color: var(--purple);">{{ ops_per_minute|round(1) }}</div>
+            <div class="stat-label">Ops / Min</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color: var(--fail);">{{ spike_analysis.total_spikes }}</div>
+            <div class="stat-label">Metric Spikes</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color: {% if verdict.oom_kills > 0 %}var(--fail){% else %}var(--pass){% endif %};">{{ verdict.oom_kills }}</div>
+            <div class="stat-label">OOM Kills</div>
+        </div>
+    </div>
+
+    <!-- EXECUTION INFO -->
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #667eea, #764ba2);">🔧</div>
+            <h2>Execution Details</h2>
+        </div>
+        <div class="card-body">
+            <table>
+                <tr><td style="width:200px;font-weight:600;">Execution ID</td><td><code>{{ execution_id }}</code></td></tr>
+                <tr><td style="font-weight:600;">Testbed</td><td>{{ testbed_label }}</td></tr>
+                <tr><td style="font-weight:600;">Status</td><td><span class="badge badge-{% if status == 'COMPLETED' %}pass{% elif status == 'FAILED' %}fail{% else %}warn{% endif %}">{{ status }}</span></td></tr>
+                <tr><td style="font-weight:600;">Period</td><td>{{ timestamp }}</td></tr>
+                <tr><td style="font-weight:600;">Target CPU</td><td>{{ target_config.get('cpu_threshold', 'N/A') }}%</td></tr>
+                <tr><td style="font-weight:600;">Target Memory</td><td>{{ target_config.get('memory_threshold', 'N/A') }}%</td></tr>
+                <tr><td style="font-weight:600;">Stop Condition</td><td>{{ target_config.get('stop_condition', 'any')|upper }}</td></tr>
+            </table>
+        </div>
+    </div>
+
+    <!-- METRICS TIMELINE WITH OPERATIONS -->
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #3b82f6, #1d4ed8);">📈</div>
+            <h2>Metrics Timeline with Operation Events</h2>
+        </div>
+        <div class="card-body">
+            <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">
+                CPU &amp; Memory over time. Vertical markers show when operations executed. Red markers = failures. Hover for details.
+            </p>
+            <div class="chart-container">
+                <canvas id="timelineChart"></canvas>
+            </div>
+            <table style="margin-top:16px;">
+                <tr>
+                    <th>Metric</th><th>Baseline</th><th>Final</th><th>Change</th>
+                </tr>
+                <tr>
+                    <td><strong>CPU</strong></td>
+                    <td>{{ baseline_metrics.get('cpu_percent', 0)|round(1) }}%</td>
+                    <td>{{ final_metrics.get('cpu_percent', 0)|round(1) }}%</td>
+                    <td style="color: {% if (final_metrics.get('cpu_percent', 0) - baseline_metrics.get('cpu_percent', 0)) > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:700;">
+                        {{ (final_metrics.get('cpu_percent', 0) - baseline_metrics.get('cpu_percent', 0))|round(1) }}%
+                    </td>
+                </tr>
+                <tr>
+                    <td><strong>Memory</strong></td>
+                    <td>{{ baseline_metrics.get('memory_percent', 0)|round(1) }}%</td>
+                    <td>{{ final_metrics.get('memory_percent', 0)|round(1) }}%</td>
+                    <td style="color: {% if (final_metrics.get('memory_percent', 0) - baseline_metrics.get('memory_percent', 0)) > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:700;">
+                        {{ (final_metrics.get('memory_percent', 0) - baseline_metrics.get('memory_percent', 0))|round(1) }}%
+                    </td>
+                </tr>
+            </table>
+        </div>
+    </div>
+
+    <!-- AI SPIKE ANALYSIS -->
+    {% if spike_analysis.spikes %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">🔍</div>
+            <h2>AI Spike Analysis ({{ spike_analysis.total_spikes }} detected)</h2>
+        </div>
+        <div class="card-body">
+            <div class="stat-grid" style="margin-bottom: 20px;">
+                <div class="stat-card">
+                    <div class="stat-value" style="color:var(--fail);">{{ spike_analysis.high_risk_count }}</div>
+                    <div class="stat-label">High Risk</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" style="color:var(--warn);">{{ spike_analysis.medium_risk_count }}</div>
+                    <div class="stat-label">Medium Risk</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" style="color:var(--teal);">{{ spike_analysis.avg_recovery_minutes }}m</div>
+                    <div class="stat-label">Avg Recovery</div>
+                </div>
+            </div>
+
+            {% for spike in spike_analysis.spikes[:15] %}
+            <div class="spike-card {{ spike.risk_level }}">
+                <div class="spike-header">
+                    <div class="spike-title">Spike #{{ spike.spike_number }} — Iteration {{ spike.iteration }}</div>
+                    <span class="badge badge-{{ spike.risk_level }}">{{ spike.risk_level|upper }} RISK</span>
+                </div>
+                <div class="spike-details">
+                    <div class="spike-detail-item">
+                        <div class="spike-detail-label">CPU Change</div>
+                        <div class="spike-detail-value" style="color:{% if spike.cpu_delta > 0 %}var(--fail){% else %}var(--pass){% endif %}">
+                            {{ spike.cpu_before|round(1) }}% → {{ spike.cpu_after|round(1) }}% ({{ '%+.1f'|format(spike.cpu_delta) }}%)
+                        </div>
+                    </div>
+                    <div class="spike-detail-item">
+                        <div class="spike-detail-label">Memory Change</div>
+                        <div class="spike-detail-value" style="color:{% if spike.memory_delta > 0 %}var(--fail){% else %}var(--pass){% endif %}">
+                            {{ spike.memory_before|round(1) }}% → {{ spike.memory_after|round(1) }}% ({{ '%+.1f'|format(spike.memory_delta) }}%)
+                        </div>
+                    </div>
+                    {% if spike.recovery_minutes %}
+                    <div class="spike-detail-item">
+                        <div class="spike-detail-label">Recovery Time</div>
+                        <div class="spike-detail-value">{{ spike.recovery_minutes }} min</div>
+                    </div>
+                    {% endif %}
+                    {% if spike.ml_prediction and spike.ml_prediction.model_available %}
+                    <div class="spike-detail-item">
+                        <div class="spike-detail-label">ML Predicted Impact</div>
+                        <div class="spike-detail-value">CPU: {{ '%+.1f'|format(spike.ml_prediction.predicted_cpu_impact) }}% | Mem: {{ '%+.1f'|format(spike.ml_prediction.predicted_memory_impact) }}%</div>
+                    </div>
+                    {% endif %}
+                </div>
+
+                {% if spike.causal_operations %}
+                <div class="spike-ops">
+                    <div class="spike-detail-label" style="margin-bottom:6px;">Causal Operations ({{ spike.causal_operations|length }})</div>
+                    <table>
+                        <tr><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Timing</th></tr>
+                        {% for op in spike.causal_operations[:5] %}
+                        <tr>
+                            <td>{{ op.entity_type }}</td>
+                            <td>{{ op.operation }}</td>
+                            <td><code>{{ op.entity_name[:40] }}</code></td>
+                            <td><span class="badge badge-{% if op.status == 'SUCCESS' %}pass{% else %}fail{% endif %}">{{ op.status }}</span></td>
+                            <td>{{ op.seconds_before_spike }}s before spike</td>
+                        </tr>
+                        {% endfor %}
+                    </table>
+                </div>
+                {% endif %}
+
+                {% if spike.affected_pods %}
+                <div class="spike-pods">
+                    <div class="spike-detail-label" style="margin-bottom:6px;">Most Affected Pods</div>
+                    <table>
+                        <tr><th>Pod</th><th>Namespace</th><th>CPU Δ</th><th>Memory Δ</th><th>Impact</th></tr>
+                        {% for pod in spike.affected_pods[:5] %}
+                        <tr>
+                            <td><code>{{ pod.pod_name[:35] }}</code></td>
+                            <td>{{ pod.namespace }}</td>
+                            <td style="color:{% if pod.cpu_delta > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:600;">{{ '%+.2f'|format(pod.cpu_delta) }}%</td>
+                            <td style="color:{% if pod.memory_delta > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:600;">{{ '%+.2f'|format(pod.memory_delta) }}MB</td>
+                            <td>{{ pod.impact_score }}</td>
+                        </tr>
+                        {% endfor %}
+                    </table>
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- FAILURE ROOT CAUSE ANALYSIS -->
+    {% if failure_analysis.total_failures > 0 %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #ef4444, #b91c1c);">🔴</div>
+            <h2>Failure Root Cause Analysis ({{ failure_analysis.total_failures }} failures in {{ failure_analysis.unique_patterns }} patterns)</h2>
+        </div>
+        <div class="card-body">
+            {% for group in failure_analysis.groups %}
+            <div style="border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:12px; border-left: 4px solid var(--fail);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <strong>{{ group.count }}x — {{ group.entity_types|join(', ') }} {{ group.operations|join(', ') }}</strong>
+                    <span class="badge badge-fail">{{ group.count }} occurrences</span>
+                </div>
+                <div style="color: var(--muted); font-size:13px; margin-bottom:6px;">
+                    <strong>Error:</strong> <code>{{ group.sample_error[:200] }}</code>
+                </div>
+                <div style="background: #fef3c7; padding:8px 12px; border-radius:6px; font-size:13px;">
+                    <strong>Root Cause Hint:</strong> {{ group.root_cause_hint }}
+                </div>
+                {% if group.first_occurrence %}
+                <div style="color:var(--muted); font-size:12px; margin-top:6px;">
+                    First: {{ group.first_occurrence }} | Last: {{ group.last_occurrence }}
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- OPERATION TIMING HEATMAP -->
+    {% if operation_heatmap.buckets %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #8b5cf6, #6d28d9);">🗺️</div>
+            <h2>Operation Timing Heatmap</h2>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--muted); font-size:13px; margin-bottom:12px;">
+                Each cell shows avg duration (seconds). Darker = slower. Red = high failure rate.
+            </p>
+            <div style="overflow-x:auto;">
+                <table class="heatmap-table">
+                    <thead>
+                        <tr>
+                            <th style="min-width:160px;">Entity.Operation</th>
+                            {% for bucket in operation_heatmap.buckets %}
+                            <th>{{ bucket }}</th>
+                            {% endfor %}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for eo in operation_heatmap.entity_ops %}
+                        <tr>
+                            <td style="font-weight:600; font-size:13px;">{{ eo }}</td>
+                            {% for bi in range(operation_heatmap.buckets|length) %}
+                            {% set cell = operation_heatmap.data[eo][bi|string] or operation_heatmap.data[eo][bi] %}
+                            {% if cell and cell.count > 0 %}
+                            {% set intensity = [cell.avg_duration / 120, 1.0]|min %}
+                            {% if cell.failure_rate > 30 %}
+                            <td><div class="heatmap-cell" style="background: rgba(239,68,68,{{ [intensity * 0.8 + 0.2, 1.0]|min }});">
+                                {{ cell.avg_duration }}s<br><small style="font-size:10px;">{{ cell.count }} ops, {{ cell.failure_rate }}% fail</small>
+                            </div></td>
+                            {% else %}
+                            <td><div class="heatmap-cell" style="background: rgba(59,130,246,{{ [intensity * 0.6 + 0.1, 0.8]|min }});">
+                                {{ cell.avg_duration }}s<br><small style="font-size:10px;">{{ cell.count }} ops</small>
+                            </div></td>
+                            {% endif %}
+                            {% else %}
+                            <td><div class="heatmap-cell" style="background: #f1f5f9;">—</div></td>
+                            {% endif %}
+                            {% endfor %}
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- POD STABILITY SCORES -->
+    {% if pod_stability %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #14b8a6, #0d9488);">🛡️</div>
+            <h2>Pod Stability Scores</h2>
+        </div>
+        <div class="card-body">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Pod</th><th>Namespace</th><th>Score</th><th>Restarts</th>
+                        <th>Throttle %</th><th>OOMKill</th><th>Max CPU</th><th>Max Mem</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for pod in pod_stability[:20] %}
+                    <tr>
+                        <td><code>{{ pod.pod_name[:35] }}</code></td>
+                        <td>{{ pod.namespace }}</td>
+                        <td>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                                <div class="stability-bar" style="width:80px;">
+                                    <div class="stability-fill" style="width:{{ pod.stability_score }}%; background: {% if pod.stability_score >= 80 %}var(--pass){% elif pod.stability_score >= 50 %}var(--warn){% else %}var(--fail){% endif %};"></div>
+                                </div>
+                                <strong>{{ pod.stability_score }}/100</strong>
+                            </div>
+                        </td>
+                        <td>{% if pod.restarts > 0 %}<span class="badge badge-fail">{{ pod.restarts }}</span>{% else %}0{% endif %}</td>
+                        <td>{% if pod.cpu_throttle_pct > 10 %}<span class="badge badge-warn">{{ pod.cpu_throttle_pct }}%</span>{% else %}{{ pod.cpu_throttle_pct }}%{% endif %}</td>
+                        <td>{% if pod.oom_killed %}<span class="badge badge-fail">YES</span>{% else %}<span class="badge badge-pass">No</span>{% endif %}</td>
+                        <td>{{ pod.max_cpu_pct }}%</td>
+                        <td>{{ pod.max_memory_mb }}MB</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- CLUSTER HEALTH SNAPSHOT -->
+    {% if cluster_health.collection_status == 'success' %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #06b6d4, #0891b2);">🏥</div>
+            <h2>Cluster Health Snapshot</h2>
+        </div>
+        <div class="card-body">
+            {% if cluster_health.node_conditions %}
+            <div class="section-title">Node Conditions</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Node</th><th>Ready</th><th>Disk Pressure</th><th>Memory Pressure</th><th>PID Pressure</th></tr>
+                {% for node in cluster_health.node_conditions %}
+                <tr>
+                    <td><strong>{{ node.node }}</strong></td>
+                    <td>{% if node.ready %}<span class="badge badge-pass">Ready</span>{% else %}<span class="badge badge-fail">NotReady</span>{% endif %}</td>
+                    <td>{% if node.disk_pressure %}<span class="badge badge-fail">YES</span>{% else %}<span class="badge badge-pass">No</span>{% endif %}</td>
+                    <td>{% if node.memory_pressure %}<span class="badge badge-fail">YES</span>{% else %}<span class="badge badge-pass">No</span>{% endif %}</td>
+                    <td>{% if node.pid_pressure %}<span class="badge badge-fail">YES</span>{% else %}<span class="badge badge-pass">No</span>{% endif %}</td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.cpu_throttling %}
+            <div class="section-title">CPU Throttling (Top Pods)</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Throttle %</th></tr>
+                {% for t in cluster_health.cpu_throttling[:10] %}
+                <tr>
+                    <td><code>{{ t.pod }}</code></td>
+                    <td>{{ t.namespace }}</td>
+                    <td>{{ t.container }}</td>
+                    <td><span class="badge {% if t.throttle_ratio > 30 %}badge-fail{% elif t.throttle_ratio > 10 %}badge-warn{% else %}badge-info{% endif %}">{{ t.throttle_ratio }}%</span></td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.oom_killed %}
+            <div class="section-title">OOMKilled Containers</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Pod</th><th>Namespace</th><th>Container</th></tr>
+                {% for o in cluster_health.oom_killed %}
+                <tr>
+                    <td><code>{{ o.pod }}</code></td>
+                    <td>{{ o.namespace }}</td>
+                    <td>{{ o.container }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.container_restarts %}
+            <div class="section-title">Container Restarts (Last Hour)</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Restarts</th></tr>
+                {% for r in cluster_health.container_restarts[:10] %}
+                <tr>
+                    <td><code>{{ r.pod }}</code></td>
+                    <td>{{ r.namespace }}</td>
+                    <td>{{ r.container }}</td>
+                    <td><span class="badge badge-warn">{{ r.restart_count }}</span></td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.pvc_health %}
+            <div class="section-title">PVC Health (&gt;50% Used)</div>
+            <table>
+                <tr><th>PVC</th><th>Namespace</th><th>Capacity</th><th>Used</th><th>Usage %</th></tr>
+                {% for p in cluster_health.pvc_health %}
+                <tr>
+                    <td><code>{{ p.pvc_name }}</code></td>
+                    <td>{{ p.namespace }}</td>
+                    <td>{{ p.capacity_gb }} GB</td>
+                    <td>{{ p.used_gb }} GB</td>
+                    <td><span class="badge {% if p.usage_percent > 85 %}badge-fail{% elif p.usage_percent > 70 %}badge-warn{% else %}badge-info{% endif %}">{{ p.usage_percent }}%</span></td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- CAPACITY PLANNING -->
+    {% if capacity_planning.available %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #a855f7, #7c3aed);">📐</div>
+            <h2>Capacity Planning Estimate</h2>
+        </div>
+        <div class="card-body">
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-value" style="color:var(--blue);">{{ capacity_planning.total_ops_executed }}</div>
+                    <div class="stat-label">Ops Executed</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" style="color:var(--purple);">{{ capacity_planning.cpu_per_operation }}%</div>
+                    <div class="stat-label">CPU / Operation</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" style="color:var(--teal);">{{ capacity_planning.memory_per_operation }}%</div>
+                    <div class="stat-label">Memory / Operation</div>
+                </div>
+                {% if capacity_planning.estimated_total_capacity_ops %}
+                <div class="stat-card">
+                    <div class="stat-value" style="color:var(--warn);">~{{ capacity_planning.estimated_total_capacity_ops }}</div>
+                    <div class="stat-label">Est. Max Ops</div>
+                </div>
+                {% endif %}
+            </div>
+            <div style="background:#f0f9ff; padding:16px; border-radius:8px; margin-top:8px;">
+                <strong>Bottleneck:</strong> {{ capacity_planning.bottleneck|upper }}<br>
+                <strong>Recommendation:</strong> {{ capacity_planning.recommendation }}
+            </div>
+            {% if capacity_planning.entities_created %}
+            <div style="margin-top:16px;">
+                <div class="section-title">Entities Created</div>
+                <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                    {% for etype, count in capacity_planning.entities_created.items() %}
+                    <div class="badge badge-info">{{ etype }}: {{ count }}</div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- HISTORICAL COMPARISON -->
+    {% if historical_comparison.available %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">📊</div>
+            <h2>Historical Comparison (Last {{ historical_comparison.count }} runs on this testbed)</h2>
+        </div>
+        <div class="card-body">
+            <table>
+                <thead>
+                    <tr><th>Execution</th><th>Status</th><th>Duration</th><th>Total Ops</th><th>Success Rate</th><th>Start CPU</th><th>End CPU</th></tr>
+                </thead>
+                <tbody>
+                    {% for h in historical_comparison.previous_executions %}
+                    <tr>
+                        <td><code>{{ h.execution_id[:12] }}...</code></td>
+                        <td><span class="badge badge-{% if h.status == 'COMPLETED' %}pass{% else %}warn{% endif %}">{{ h.status }}</span></td>
+                        <td>{{ h.duration_minutes }}m</td>
+                        <td>{{ h.total_operations }}</td>
+                        <td>{{ h.success_rate }}%</td>
+                        <td>{{ h.baseline_cpu|round(1) }}%</td>
+                        <td>{{ h.final_cpu|round(1) }}%</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- ENTITY BREAKDOWN -->
+    {% if entity_breakdown %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #10b981, #059669);">📋</div>
+            <h2>Entity Breakdown</h2>
+        </div>
+        <div class="card-body">
+            <table>
+                <thead><tr><th>Entity Type</th><th>Total</th><th>Success</th><th>Failed</th><th>Success Rate</th></tr></thead>
+                <tbody>
+                    {% for etype, stats in entity_breakdown.items() %}
+                    <tr>
+                        <td><strong>{{ etype }}</strong></td>
+                        <td>{{ stats.get('total', 0) }}</td>
+                        <td style="color:var(--pass); font-weight:600;">{{ stats.get('success', 0) }}</td>
+                        <td style="color:var(--fail); font-weight:600;">{{ stats.get('failed', 0) }}</td>
+                        <td>
+                            {% set sr = ((stats.get('success', 0) / [stats.get('total', 1), 1]|max) * 100)|round(1) %}
+                            <span class="badge badge-{% if sr > 90 %}pass{% elif sr > 70 %}warn{% else %}fail{% endif %}">{{ sr }}%</span>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- OPERATION EFFECTIVENESS -->
+    {% if operation_effectiveness %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #6366f1, #4f46e5);">⚡</div>
+            <h2>Most Effective Operations</h2>
+        </div>
+        <div class="card-body">
+            <table>
+                <thead><tr><th>Operation</th><th>Impact Score</th><th>Avg CPU Δ</th><th>Avg Memory Δ</th></tr></thead>
+                <tbody>
+                    {% for eff in operation_effectiveness[:10] %}
+                    <tr>
+                        <td><strong>{{ eff.get('key', eff.get('entity_type', '?') + '.' + eff.get('operation', '?')) }}</strong></td>
+                        <td>{{ eff.get('impact_score', 0)|round(2) }}</td>
+                        <td style="color:{% if eff.get('avg_cpu_delta', 0) > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:600;">
+                            {{ '%+.2f'|format(eff.get('avg_cpu_delta', 0)) }}%
+                        </td>
+                        <td style="color:{% if eff.get('avg_memory_delta', 0) > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:600;">
+                            {{ '%+.2f'|format(eff.get('avg_memory_delta', 0)) }}%
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- FULL OPERATIONS LOG (collapsible) -->
+    <div class="card">
+        <div class="card-header collapsible-header" onclick="toggleSection('ops-log')">
+            <div class="icon" style="background: linear-gradient(135deg, #64748b, #475569);">📝</div>
+            <h2>All Operations ({{ operations_history|length }})</h2>
+        </div>
+        <div id="ops-log" class="collapsible-content">
+            <div class="card-body" style="padding:0;">
+                <div style="max-height:600px; overflow-y:auto;">
+                    <table>
+                        <thead><tr><th>#</th><th>Entity</th><th>Operation</th><th>Name</th><th>Duration</th><th>Status</th></tr></thead>
+                        <tbody>
+                            {% for op in operations_history %}
+                            <tr>
+                                <td>{{ loop.index }}</td>
+                                <td>{{ op.get('entity_type', 'N/A') }}</td>
+                                <td>{{ op.get('operation', 'N/A') }}</td>
+                                <td><code>{{ op.get('entity_name', 'N/A')[:40] }}</code></td>
+                                <td>{{ op.get('duration_seconds', 0)|round(2) }}s</td>
+                                <td><span class="badge badge-{% if op.get('status') == 'SUCCESS' %}pass{% else %}fail{% endif %}">{{ op.get('status', '?') }}</span></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER -->
+    <div class="report-footer">
+        Generated by <strong>NMT Smart Execution Tool (Enhanced AI Report)</strong> — {{ timestamp }}
+    </div>
+</div>
+
+<script>
+function toggleSection(id) {
+    var el = document.getElementById(id);
+    el.classList.toggle('open');
+}
+
+// Build Timeline Chart
+(function() {
+    var metricsHistory = {{ metrics_history_json|safe }};
+    var operationsHistory = {{ operations_history_json|safe }};
+
+    if (!metricsHistory || metricsHistory.length === 0) return;
+
+    var labels = metricsHistory.map(function(m, i) { return 'Iter ' + (m.iteration || i + 1); });
+    var cpuData = metricsHistory.map(function(m) { return m.cpu_percent || 0; });
+    var memData = metricsHistory.map(function(m) { return m.memory_percent || 0; });
+
+    // Build operation annotations
+    var annotations = {};
+    var opIdx = 0;
+    operationsHistory.forEach(function(op) {
+        var opTs = op.timestamp || op.started_at || op.start_time;
+        if (!opTs) return;
+        var opTime = new Date(opTs).getTime();
+
+        // Find closest metric iteration
+        var closestIdx = 0;
+        var closestDiff = Infinity;
+        metricsHistory.forEach(function(m, idx) {
+            var mTime = new Date(m.timestamp).getTime();
+            var diff = Math.abs(mTime - opTime);
+            if (diff < closestDiff) {
+                closestDiff = diff;
+                closestIdx = idx;
+            }
+        });
+
+        if (opIdx < 50) { // limit annotations for performance
+            annotations['op' + opIdx] = {
+                type: 'line',
+                xMin: closestIdx,
+                xMax: closestIdx,
+                borderColor: op.status === 'FAILED' ? 'rgba(239,68,68,0.6)' : 'rgba(59,130,246,0.15)',
+                borderWidth: op.status === 'FAILED' ? 2 : 1,
+                borderDash: op.status === 'FAILED' ? [] : [4, 4],
+                label: {
+                    display: op.status === 'FAILED',
+                    content: op.entity_type + '.' + op.operation,
+                    position: 'start',
+                    font: { size: 9 },
+                    backgroundColor: 'rgba(239,68,68,0.8)',
+                    color: 'white',
+                    padding: 2
+                }
+            };
+        }
+        opIdx++;
+    });
+
+    // Add threshold lines
+    var targetCpu = {{ target_config.get('cpu_threshold', 80) }};
+    var targetMem = {{ target_config.get('memory_threshold', 80) }};
+    annotations['cpuThreshold'] = {
+        type: 'line',
+        yMin: targetCpu, yMax: targetCpu,
+        borderColor: 'rgba(239,68,68,0.4)',
+        borderWidth: 2,
+        borderDash: [8, 4],
+        label: { display: true, content: 'CPU Target ' + targetCpu + '%', position: 'end', font: { size: 10 }, backgroundColor: 'rgba(239,68,68,0.7)' }
+    };
+    annotations['memThreshold'] = {
+        type: 'line',
+        yMin: targetMem, yMax: targetMem,
+        borderColor: 'rgba(245,158,11,0.4)',
+        borderWidth: 2,
+        borderDash: [8, 4],
+        label: { display: true, content: 'Mem Target ' + targetMem + '%', position: 'start', font: { size: 10 }, backgroundColor: 'rgba(245,158,11,0.7)' }
+    };
+
+    var ctx = document.getElementById('timelineChart').getContext('2d');
+    new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: 'CPU %',
+                    data: cpuData,
+                    borderColor: '#3b82f6',
+                    backgroundColor: 'rgba(59,130,246,0.1)',
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 2,
+                    borderWidth: 2
+                },
+                {
+                    label: 'Memory %',
+                    data: memData,
+                    borderColor: '#f59e0b',
+                    backgroundColor: 'rgba(245,158,11,0.1)',
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 2,
+                    borderWidth: 2
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            scales: {
+                y: { min: 0, max: 100, title: { display: true, text: 'Usage %' } },
+                x: { ticks: { maxTicksLimit: 20, font: { size: 10 } } }
+            },
+            plugins: {
+                annotation: { annotations: annotations },
+                legend: { position: 'top' }
+            }
+        }
+    });
+})();
+</script>
+</body>
+</html>

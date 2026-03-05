@@ -1,0 +1,193 @@
+/* Layout Component Styles */
+.sidebar-wrapper {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 260px;
+  height: 100vh;
+  background: #fff;
+  box-shadow: 2px 0 10px rgba(0,0,0,0.05);
+  transition: all 0.3s ease;
+  z-index: 1000;
+  overflow-y: auto;
+  overflow-x: hidden;
+  border-right: 1px solid #e9ecef;
+}
+
+.sidebar-wrapper.closed {
+  left: -260px;
+}
+
+.sidebar-header {
+  padding: 20px;
+  border-bottom: 1px solid #e9ecef;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sidebar-nav {
+  padding: 10px 0;
+}
+
+.sidebar-nav ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.sidebar-nav li {
+  margin: 0;
+}
+
+.sidebar-nav li a {
+  display: flex;
+  align-items: center;
+  padding: 12px 20px;
+  color: #6c757d;
+  text-decoration: none;
+  transition: all 0.2s ease;
+  border-right: 3px solid transparent;
+}
+
+.sidebar-nav li a:hover {
+  background: #f8f9fa;
+  color: #0078d4;
+}
+
+.sidebar-nav li a.active {
+  background: #e6f0fa;
+  color: #0078d4;
+  border-right: 3px solid #0078d4;
+  font-weight: 600;
+}
+
+.sidebar-nav li a i {
+  margin-right: 12px;
+  font-size: 20px;
+  width: 20px;
+  text-align: center;
+}
+
+.menu-label {
+  padding: 20px 20px 8px 20px;
+  font-size: 11px;
+  text-transform: uppercase;
+  color: #adb5bd;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.top-header {
+  position: fixed;
+  top: 0;
+  left: 260px;
+  right: 0;
+  height: 60px;
+  background: #fff;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+  transition: all 0.3s ease;
+  z-index: 999;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  border-bottom: 1px solid #e9ecef;
+}
+
+.top-header.sidebar-closed {
+  left: 0;
+}
+
+.btn-toggle {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 8px;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+.btn-toggle:hover {
+  background: #f8f9fa;
+}
+
+.btn-toggle i {
+  font-size: 24px;
+  color: #6c757d;
+}
+
+.main-wrapper {
+  margin-left: 260px;
+  margin-top: 60px;
+  padding: 12px 16px;
+  min-height: calc(100vh - 60px);
+  background: #f5f7fa;
+  transition: all 0.3s ease;
+}
+
+.main-wrapper.sidebar-closed {
+  margin-left: 0;
+}
+
+.main-content {
+  max-width: 100%;
+  margin: 0 auto;
+}
+
+/* Notification Badge */
+.badge-notify {
+  position: absolute;
+  top: -5px;
+  right: -8px;
+  background: #dc3545;
+  color: #fff;
+  border-radius: 50%;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  border: 2px solid #fff;
+}
+
+/* Card Enhancements */
+.card {
+  margin-bottom: 1.5rem;
+}
+
+/* Breadcrumb Styling */
+.breadcrumb {
+  background: transparent;
+  padding: 0;
+  margin: 0;
+}
+
+.breadcrumb-item a {
+  color: #6c757d;
+  text-decoration: none;
+}
+
+.breadcrumb-item a:hover {
+  color: #0078d4;
+}
+
+.breadcrumb-item.active {
+  color: #212529;
+  font-weight: 500;
+}
+
+/* Ensure smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Make sure modals and overlays work correctly */
+.modal-backdrop {
+  z-index: 1040;
+}
+
+.modal {
+  z-index: 1050;
+}

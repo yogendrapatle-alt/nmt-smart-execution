@@ -1,0 +1,201 @@
+# macOS
+.DS_Store
+.DS_Store?
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+myenv/
+activate/
+entry.sh/
+source/
+virtualenv/
+*.egg-info/
+dist/
+build/
+
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Logs
+*.log
+logs/
+*.local
+nohup.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.temp
+~$*
+*.pem
+
+# Build artifacts
+dist/
+dist-ssr/
+
+# Exclude loadgen folder
+loadgen/
+
+# Exclude vertical-menu folder
+vertical-menu/
+
+# ==========================================
+# Exclude MD files (except README)
+# ==========================================
+*.md
+!README.md
+!PRESENTATION_DOCUMENT.md
+
+# ==========================================
+# Exclude test files
+# ==========================================
+test_*.py
+test_*.sh
+**/test_*.py
+**/test_*.sh
+tests/
+**/tests/
+**/test-results/
+
+# ==========================================
+# Exclude data/export/binary files
+# ==========================================
+*.csv
+*.xlsx
+*.xls
+*.tgz
+*.tar.gz
+*.zip
+*.pkl
+
+# ==========================================
+# Exclude nutest reference folder
+# ==========================================
+nutest-py3-tests/
+
+# ==========================================
+# Exclude old nmt_backend folder (legacy)
+# ==========================================
+nmt_backend/
+
+# ==========================================
+# Exclude runtime-generated data
+# ==========================================
+nmt_ui/prism-onboarding-ui/submitted-rules/
+nmt_ui/prism-onboarding-ui/submitted-testbeds/
+nmt_ui/prism-onboarding-ui/submitted-workloads/
+nmt_ui/prism-onboarding-ui/backend/configs/
+nmt_ui/prism-onboarding-ui/test-custom-script.json
+
+# ==========================================
+# Exclude environment/secrets
+# ==========================================
+.env
+*.env
+
+# ==========================================
+# Exclude runtime JSON artifacts
+# ==========================================
+jita_status.json
+last_filepath.json
+prometheus_port.json
+nmt_ui/prism-onboarding-ui/backend/nmt_config_*.json
+
+# ==========================================
+# Exclude backup/patch files
+# ==========================================
+*_backup.py
+*_broken_backup.py
+*.patch
+
+# ==========================================
+# Root level junk/one-off files
+# ==========================================
+ALL_ENTITY_OPERATIONS.py
+RESTART_AND_TEST.sh
+WEBSOCKET_CODE_ADDITION.tsx
+check_entity_operations.py
+create_alerts_complete.sh
+daily_*.html
+db_data_output.txt
+generate_test_alerts.sh
+k8_cluster_report.html
+fix_prometheus_https.py
+generate_performance_report_v5.py
+optimization_*.json
+optimization_*.txt
+resource_optimizer_*.py
+setup_*.sh
+show_db_data.py
+verify_system_blueprint.sh
+ml_training_samples.csv
+
+# ==========================================
+# nmt_ui root level utility scripts
+# ==========================================
+nmt_ui/test.py
+nmt_ui/update_env_backend_url.py
+nmt_ui/update_vite_env.py
+
+# ==========================================
+# prism-onboarding-ui junk files
+# ==========================================
+nmt_ui/prism-onboarding-ui/1
+nmt_ui/prism-onboarding-ui/debug_email_system.sh
+nmt_ui/prism-onboarding-ui/migrate-to-vm.sh
+nmt_ui/prism-onboarding-ui/setup-test.sh
+nmt_ui/prism-onboarding-ui/vm-setup.sh
+nmt_ui/prism-onboarding-ui/auto-configure.sh
+nmt_ui/prism-onboarding-ui/playwright.config.ts
+
+# ==========================================
+# Backend one-off utility scripts
+# ==========================================
+nmt_ui/prism-onboarding-ui/backend/cleanup_fake_data.py
+nmt_ui/prism-onboarding-ui/backend/complete_test_execution.py
+nmt_ui/prism-onboarding-ui/backend/configure_internal_email.py
+nmt_ui/prism-onboarding-ui/backend/copy_ncm_utils.py
+nmt_ui/prism-onboarding-ui/backend/create_preset_templates.py
+nmt_ui/prism-onboarding-ui/backend/create_smart_execution_with_children.py
+nmt_ui/prism-onboarding-ui/backend/execute_all_operations.py
+nmt_ui/prism-onboarding-ui/backend/execute_operations_with_excel_export.py
+nmt_ui/prism-onboarding-ui/backend/generate_excel_from_db.py
+nmt_ui/prism-onboarding-ui/backend/quick_test_execution.py
+nmt_ui/prism-onboarding-ui/backend/recreate_email_table.py
+nmt_ui/prism-onboarding-ui/backend/run_large_workload.py
+nmt_ui/prism-onboarding-ui/backend/run_quick_batch_workload.py
+nmt_ui/prism-onboarding-ui/backend/simple_image_list_test.py
+nmt_ui/prism-onboarding-ui/backend/verify_all_metrics_endpoints.sh
+nmt_ui/prism-onboarding-ui/backend/run_backen.py
+
+# ==========================================
+# Execution report files
+# ==========================================
+execution_report_*.xlsx
+
+# ==========================================
+# ML model files (binary)
+# ==========================================
+/tmp/nmt_ml_models/

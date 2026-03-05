@@ -1,0 +1,17 @@
+{
+  "queries": [
+    "NodeCPUUsage",
+    "NodeMemoryUsage",
+    "LoadAverage",
+    "DiskUsage",
+    "NodeSwapUsage",
+    "NodeNetworkUsage",
+    "DiskIOLatency",
+    "NodeStorageUsage",
+    "DiskLatency",
+    "NodeReadiness",
+    "KubeletCPUUsage",
+    "KubeletMemoryUsage",
+    "InodeUsage"
+  ]
+}

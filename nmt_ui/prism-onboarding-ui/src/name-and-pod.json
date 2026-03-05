@@ -1,0 +1,92 @@
+
+{
+  "kube-system": [
+    "cloud-controller-manager",
+    "coredns",
+    "kube-apiserver",
+    "kube-flannel-ds",
+    "kube-proxy-ds",
+    "lb-controller-deployment",
+    "mspdns",
+    "mspserviceregistry"
+  ],
+  "ntnx-ikat": [
+    "ikat"
+  ],
+  "ntnx-ncm-aiops": [
+    "neuron",
+    "reports",
+    "sizer",
+    "uda",
+    "vulcan"
+  ],
+  "ntnx-ncm-common": [
+    "aiops-ui",
+    "cfs",
+    "cluster-mgmt",
+    "dcis",
+    "dmis",
+    "dpm",
+    "ergon",
+    "external-notifications-service",
+    "filestore-chakr-cm",
+    "filestore-chakr-db-instance",
+    "insights-collector",
+    "mercury",
+    "msp-prometheus-collector",
+    "ncm-adonis-service",
+    "ncm-backup",
+    "ncm-data-processor",
+    "ncm-dbal-dedupe",
+    "ncm-epsilon",
+    "ncm-migration",
+    "ncm-post-processor",
+    "nutanix-infra-data-receiver",
+    "onboarding-svc",
+    "otel-collector",
+    "search",
+    "signals-manager",
+    "sqlserver",
+    "statsgw",
+    "vcenter",
+    "zeus-collector"
+  ],
+  "ntnx-ncm-datastore": [
+    "altinity-clickhouse-operator",
+    "ch-keeper-pull-image",
+    "ch-server-pull-image",
+    "chakr-cm",
+    "chakr-db-instance",
+    "chi-clickhouse-chcluster1",
+    "chk-clickhouse-keeper-chkeeper",
+    "clickhouse-schema-job",
+    "cpaas-nats",
+    "idf-statefulset",
+    "ncm-postgres",
+    "ss-chakr-cm",
+    "ss-chakr-db-instance",
+    "ss-idf-statefulset",
+    "ss-zk",
+    "zk"
+  ],
+  "ntnx-ncm-self-service": [
+    "insights-collector",
+    "ncm-calm",
+    "ncm-policy",
+    "ncm-tunnel-server"
+  ],
+  "ntnx-system": [
+    "alertmanager-main",
+    "alerts-broker",
+    "csi-node-ntnx-plugin",
+    "csi-provisioner-ntnx-plugin",
+    "fluent-bit",
+    "fluentd-aggregator",
+    "kube-state-metrics",
+    "mutator-webhook-dep",
+    "node-exporter",
+    "ntnx-cluster-maintainer",
+    "ntnx-k8s-cluster-maintainer-operator",
+    "prometheus-k8s"
+  ]
+}

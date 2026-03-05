@@ -1,0 +1,56 @@
+/* Reset and base styles for NMT application */
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  font-family: 'Noto Sans', system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: #f5f7fa;
+  color: #212529;
+  overflow-x: hidden;
+}
+
+#root {
+  min-height: 100vh;
+  width: 100%;
+}
+
+/* Override Bootstrap link colors for better consistency */
+a {
+  color: #0078d4;
+  text-decoration: none;
+}
+a:hover {
+  color: #005a9e;
+  text-decoration: underline;
+}
+
+/* Ensure Material Icons render correctly */
+.material-icons-outlined {
+  font-family: 'Material Icons Outlined';
+  font-weight: normal;
+  font-style: normal;
+  font-size: 24px;
+  display: inline-block;
+  line-height: 1;
+  text-transform: none;
+  letter-spacing: normal;
+  word-wrap: normal;
+  white-space: nowrap;
+  direction: ltr;
+  vertical-align: middle;
+}
