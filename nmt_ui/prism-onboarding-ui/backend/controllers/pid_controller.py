@@ -97,23 +97,30 @@ class PIDController:
         # Calculate error (how far from target)
         error = self.target - current_value
         
-        # Proportional term: Immediate response to current error
         P = self.Kp * error
         
-        # Integral term: Accumulated error over time
-        # This eliminates steady-state error
-        self.integral += error * dt
-        
-        # Anti-windup: Limit integral to prevent excessive buildup
+        # Integral term with conditional integration anti-windup:
+        # Only accumulate integral when the output is NOT saturated, OR
+        # when the error sign would drive integral back toward zero.
+        tentative_integral = self.integral + error * dt
+        tentative_I = self.Ki * tentative_integral
+        tentative_output = P + tentative_I + self.Kd * ((error - self.last_error) / dt)
+
+        output_saturated = tentative_output > self.max_output or tentative_output < self.min_output
+        error_reduces_saturation = (
+            (tentative_output > self.max_output and error < 0) or
+            (tentative_output < self.min_output and error > 0)
+        )
+
+        if not output_saturated or error_reduces_saturation:
+            self.integral = tentative_integral
+
         self.integral = max(min(self.integral, self.integral_limit), -self.integral_limit)
         I = self.Ki * self.integral
         
-        # Derivative term: Rate of change of error
-        # This anticipates future error and provides damping
         derivative = (error - self.last_error) / dt
         D = self.Kd * derivative
         
-        # Total PID output
         output = P + I + D
         
         # Determine control phase

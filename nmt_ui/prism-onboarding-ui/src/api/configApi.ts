@@ -1,8 +1,9 @@
 // src/api/configApi.ts
 
+import { getApiBase } from '../utils/backendUrl';
+
 export async function fetchConfig(pc_ip: string) {
-  // Always use localhost:5000 for backend in development
-  const backendUrl = 'http://localhost:5000';
+  const backendUrl = getApiBase();
   const response = await fetch(
     `${backendUrl}/api/fetch-config?pc_ip=${encodeURIComponent(pc_ip)}`
   );

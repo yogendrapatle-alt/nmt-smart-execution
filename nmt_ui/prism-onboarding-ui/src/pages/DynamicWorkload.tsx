@@ -4,6 +4,7 @@ import WorkloadUploader from '../components/WorkloadUploader';
 import { useNavigate } from 'react-router-dom';
 import { useOnboarding } from '../context/OnboardingContext';
 import ntnxLogo from '../assets/new_nutanix_logo.png';
+import { getApiBase } from '../utils/backendUrl';
 // For file download
 const downloadJSON = (data: any, filename: string) => {
 	const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -67,7 +68,7 @@ const DynamicWorkload: React.FC = () => {
 	const handleFetchWorkload = async () => {
 		try {
 			// Always use localhost:5000 for backend in development
-			const backendUrl = 'http://localhost:5000';
+			const backendUrl = getApiBase();
 			const res = await fetch(`${backendUrl}/api/get-workload`);
 			if (!res.ok) throw new Error('Failed to fetch workload');
 			const json = await res.json();
@@ -157,7 +158,7 @@ const DynamicWorkload: React.FC = () => {
 		};
 		downloadJSON(output, 'dynamic_workload.json');
 		// Always use localhost:5000 for backend in development
-		const backendUrl = 'http://localhost:5000';
+		const backendUrl = getApiBase();
 		try {
 			const unique_testbed_id = localStorage.getItem("unique_testbed_id");
 			const unique_rule_id = localStorage.getItem("unique_rule_id");
@@ -232,7 +233,7 @@ const DynamicWorkload: React.FC = () => {
 		setWorkloadStatus('Executing dynamic workload jobs...');
 		try {
 			// Always use localhost:5000 for backend in development
-			const backendUrl = 'http://localhost:5000';
+			const backendUrl = getApiBase();
 			const res = await fetch(`${backendUrl}/api/run-dynamic-workload`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' }

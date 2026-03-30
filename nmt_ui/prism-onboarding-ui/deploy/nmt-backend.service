@@ -1,0 +1,17 @@
+[Unit]
+Description=NCM Monitoring Tool (Flask + SocketIO)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/nmt/prism-onboarding-ui/backend
+Environment=PYTHONUNBUFFERED=1
+# Copy and edit on the server — database and CORS for your VM URL
+EnvironmentFile=-/opt/nmt/prism-onboarding-ui/backend/.env
+ExecStart=/opt/nmt/venv/bin/python app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

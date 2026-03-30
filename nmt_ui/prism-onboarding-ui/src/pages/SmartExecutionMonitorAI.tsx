@@ -12,6 +12,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import '../styles/SmartExecutionMonitorAI.css';
+import { getApiBase } from '../utils/backendUrl';
 
 interface MonitorData {
   execution_id: string;
@@ -75,7 +76,7 @@ const SmartExecutionMonitorAI: React.FC = () => {
   // Fetch monitoring data
   const fetchMonitorData = async () => {
     try {
-      const response = await fetch(`http://localhost:5000/api/smart-execution/monitor/${executionId}`);
+      const response = await fetch(`${getApiBase()}/api/smart-execution/monitor/${executionId}`);
       if (response.ok) {
         const data = await response.json();
         if (data.success) {
@@ -89,7 +90,7 @@ const SmartExecutionMonitorAI: React.FC = () => {
       }
     } catch (err) {
       console.error('Error fetching monitor data:', err);
-      setError('Error connecting to backend. Make sure backend is running on port 5000.');
+      setError('Error connecting to backend. Check that the API is reachable (nginx proxy or backend on port 5000).');
     } finally {
       setLoading(false);
     }
@@ -117,7 +118,7 @@ const SmartExecutionMonitorAI: React.FC = () => {
     }
     
     try {
-      const response = await fetch(`http://localhost:5000/api/smart-execution/emergency-stop/${executionId}`, {
+      const response = await fetch(`${getApiBase()}/api/smart-execution/emergency-stop/${executionId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'Manual emergency stop from UI' })
@@ -139,7 +140,7 @@ const SmartExecutionMonitorAI: React.FC = () => {
     if (!confirm('Are you sure you want to delete all entities created by this execution?')) return;
     setCleaningUp(true);
     try {
-      const res = await fetch(`http://localhost:5000/api/smart-execution/cleanup/${executionId}`, { method: 'POST' });
+      const res = await fetch(`${getApiBase()}/api/smart-execution/cleanup/${executionId}`, { method: 'POST' });
       const data = await res.json();
       if (data.success) {
         alert(`Cleanup done: ${data.cleanup_summary?.success || 0}/${data.cleanup_summary?.total || 0} deleted`);

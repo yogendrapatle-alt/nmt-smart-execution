@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import '../styles/AnalyticsDashboard.css';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Overview {
   period: {
@@ -65,7 +66,7 @@ const AnalyticsDashboard: React.FC = () => {
 
   const loadTestbeds = async () => {
     try {
-      const response = await axios.get('http://localhost:5000/api/testbeds');
+      const response = await axios.get(`${getApiBase()}/api/testbeds`);
       if (response.data.success) {
         setTestbeds(response.data.testbeds);
       }
@@ -93,14 +94,14 @@ const AnalyticsDashboard: React.FC = () => {
       }
       
       // Load overview
-      const overviewRes = await axios.get('http://localhost:5000/api/analytics/overview', { params });
+      const overviewRes = await axios.get(`${getApiBase()}/api/analytics/overview`, { params });
       if (overviewRes.data.success) {
         setOverview(overviewRes.data.overview);
       }
       
       // Load trends
       const trendsParams = { ...params, metric: selectedMetric, granularity: 'daily' };
-      const trendsRes = await axios.get('http://localhost:5000/api/analytics/trends', { params: trendsParams });
+      const trendsRes = await axios.get(`${getApiBase()}/api/analytics/trends`, { params: trendsParams });
       if (trendsRes.data.success) {
         setTrends(trendsRes.data.trends.trend_data);
       }
@@ -118,7 +119,7 @@ const AnalyticsDashboard: React.FC = () => {
       const startDate = new Date();
       startDate.setDate(endDate.getDate() - parseInt(dateRange));
       
-      const response = await axios.post('http://localhost:5000/api/analytics/export', {
+      const response = await axios.post(`${getApiBase()}/api/analytics/export`, {
         format,
         data_type: 'overview',
         params: {

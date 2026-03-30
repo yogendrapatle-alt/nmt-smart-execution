@@ -1,88 +1,54 @@
 /**
- * Auto-detect backend URL utility
- * This eliminates the need for hardcoded IP addresses
+ * Backend API base URL for HTTP calls from the browser.
+ *
+ * - Default (empty): same-origin — use Vite dev proxy (`/api` → :5000) or nginx in production.
+ * - Override: set `VITE_API_BASE_URL` or legacy `VITE_BACKEND_URL` (e.g. `http://host:5000`).
  */
 
-/**
- * Get the backend URL by auto-detecting the current host
- * @returns {string} The backend URL
- */
+export function getApiBase(): string {
+  const raw = import.meta.env.VITE_API_BASE_URL ?? import.meta.env.VITE_BACKEND_URL ?? '';
+  if (typeof raw !== 'string') return '';
+  return raw.replace(/\/$/, '');
+}
+
+/** @deprecated Use getApiBase() — kept for existing imports */
+export function getAutoBackendUrl(): string {
+  return getApiBase();
+}
+
+/** @deprecated Use getApiBase() */
 export function getBackendUrl(): string {
-  // If explicitly set in environment, use that
-  if (import.meta.env.VITE_BACKEND_URL) {
-    return import.meta.env.VITE_BACKEND_URL;
-  }
-
-  // Auto-detect based on current window location
-  const protocol = window.location.protocol; // http: or https:
-  const hostname = window.location.hostname; // IP or domain name
-  
-  // Use the same host as the frontend, but port 5000 for backend
-  return `${protocol}//${hostname}:5000`;
+  return getApiBase();
 }
 
 /**
- * Alternative method: Try multiple possible backend URLs
- * @returns {Promise<string>} The working backend URL
+ * Probe common locations for /api/health (optional UI flows).
  */
 export async function detectWorkingBackendUrl(): Promise<string> {
-  const possibleUrls = [
-    // Try environment variable first
-    import.meta.env.VITE_BACKEND_URL,
-    // Try same host as frontend
-    `${window.location.protocol}//${window.location.hostname}:5000`,
-    // Fallback to localhost
-    'http://localhost:5000',
-    // Try common internal network ranges
-    'http://127.0.0.1:5000',
-  ].filter(Boolean); // Remove undefined values
+  const explicit = getApiBase();
+  const candidates: string[] = [];
+  if (explicit) candidates.push(explicit);
+  candidates.push('');
+  candidates.push(`${window.location.protocol}//${window.location.hostname}:5000`);
+  candidates.push('http://127.0.0.1:5000');
+  candidates.push('http://localhost:5000');
 
-  for (const url of possibleUrls) {
+  const seen = new Set<string>();
+  for (const base of candidates) {
+    if (seen.has(base)) continue;
+    seen.add(base);
+    const url = base === '' ? '/api/health' : `${base.replace(/\/$/, '')}/api/health`;
     try {
-      // Create AbortController for timeout
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3000);
-      
-      const response = await fetch(`${url}/api/health`, { 
-        method: 'GET',
-        signal: controller.signal
-      });
-      
+      const response = await fetch(url, { method: 'GET', signal: controller.signal });
       clearTimeout(timeoutId);
-      
       if (response.ok) {
-        console.log(`✅ Found working backend at: ${url}`);
-        return url;
+        return base === '' ? '' : base.replace(/\/$/, '');
       }
-    } catch (error) {
-      console.log(`❌ Backend not reachable at: ${url}`);
+    } catch {
+      // try next
     }
   }
-
-  // If nothing works, use the first URL as fallback
-  const fallback = possibleUrls[0] || 'http://localhost:5000';
-  console.warn(`⚠️ No backend found, using fallback: ${fallback}`);
-  return fallback;
-}
-
-/**
- * Simple method - use localhost for development, auto-detect for production
- */
-export function getAutoBackendUrl(): string {
-  // If environment variable is set, use it
-  if (import.meta.env.VITE_BACKEND_URL) {
-    console.log('getAutoBackendUrl: Using VITE_BACKEND_URL:', import.meta.env.VITE_BACKEND_URL);
-    return import.meta.env.VITE_BACKEND_URL;
-  }
-
-  const { protocol, hostname } = window.location;
-  console.log('getAutoBackendUrl:', { protocol, hostname });
-  
-  // If accessing via localhost or 127.0.0.1, use localhost for backend
-  if (hostname === 'localhost' || hostname === '127.0.0.1') {
-    return 'http://localhost:5000';
-  }
-  
-  // Otherwise use the same hostname (for production/VM deployments)
-  return `${protocol}//${hostname}:5000`;
+  return getApiBase();
 }

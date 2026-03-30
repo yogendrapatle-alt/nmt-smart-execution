@@ -4,6 +4,7 @@ import RuleBuilderExperimental from '../components/RuleBuilderExperimental';
 import ntnxLogo from '../assets/new_nutanix_logo.png';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeRulesByTestbed } from '../fake-data';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Testbed {
   id: number;
@@ -70,7 +71,7 @@ const RuleConfigManager: React.FC = () => {
         return;
       }
 
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/get-testbeds`);
       const data = await response.json();
       
@@ -95,7 +96,7 @@ const RuleConfigManager: React.FC = () => {
         return;
       }
 
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/get-rules-by-testbed/${testbedId}`);
       const data = await response.json();
       
@@ -128,7 +129,7 @@ const RuleConfigManager: React.FC = () => {
 
   const handleSaveRule = async (ruleConfig: any) => {
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       let savedRuleId = null;
       
       if (editingRule) {
@@ -190,7 +191,7 @@ const RuleConfigManager: React.FC = () => {
     }
     
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/delete-rule/${ruleId}`, {
         method: 'DELETE'
       });
@@ -220,7 +221,7 @@ const RuleConfigManager: React.FC = () => {
     }
     
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       
       // Get the latest rule config
       const latestRule = rules[0];
@@ -272,7 +273,7 @@ const RuleConfigManager: React.FC = () => {
 
     setTestingSlack(true);
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/test-slack-alert`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -304,7 +305,7 @@ const RuleConfigManager: React.FC = () => {
     }
 
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/update-slack-webhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

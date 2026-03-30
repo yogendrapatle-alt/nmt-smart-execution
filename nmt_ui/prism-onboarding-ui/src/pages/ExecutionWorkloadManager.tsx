@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import ntnxLogo from '../assets/new_nutanix_logo.png';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeExecutions, getFakeExecutionById } from '../fake-data';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Testbed {
   id: number;
@@ -144,7 +145,7 @@ const ExecutionWorkloadManager: React.FC = () => {
         return;
       }
 
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/get-testbeds`);
       const data = await response.json();
       
@@ -171,7 +172,7 @@ const ExecutionWorkloadManager: React.FC = () => {
         return;
       }
 
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/executions?limit=10`);
       const data = await response.json();
       
@@ -235,7 +236,7 @@ const ExecutionWorkloadManager: React.FC = () => {
         return;
       }
 
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       
       const transformedConfig = {
         ...workloadConfig,
@@ -314,7 +315,7 @@ const ExecutionWorkloadManager: React.FC = () => {
         return;
       }
 
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/execution-status/${execId}`);
       const status = await response.json();
       
@@ -337,7 +338,7 @@ const ExecutionWorkloadManager: React.FC = () => {
     if (!executionId) return;
     
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/stop-execution/${executionId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -370,7 +371,7 @@ const ExecutionWorkloadManager: React.FC = () => {
         return;
       }
 
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/delete-execution/${execId}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' }
@@ -396,7 +397,7 @@ const ExecutionWorkloadManager: React.FC = () => {
     if (!executionId) return;
     
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/pause-execution/${executionId}`, {
         method: 'POST'
       });
@@ -415,7 +416,7 @@ const ExecutionWorkloadManager: React.FC = () => {
     if (!executionId) return;
     
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/resume-execution/${executionId}`, {
         method: 'POST'
       });

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import Layout from '../components/Layout';
+import { getApiBase } from '../utils/backendUrl';
 
 interface ExecutionData {
   execution_id: string;
@@ -68,7 +69,7 @@ const ExecutionReport: React.FC = () => {
   const fetchExecutionReport = async () => {
     try {
       setLoading(true);
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/execution-report-detailed/${executionId}`);
       const data = await response.json();
       
@@ -90,7 +91,7 @@ const ExecutionReport: React.FC = () => {
   
   const downloadHTMLReport = async () => {
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/execution-html-report/${executionId}`);
       
       if (!response.ok) {

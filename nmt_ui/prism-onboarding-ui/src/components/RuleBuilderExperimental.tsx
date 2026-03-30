@@ -86,6 +86,7 @@ import { useConfigLoader } from '../hooks/useConfigLoader';
 import CustomScriptNavButton from './CustomScriptNavButton';
 import CustomScriptUploader from './CustomScriptUploader';
 import CustomRuleBuilder from './CustomRuleBuilder';
+import { getApiBase } from '../utils/backendUrl';
 
 interface RuleBuilderExperimentalProps {
   onSave: (rule: RuleConfig) => void;
@@ -717,7 +718,7 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
       return;
     }
     // Always use localhost:5000 for backend in development
-    const backendUrl = 'http://localhost:5000';
+    const backendUrl = getApiBase();
     const ruleUploadResponse = await fetch(
       `${backendUrl}/api/upload-rule-config`,
       {
@@ -753,7 +754,7 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
         return;
       }
       console.log("Immediately deploying config to remote server...");
-      const backendUrl2 = 'http://localhost:5000';
+      const backendUrl2 = getApiBase();
       const deployResponse = await fetch(
         `${backendUrl2}/api/deploy-config-immediate`,
         {
@@ -799,7 +800,7 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
       timestamp: new Date().toISOString(),
     };
   
-    const backendUrl3 = 'http://localhost:5000';
+    const backendUrl3 = getApiBase();
     const res = await fetch(
       `${backendUrl3}/api/save-config`,
       {

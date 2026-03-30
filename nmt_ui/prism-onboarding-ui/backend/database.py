@@ -23,8 +23,11 @@ from models.testbed import Testbed
 # Import the SmartExecution model
 from models.smart_execution import SmartExecution
 
-# Example: postgresql://user:password@localhost/dbname
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://alertuser:alertpass@localhost/alerts')
+# Use 127.0.0.1 (not localhost) so libpq uses TCP + md5/pg_hba "host" rules; "localhost" can use ::1 or socket.
+DATABASE_URL = os.environ.get(
+    'DATABASE_URL',
+    'postgresql://alertuser:alertpass@127.0.0.1:5432/alerts',
+)
 
 # Connection Pool Configuration
 # These settings prevent connection exhaustion and improve performance under load

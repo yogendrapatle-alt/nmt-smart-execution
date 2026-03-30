@@ -17,7 +17,7 @@ import math
 import re
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from urllib.parse import urljoin
@@ -45,18 +45,28 @@ class EnhancedReportService:
         metrics_history = report_data.get('metrics_history') or status_data.get('metrics_history') or []
         operations_history = report_data.get('operations_history') or status_data.get('operations_history') or []
         pod_correlation = report_data.get('pod_operation_correlation') or status_data.get('pod_operation_correlation') or {}
-        baseline_metrics = report_data.get('baseline_metrics') or status_data.get('baseline_metrics') or {}
-        final_metrics = report_data.get('current_metrics') or report_data.get('final_metrics') or status_data.get('current_metrics') or {}
+        raw_baseline = report_data.get('baseline_metrics') or status_data.get('baseline_metrics') or {}
+        raw_final = report_data.get('current_metrics') or report_data.get('final_metrics') or status_data.get('current_metrics') or status_data.get('final_metrics') or {}
+        baseline_metrics, final_metrics, metrics_resolution_note = self._resolve_effective_metrics(
+            raw_baseline, raw_final, metrics_history
+        )
         detected_anomalies = report_data.get('detected_anomalies') or status_data.get('detected_anomalies') or []
 
         spike_analysis = self._analyze_spikes(metrics_history, operations_history, pod_correlation, detected_anomalies)
         cluster_health = self._collect_cluster_health()
+        # Use persisted cluster health if live collection failed
+        if cluster_health.get('collection_status') != 'success':
+            persisted_health = report_data.get('cluster_health_snapshot') or status_data.get('cluster_health_snapshot')
+            if persisted_health and isinstance(persisted_health, dict) and persisted_health.get('collection_status') == 'success':
+                cluster_health = persisted_health
         failure_groups = self._group_failures(operations_history)
         heatmap = self._build_operation_heatmap(operations_history)
         pod_stability = self._compute_pod_stability(pod_correlation, cluster_health)
         historical = self._get_historical_comparison(testbed_id, execution_id)
         capacity = self._estimate_capacity(operations_history, metrics_history, baseline_metrics, final_metrics, report_data)
         ml_insights = self._get_ml_report_insights(testbed_id)
+        iteration_timeline = self._build_iteration_timeline(metrics_history, operations_history, spike_analysis)
+        entity_operation_counts = self._entity_operation_counts(operations_history)
         verdict = self._compute_verdict(
             report_data, status_data, spike_analysis, cluster_health,
             failure_groups, operations_history, metrics_history
@@ -77,7 +87,69 @@ class EnhancedReportService:
             'ml_report_insights': ml_insights,
             'latency_report': latency_report,
             'learning_summary': learning,
+            'iteration_timeline': iteration_timeline,
+            'entity_operation_counts': entity_operation_counts,
+            'effective_metrics': {
+                'baseline': baseline_metrics,
+                'final': final_metrics,
+                'resolution_note': metrics_resolution_note,
+            },
         }
+
+    def _entity_operation_counts(self, operations_history: List) -> List[Dict[str, Any]]:
+        """Sorted list of { 'key': 'Entity.operation', 'count': n } for report tables."""
+        counts: Dict[str, int] = defaultdict(int)
+        for op in operations_history:
+            key = f"{op.get('entity_type', '?')}.{op.get('operation', '?')}"
+            counts[key] += 1
+        ordered = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+        return [{'key': k, 'count': c} for k, c in ordered]
+
+    def _resolve_effective_metrics(
+        self,
+        baseline_metrics: Dict,
+        final_metrics: Dict,
+        metrics_history: List,
+    ) -> Tuple[Dict, Dict, str]:
+        """
+        When stored baseline/final are missing or all zeros but metrics_history has samples,
+        use first/last samples so reports and capacity math match what the run actually observed.
+        """
+        bm = dict(baseline_metrics) if isinstance(baseline_metrics, dict) else {}
+        fm = dict(final_metrics) if isinstance(final_metrics, dict) else {}
+        notes: List[str] = []
+
+        if not metrics_history:
+            return bm, fm, 'stored'
+
+        first = metrics_history[0]
+        last = metrics_history[-1]
+        f_cpu = float(first.get('cpu_percent') or 0)
+        f_mem = float(first.get('memory_percent') or 0)
+        l_cpu = float(last.get('cpu_percent') or 0)
+        l_mem = float(last.get('memory_percent') or 0)
+
+        b_cpu = float(bm.get('cpu_percent') or 0)
+        b_mem = float(bm.get('memory_percent') or 0)
+        if (b_cpu == 0 and b_mem == 0) and (f_cpu > 0 or f_mem > 0):
+            bm['cpu_percent'] = f_cpu
+            bm['memory_percent'] = f_mem
+            notes.append('baseline_from_first_metric_sample')
+
+        c_cpu = float(fm.get('cpu_percent') or 0)
+        c_mem = float(fm.get('memory_percent') or 0)
+        if (c_cpu == 0 and c_mem == 0) and (l_cpu > 0 or l_mem > 0):
+            fm['cpu_percent'] = l_cpu
+            fm['memory_percent'] = l_mem
+            notes.append('final_from_last_metric_sample')
+        elif c_cpu == 0 and l_cpu > 0:
+            fm['cpu_percent'] = l_cpu
+            notes.append('final_cpu_from_last_metric_sample')
+        elif c_mem == 0 and l_mem > 0:
+            fm['memory_percent'] = l_mem
+            notes.append('final_memory_from_last_metric_sample')
+
+        return bm, fm, ','.join(notes) if notes else 'stored'
 
     # ------------------------------------------------------------------
     #  1. SPIKE ANALYSIS
@@ -113,6 +185,14 @@ class EnhancedReportService:
 
             ml_prediction = self._get_ml_prediction_for_spike(causal_ops)
 
+            # Count operations that ran around this iteration
+            ops_in_window = [op for op in operations_history
+                             if op.get('iteration') == spike_iter or
+                             (isinstance(op.get('iteration'), int) and abs(op.get('iteration', 0) - spike_iter) <= 1)]
+            ops_count = len(ops_in_window)
+            ops_success = sum(1 for op in ops_in_window if op.get('status') == 'SUCCESS')
+            ops_failed = sum(1 for op in ops_in_window if op.get('status') == 'FAILED')
+
             spikes.append({
                 'spike_number': len(spikes) + 1,
                 'iteration': spike_iter,
@@ -125,6 +205,9 @@ class EnhancedReportService:
                 'memory_delta': round(mem_delta, 2),
                 'risk_level': risk,
                 'causal_operations': causal_ops,
+                'operation_count': ops_count,
+                'operations_success': ops_success,
+                'operations_failed': ops_failed,
                 'affected_pods': affected_pods[:10],
                 'recovery_minutes': round(recovery_min, 1) if recovery_min else None,
                 'ml_prediction': ml_prediction,
@@ -437,7 +520,7 @@ class EnhancedReportService:
     # ------------------------------------------------------------------
     def _build_operation_heatmap(self, operations_history: List) -> Dict:
         if not operations_history:
-            return {'buckets': [], 'entity_ops': [], 'data': {}}
+            return {'buckets': [], 'entity_ops': [], 'data': {}, 'row_totals': {}}
 
         timestamps = []
         for op in operations_history:
@@ -449,7 +532,7 @@ class EnhancedReportService:
                     pass
 
         if not timestamps:
-            return {'buckets': [], 'entity_ops': [], 'data': {}}
+            return {'buckets': [], 'entity_ops': [], 'data': {}, 'row_totals': {}}
 
         start = min(timestamps)
         end = max(timestamps)
@@ -507,11 +590,16 @@ class EnhancedReportService:
             else:
                 bucket_labels.append(f"{minutes_from_start / 60:.1f}h")
 
+        row_totals: Dict[str, int] = {}
+        for eo in entity_ops:
+            row_totals[eo] = sum(data[eo][bi]['count'] for bi in data[eo])
+
         return {
             'buckets': bucket_labels,
             'entity_ops': entity_ops,
             'data': data,
             'bucket_minutes': bucket_minutes,
+            'row_totals': row_totals,
         }
 
     # ------------------------------------------------------------------
@@ -592,11 +680,12 @@ class EnhancedReportService:
                     SELECT execution_id, status, duration_minutes, total_operations,
                            successful_operations, failed_operations, success_rate,
                            start_time, end_time,
-                           baseline_metrics, final_metrics
+                           baseline_metrics, final_metrics,
+                           jsonb_array_length(COALESCE(metrics_history, '[]'::jsonb)) as iterations
                     FROM smart_executions
                     WHERE testbed_id = :testbed_id
                       AND execution_id != :current_id
-                      AND status IN ('COMPLETED', 'TIMEOUT', 'STOPPED')
+                      AND status IN ('COMPLETED', 'TIMEOUT', 'STOPPED', 'LONGEVITY_SUSTAINING')
                     ORDER BY start_time DESC
                     LIMIT 5
                 """)
@@ -632,6 +721,7 @@ class EnhancedReportService:
                     'status': r[1],
                     'duration_minutes': round(r[2], 1) if r[2] else 0,
                     'total_operations': r[3] or 0,
+                    'iterations': r[11] if len(r) > 11 and r[11] else 0,
                     'success_rate': round(r[6], 1) if r[6] else 0,
                     'start_time': r[7].isoformat() if r[7] else '',
                     'baseline_cpu': baseline.get('cpu_percent', 0) if isinstance(baseline, dict) else 0,
@@ -666,8 +756,28 @@ class EnhancedReportService:
         cpu_delta = final_cpu - baseline_cpu
         mem_delta = final_mem - baseline_mem
 
-        cpu_per_op = cpu_delta / total_ops if total_ops > 0 and cpu_delta > 0 else 0
-        mem_per_op = mem_delta / total_ops if total_ops > 0 and mem_delta > 0 else 0
+        # Average magnitude of net change per op (not only positive deltas — avoids bogus 0% when usage dropped)
+        cpu_per_op = (abs(cpu_delta) / total_ops) if total_ops > 0 else 0
+        mem_per_op = (abs(mem_delta) / total_ops) if total_ops > 0 else 0
+
+        # If start/end metrics cancel out but samples moved during the run, apportion step changes across ops
+        if total_ops > 0 and cpu_per_op == 0 and mem_per_op == 0 and len(metrics_history) >= 2:
+            cpu_move = sum(
+                abs(
+                    float(metrics_history[i + 1].get('cpu_percent') or 0)
+                    - float(metrics_history[i].get('cpu_percent') or 0)
+                )
+                for i in range(len(metrics_history) - 1)
+            )
+            mem_move = sum(
+                abs(
+                    float(metrics_history[i + 1].get('memory_percent') or 0)
+                    - float(metrics_history[i].get('memory_percent') or 0)
+                )
+                for i in range(len(metrics_history) - 1)
+            )
+            cpu_per_op = cpu_move / total_ops
+            mem_per_op = mem_move / total_ops
 
         target_cpu = report_data.get('target_config', {}).get('cpu_threshold', 80)
         target_mem = report_data.get('target_config', {}).get('memory_threshold', 80)
@@ -831,4 +941,132 @@ class EnhancedReportService:
             return False
         early_avg = sum(early) / len(early)
         late_avg = sum(late) / len(late)
-        return late_avg > early_avg * 1.5  # 50% increase = degradation
+        return late_avg > early_avg * 1.5
+
+    # ------------------------------------------------------------------
+    #  11. ITERATION TIMELINE (all iterations with operations & spike flag)
+    # ------------------------------------------------------------------
+    def _build_iteration_timeline(self, metrics_history: List, operations_history: List,
+                                   spike_analysis: Dict) -> Dict:
+        if not metrics_history:
+            return {'iterations': [], 'total_iterations': 0}
+
+        spike_iters = set()
+        spike_map = {}
+        for s in spike_analysis.get('spikes', []):
+            spike_iters.add(s.get('iteration', -1))
+            spike_map[s.get('iteration', -1)] = s
+
+        iterations = []
+        for mi in metrics_history:
+            iteration_num = mi.get('iteration', 0)
+            cpu = mi.get('cpu_percent', 0)
+            memory = mi.get('memory_percent', 0)
+            ts = mi.get('timestamp', '')
+
+            iter_ops = [
+                op for op in operations_history
+                if self._op_iteration_matches(op, iteration_num)
+            ]
+            if not iter_ops:
+                iter_ops = self._find_ops_near_timestamp(ts, operations_history)
+
+            ops_count = len(iter_ops)
+            ops_success = sum(1 for op in iter_ops if op.get('status') == 'SUCCESS')
+            ops_failed = sum(1 for op in iter_ops if op.get('status') == 'FAILED')
+
+            create_count = sum(1 for op in iter_ops if 'create' in (op.get('operation', '') or '').lower())
+            delete_count = sum(1 for op in iter_ops if 'delete' in (op.get('operation', '') or '').lower())
+
+            is_spike = iteration_num in spike_iters
+            spike_info = spike_map.get(iteration_num)
+
+            prev_cpu = metrics_history[max(0, metrics_history.index(mi) - 1)].get('cpu_percent', 0) if metrics_history.index(mi) > 0 else cpu
+            prev_mem = metrics_history[max(0, metrics_history.index(mi) - 1)].get('memory_percent', 0) if metrics_history.index(mi) > 0 else memory
+            cpu_delta = round(cpu - prev_cpu, 2)
+            mem_delta = round(memory - prev_mem, 2)
+
+            op_summary = {}
+            for op in iter_ops:
+                key = f"{op.get('entity_type', '?')}.{op.get('operation', '?')}"
+                if key not in op_summary:
+                    op_summary[key] = {'count': 0, 'success': 0, 'failed': 0, 'avg_duration': 0, 'durations': []}
+                op_summary[key]['count'] += 1
+                if op.get('status') == 'SUCCESS':
+                    op_summary[key]['success'] += 1
+                elif op.get('status') == 'FAILED':
+                    op_summary[key]['failed'] += 1
+                if op.get('duration_seconds'):
+                    op_summary[key]['durations'].append(op['duration_seconds'])
+
+            for key in op_summary:
+                d = op_summary[key]['durations']
+                op_summary[key]['avg_duration'] = round(sum(d) / len(d), 2) if d else 0
+                del op_summary[key]['durations']
+
+            iterations.append({
+                'iteration': iteration_num,
+                'timestamp': ts,
+                'cpu': round(cpu, 1),
+                'memory': round(memory, 1),
+                'cpu_delta': cpu_delta,
+                'memory_delta': mem_delta,
+                'operations_count': ops_count,
+                'operations_success': ops_success,
+                'operations_failed': ops_failed,
+                'creates': create_count,
+                'deletes': delete_count,
+                'is_spike': is_spike,
+                'spike_risk': spike_info.get('risk_level') if spike_info else None,
+                'operation_breakdown': op_summary,
+                'operations': [{
+                    'entity_type': op.get('entity_type', '?'),
+                    'operation': op.get('operation', '?'),
+                    'entity_name': op.get('entity_name', '?'),
+                    'status': op.get('status', '?'),
+                    'duration': round(op.get('duration_seconds', 0), 2),
+                } for op in iter_ops[:20]],
+            })
+
+        return {
+            'iterations': iterations,
+            'total_iterations': len(iterations),
+            'total_spikes': len(spike_iters),
+            'summary': {
+                'total_creates': sum(i['creates'] for i in iterations),
+                'total_deletes': sum(i['deletes'] for i in iterations),
+                'total_ops': sum(i['operations_count'] for i in iterations),
+                'avg_ops_per_iteration': round(sum(i['operations_count'] for i in iterations) / max(len(iterations), 1), 1),
+            }
+        }
+
+    @staticmethod
+    def _op_iteration_matches(op: Dict, iteration_num: Any) -> bool:
+        oi = op.get('iteration')
+        if oi is None:
+            return False
+        try:
+            return int(oi) == int(iteration_num)
+        except (TypeError, ValueError):
+            return False
+
+    def _find_ops_near_timestamp(self, ts: str, operations_history: List) -> List:
+        """Fallback when operations lack iteration: match ops whose start is near the metric sample."""
+        if not ts or not operations_history:
+            return []
+        try:
+            target_time = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        except Exception:
+            return []
+        nearby = []
+        for op in operations_history:
+            op_ts = op.get('timestamp') or op.get('started_at') or op.get('start_time', '')
+            if not op_ts:
+                continue
+            try:
+                op_time = datetime.fromisoformat(op_ts.replace('Z', '+00:00'))
+                if abs((target_time - op_time).total_seconds()) <= 120:
+                    nearby.append(op)
+            except Exception:
+                continue
+        return nearby

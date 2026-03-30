@@ -68,8 +68,19 @@ from copy_ncm_utils import KubeRemoteClient
 
 
 app = Flask(__name__)
+
+# Comma-separated list, e.g. http://localhost:3000,http://10.117.66.44 (set CORS_ORIGINS on VM)
+_cors_origins = [
+    o.strip()
+    for o in os.environ.get(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000",
+    ).split(",")
+    if o.strip()
+]
+
 # Initialize SocketIO for real-time logs
-socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000", "http://localhost:5173"], async_mode='threading')
+socketio = SocketIO(app, cors_allowed_origins=_cors_origins, async_mode="threading")
 
 # Register socketio with smart_execution_service
 from services import smart_execution_service
@@ -78,7 +89,7 @@ smart_execution_service.set_socketio(socketio)
 # Configure CORS to allow DELETE method
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://localhost:3000", "http://localhost:5173"],
+        "origins": _cors_origins,
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type"],
         "supports_credentials": True
@@ -4204,8 +4215,25 @@ def stop_smart_execution_api(execution_id):
         if success:
             logging.info(f"✅ Smart execution stopped: {execution_id}")
             return jsonify({'success': True, 'message': 'Execution stopped'}), 200
-        else:
-            return jsonify({'success': False, 'error': 'Execution not found'}), 404
+        
+        # Not in memory — update DB directly for stuck records
+        try:
+            from sqlalchemy import text
+            session = SessionLocal()
+            result = session.execute(
+                text("UPDATE smart_executions SET status = 'STOPPED', is_running = false, end_time = NOW() WHERE execution_id = :eid AND status = 'RUNNING'"),
+                {'eid': execution_id}
+            )
+            session.commit()
+            rows = result.rowcount
+            session.close()
+            if rows > 0:
+                logging.info(f"✅ Stuck execution force-stopped in DB: {execution_id}")
+                return jsonify({'success': True, 'message': 'Execution force-stopped (was stuck in DB)'}), 200
+        except Exception:
+            pass
+        
+        return jsonify({'success': False, 'error': 'Execution not found'}), 404
         
     except Exception as e:
         logging.exception("Error stopping smart execution")
@@ -4344,6 +4372,36 @@ def cleanup_smart_execution_entities(execution_id):
         
     except Exception as e:
         logging.exception(f"Error cleaning up entities for execution {execution_id}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/smart-execution/stop-all', methods=['POST'])
+def stop_all_running_executions():
+    """Force-stop every execution that is still marked RUNNING (in-memory + DB)."""
+    try:
+        from services.smart_execution_service import stop_smart_execution, _active_smart_executions
+        stopped_memory = []
+        for eid in list(_active_smart_executions.keys()):
+            if stop_smart_execution(eid):
+                stopped_memory.append(eid)
+        
+        from sqlalchemy import text
+        session = SessionLocal()
+        result = session.execute(
+            text("UPDATE smart_executions SET status = 'STOPPED', is_running = false, end_time = NOW() WHERE status = 'RUNNING'")
+        )
+        session.commit()
+        db_rows = result.rowcount
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'stopped_in_memory': stopped_memory,
+            'db_rows_updated': db_rows,
+            'message': f'Stopped {len(stopped_memory)} in-memory, {db_rows} DB records updated'
+        }), 200
+    except Exception as e:
+        logging.exception("Error stopping all executions")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -4828,574 +4886,11 @@ def get_rerun_config(execution_id):
 @app.route('/api/smart-execution/report/<execution_id>/download', methods=['GET'])
 def download_smart_execution_report(execution_id):
     """
-    Download detailed HTML report of a smart execution
+    Download detailed HTML report — same content as the enhanced AI report (iteration timeline,
+    capacity planning, entity×operation counts, heatmap row totals, etc.), with legacy filename.
     """
     try:
-        from services.smart_execution_service import get_smart_execution
-        from services.smart_execution_db import load_smart_execution
-        
-        # Initialize status and report_data to avoid None errors
-        status = None
-        report_data = None
-        
-        # Try to get from memory first
-        controller = get_smart_execution(execution_id)
-        if controller:
-            status = controller.get_status()
-            report_data = controller.get_report()
-        else:
-            # Load from database
-            db_data = None
-            try:
-                db_data = load_smart_execution(execution_id)
-            except Exception as e:
-                return jsonify({'success': False, 'error': f'Error loading execution: {str(e)}'}), 500
-            
-            # Validate db_data
-            if db_data is None:
-                return jsonify({'success': False, 'error': 'Execution not found'}), 404
-            
-            if not isinstance(db_data, dict):
-                return jsonify({'success': False, 'error': 'Invalid execution data format'}), 500
-            
-            # Now safely access db_data - ensure it's a dict first
-            if not isinstance(db_data, dict):
-                return jsonify({'success': False, 'error': 'Execution data format invalid'}), 500
-            
-            # Extract full_execution_data safely
-            full_execution_data = db_data.get('full_execution_data')
-            if full_execution_data is None or not isinstance(full_execution_data, dict):
-                full_execution_data = {}
-            
-            # Create status dict from db_data
-            try:
-                status = {
-                    'execution_id': db_data.get('execution_id') or execution_id,
-                    'status': db_data.get('status') or 'UNKNOWN',
-                    'start_time': db_data.get('start_time'),
-                    'end_time': db_data.get('end_time'),
-                    'duration_minutes': db_data.get('duration_minutes') or 0,
-                    'total_operations': db_data.get('total_operations') or 0,
-                    'successful_operations': db_data.get('successful_operations') or 0,
-                    'failed_operations': db_data.get('failed_operations') or 0,
-                    'success_rate': db_data.get('success_rate') or 0,
-                    'operations_per_minute': db_data.get('operations_per_minute') or 0,
-                    'target_config': db_data.get('target_config') or {},
-                    'baseline_metrics': db_data.get('baseline_metrics') or {},
-                    'current_metrics': db_data.get('final_metrics') or {},
-                    'operations_history': db_data.get('operations_history') or [],
-                    'metrics_history': db_data.get('metrics_history') or [],
-                    'threshold_reached': db_data.get('threshold_reached') or False,
-                    'entity_breakdown': db_data.get('entity_breakdown') or {},
-                    'testbed_info': {
-                        'testbed_label': db_data.get('testbed_label') or 'Unknown',
-                        'testbed_id': db_data.get('testbed_id') or 'unknown'
-                    },
-                    'predictions': full_execution_data.get('predictions') if isinstance(full_execution_data, dict) else None,
-                    'detected_anomalies': full_execution_data.get('detected_anomalies', []) if isinstance(full_execution_data, dict) else [],
-                    'recommendations': full_execution_data.get('recommendations', []) if isinstance(full_execution_data, dict) else [],
-                    'operation_effectiveness': full_execution_data.get('operation_effectiveness', []) if isinstance(full_execution_data, dict) else [],
-                    'resource_summary': full_execution_data.get('resource_summary', {}) if isinstance(full_execution_data, dict) else {},
-                    'pod_metrics': full_execution_data.get('pod_metrics', []) if isinstance(full_execution_data, dict) else [],
-                    'anomaly_summary': full_execution_data.get('anomaly_summary', {}) if isinstance(full_execution_data, dict) else {}
-                }
-                report_data = status
-            except Exception as e:
-                import traceback
-                return jsonify({'success': False, 'error': f'Error constructing status: {str(e)}. Traceback: {traceback.format_exc()}'}), 500
-        
-        # Generate HTML report
-        from jinja2 import Template
-        import os
-        
-        template_path = os.path.join(os.path.dirname(__file__), 'templates', 'smart_execution_report.html')
-        
-        if not os.path.exists(template_path):
-            # Create template on the fly
-            html_template = '''<!DOCTYPE html>
-<html>
-<head>
-    <title>Smart Execution Report - {{ execution_id }}</title>
-    <meta charset="UTF-8">
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #667eea; border-bottom: 3px solid #667eea; padding-bottom: 10px; }
-        h2 { color: #764ba2; margin-top: 30px; }
-        .metric-card { display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; margin: 10px; border-radius: 8px; min-width: 200px; }
-        .metric-label { font-size: 14px; opacity: 0.9; }
-        .metric-value { font-size: 32px; font-weight: bold; margin-top: 5px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th { background: #667eea; color: white; padding: 12px; text-align: left; }
-        td { padding: 10px; border-bottom: 1px solid #ddd; }
-        tr:hover { background: #f5f5f5; }
-        .status-badge { padding: 5px 10px; border-radius: 4px; color: white; font-weight: bold; }
-        .status-success { background: #28a745; }
-        .status-failed { background: #dc3545; }
-        .status-running { background: #17a2b8; }
-        .chart { margin: 20px 0; }
-    </style>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-</head>
-<body>
-    <div class="container">
-        <h1>🚀 Smart Execution Report</h1>
-        
-        <div style="color: #666; margin-bottom: 30px;">
-            <strong>Execution ID:</strong> {{ execution_id }}<br>
-            <strong>Testbed:</strong> {{ testbed_label }}<br>
-            <strong>Status:</strong> <span class="status-badge status-{{ status|lower }}">{{ status }}</span><br>
-            <strong>Generated:</strong> {{ timestamp }}
-        </div>
-        
-        <h2>📊 Executive Summary</h2>
-        <div>
-            <div class="metric-card">
-                <div class="metric-label">Total Operations</div>
-                <div class="metric-value">{{ total_operations }}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Duration</div>
-                <div class="metric-value">{{ duration_minutes|round(1) }}m</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Operations/Min</div>
-                <div class="metric-value">{{ ops_per_minute|round(1) }}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Success Rate</div>
-                <div class="metric-value">{{ success_rate|round(1) }}%</div>
-            </div>
-        </div>
-        
-        <h2>🎯 Target Configuration</h2>
-        <table>
-            <tr>
-                <td><strong>Target CPU Threshold:</strong></td>
-                <td>{{ target_config.cpu_threshold }}%</td>
-            </tr>
-            <tr>
-                <td><strong>Target Memory Threshold:</strong></td>
-                <td>{{ target_config.memory_threshold }}%</td>
-            </tr>
-            <tr>
-                <td><strong>Stop Condition:</strong></td>
-                <td>{{ target_config.stop_condition|upper }}</td>
-            </tr>
-        </table>
-        
-        <h2>📈 Metrics Summary</h2>
-        <table>
-            <tr>
-                <th>Metric</th>
-                <th>Baseline</th>
-                <th>Final</th>
-                <th>Change</th>
-            </tr>
-            <tr>
-                <td><strong>CPU Usage</strong></td>
-                <td>{{ baseline_metrics.get('cpu_percent', 0)|round(1) }}%</td>
-                <td>{{ final_metrics.get('cpu_percent', 0)|round(1) }}%</td>
-                <td>{{ (final_metrics.get('cpu_percent', 0) - baseline_metrics.get('cpu_percent', 0))|round(1) }}%</td>
-            </tr>
-            <tr>
-                <td><strong>Memory Usage</strong></td>
-                <td>{{ baseline_metrics.get('memory_percent', 0)|round(1) }}%</td>
-                <td>{{ final_metrics.get('memory_percent', 0)|round(1) }}%</td>
-                <td>{{ (final_metrics.get('memory_percent', 0) - baseline_metrics.get('memory_percent', 0))|round(1) }}%</td>
-            </tr>
-            {% if network_metrics %}
-            <tr>
-                <td><strong>Network RX (MB/s)</strong></td>
-                <td>{{ baseline_metrics.get('network', {}).get('rx_mbps', 0)|round(2) }}</td>
-                <td>{{ network_metrics.get('rx_mbps', 0)|round(2) }}</td>
-                <td>{{ (network_metrics.get('rx_mbps', 0) - baseline_metrics.get('network', {}).get('rx_mbps', 0))|round(2) }}</td>
-            </tr>
-            <tr>
-                <td><strong>Network TX (MB/s)</strong></td>
-                <td>{{ baseline_metrics.get('network', {}).get('tx_mbps', 0)|round(2) }}</td>
-                <td>{{ network_metrics.get('tx_mbps', 0)|round(2) }}</td>
-                <td>{{ (network_metrics.get('tx_mbps', 0) - baseline_metrics.get('network', {}).get('tx_mbps', 0))|round(2) }}</td>
-            </tr>
-            {% endif %}
-            {% if disk_metrics %}
-            <tr>
-                <td><strong>Disk Usage (%)</strong></td>
-                <td>{{ baseline_metrics.get('disk', {}).get('usage_percent', 0)|round(1) }}%</td>
-                <td>{{ disk_metrics.get('usage_percent', 0)|round(1) }}%</td>
-                <td>{{ (disk_metrics.get('usage_percent', 0) - baseline_metrics.get('disk', {}).get('usage_percent', 0))|round(1) }}%</td>
-            </tr>
-            {% endif %}
-            {% if latency_metrics %}
-            <tr>
-                <td><strong>P95 Latency (ms)</strong></td>
-                <td>{{ baseline_metrics.get('latency', {}).get('p95_ms', 0)|round(2) }}</td>
-                <td>{{ latency_metrics.get('p95_ms', 0)|round(2) }}</td>
-                <td>{{ (latency_metrics.get('p95_ms', 0) - baseline_metrics.get('latency', {}).get('p95_ms', 0))|round(2) }}</td>
-            </tr>
-            {% endif %}
-        </table>
-        
-        {% if threshold_reached %}
-        <div style="background: #d4edda; color: #155724; padding: 15px; border-radius: 5px; margin: 20px 0;">
-            <strong>✅ Threshold Reached!</strong> Target metrics have been achieved.
-        </div>
-        {% endif %}
-        
-        {% if predictions %}
-        <h2>🔮 Predictive Insights</h2>
-        <table>
-            <tr>
-                <td><strong>Estimated Operations Remaining:</strong></td>
-                <td>{{ predictions.get('estimated_operations_remaining', 'N/A') }}</td>
-            </tr>
-            <tr>
-                <td><strong>Estimated Time to Completion:</strong></td>
-                <td>{{ predictions.get('estimated_time_minutes', 'N/A') }} minutes</td>
-            </tr>
-            <tr>
-                <td><strong>Current Trend:</strong></td>
-                <td>{{ predictions.get('current_trend', 'unknown')|upper }}</td>
-            </tr>
-            <tr>
-                <td><strong>Efficiency Score:</strong></td>
-                <td>{{ predictions.get('efficiency_score', 0)|round(1) }}/10</td>
-            </tr>
-            <tr>
-                <td><strong>Bottleneck:</strong></td>
-                <td>{{ predictions.get('bottleneck', 'unknown')|upper }}</td>
-            </tr>
-        </table>
-        {% endif %}
-        
-        {% if anomalies %}
-        <h2>⚠️ Detected Anomalies</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>Type</th>
-                    <th>Severity</th>
-                    <th>Description</th>
-                    <th>Timestamp</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for anomaly in anomalies[-10:] %}
-                <tr>
-                    <td>{{ anomaly.get('type', 'Unknown') }}</td>
-                    <td><span class="status-badge status-{{ anomaly.get('severity', 'low') }}">{{ anomaly.get('severity', 'low')|upper }}</span></td>
-                    <td>{{ anomaly.get('description', 'N/A') }}</td>
-                    <td>{{ anomaly.get('timestamp', 'N/A') }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        {% endif %}
-        
-        {% if recommendations %}
-        <h2>💡 Automated Recommendations</h2>
-        <ul>
-            {% for rec in recommendations[-5:] %}
-            <li style="margin: 10px 0;">
-                <strong>{{ rec.get('type', 'Recommendation') }}:</strong> {{ rec.get('action', 'N/A') }}
-                <br><small style="color: #666;">{{ rec.get('reason', '') }}</small>
-            </li>
-            {% endfor %}
-        </ul>
-        {% endif %}
-        
-        {% if operation_effectiveness %}
-        <h2>📊 Most Effective Operations</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>Entity</th>
-                    <th>Operation</th>
-                    <th>Impact Score</th>
-                    <th>Avg CPU Change</th>
-                    <th>Avg Memory Change</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for eff in operation_effectiveness %}
-                <tr>
-                    <td>{{ eff.get('entity_type', 'N/A') }}</td>
-                    <td>{{ eff.get('operation', 'N/A') }}</td>
-                    <td>{{ eff.get('impact_score', 0)|round(2) }}</td>
-                    <td>{{ eff.get('avg_cpu_change', 0)|round(2) }}%</td>
-                    <td>{{ eff.get('avg_memory_change', 0)|round(2) }}%</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        {% endif %}
-        
-        {% if entity_breakdown %}
-        <h2>📋 Entity Breakdown</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>Entity Type</th>
-                    <th>Total</th>
-                    <th>Success</th>
-                    <th>Failed</th>
-                    <th>Success Rate</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for entity_type, stats in entity_breakdown.items() %}
-                <tr>
-                    <td><strong>{{ entity_type }}</strong></td>
-                    <td>{{ stats.get('total', 0) }}</td>
-                    <td>{{ stats.get('success', 0) }}</td>
-                    <td>{{ stats.get('failed', 0) }}</td>
-                    <td>{{ ((stats.get('success', 0) / stats.get('total', 1)) * 100)|round(1) }}%</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        {% endif %}
-        
-        <h2>🔨 Operation Details (All {{ operations_history|length }} Operations)</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>#</th>
-                    <th>Entity</th>
-                    <th>Operation</th>
-                    <th>Name</th>
-                    <th>Duration</th>
-                    <th>Status</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for op in operations_history %}
-                <tr>
-                    <td>{{ loop.index }}</td>
-                    <td>{{ op.get('entity_type', 'N/A') }}</td>
-                    <td>{{ op.get('operation', 'N/A') }}</td>
-                    <td><code>{{ op.get('entity_name', 'N/A') }}</code></td>
-                    <td>{{ op.get('duration_seconds', 0)|round(2) }}s</td>
-                    <td>
-                        <span class="status-badge status-{{ op.get('status', 'UNKNOWN')|lower }}">
-                            {{ op.get('status', 'UNKNOWN') }}
-                        </span>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        
-        <div style="margin-top: 50px; padding-top: 20px; border-top: 1px solid #ddd; color: #999; font-size: 12px;">
-            Generated by NMT Smart Execution Tool • {{ timestamp }}
-        
-        {% if pod_operation_correlation and pod_operation_correlation.get('operations') %}
-        <h2>🔗 Pod-Operation Correlation</h2>
-        <p style="color: #666; margin-bottom: 20px;">This section shows which pods were affected by each operation and their resource changes.</p>
-        {% for op in pod_operation_correlation.get('operations', []) %}
-        <h3 style="color: #667eea; margin-top: 30px;">{{ op.get('entity_type') }}.{{ op.get('operation_type') }} - {{ op.get('entity_name') }}</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>Pod Name</th>
-                    <th>Namespace</th>
-                    <th>Node</th>
-                    <th>CPU Before</th>
-                    <th>CPU After</th>
-                    <th>CPU Δ</th>
-                    <th>Memory Before</th>
-                    <th>Memory After</th>
-                    <th>Memory Δ</th>
-                    <th>Impact Score</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for pod in op.get('pods', []) %}
-                <tr>
-                    <td><code>{{ pod.get('pod_name') }}</code></td>
-                    <td>{{ pod.get('namespace') }}</td>
-                    <td>{{ pod.get('node_name', 'N/A') }}</td>
-                    <td>{{ pod.get('cpu_before', 0)|round(2) }}%</td>
-                    <td>{{ pod.get('cpu_after', 0)|round(2) }}%</td>
-                    <td style="color: {% if pod.get('cpu_delta', 0) > 0 %}#dc3545{% else %}#28a745{% endif %}; font-weight: bold;">
-                        {{ pod.get('cpu_delta', 0)|round(2) }}%
-                    </td>
-                    <td>{{ pod.get('memory_before', 0)|round(2) }}MB</td>
-                    <td>{{ pod.get('memory_after', 0)|round(2) }}MB</td>
-                    <td style="color: {% if pod.get('memory_delta', 0) > 0 %}#dc3545{% else %}#28a745{% endif %}; font-weight: bold;">
-                        {{ pod.get('memory_delta', 0)|round(2) }}MB
-                    </td>
-                    <td>{{ pod.get('impact_score', 0)|round(2) }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        {% endfor %}
-        <div style="background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 20px 0;">
-            <strong>Summary:</strong> {{ pod_operation_correlation.get('summary', {}).get('total_pods_affected', 0) }} pods affected across {{ pod_operation_correlation.get('summary', {}).get('total_operations', 0) }} operations
-        </div>
-        {% endif %}
-        
-        </div>
-    </div>
-</body>
-</html>'''
-            template = Template(html_template)
-        else:
-            with open(template_path, 'r') as f:
-                template = Template(f.read())
-        
-        # Prepare data (safely handle None values)
-        # Ensure status is a dict - CRITICAL CHECK
-        if status is None:
-            logging.error(f"CRITICAL: status is None before template rendering")
-            return jsonify({'success': False, 'error': 'Execution status is None'}), 500
-        
-        if not isinstance(status, dict):
-            logging.error(f"status is not a dict: {type(status)}")
-            status = {}
-        
-        if report_data is None:
-            logging.warning(f"report_data is None, using status as report_data")
-            report_data = status
-        
-        if not isinstance(report_data, dict):
-            logging.error(f"report_data is not a dict: {type(report_data)}")
-            report_data = {}
-        
-        total_ops = status.get('total_operations', 0) or 0
-        duration_mins = status.get('duration_minutes', 0) or 0.1
-        
-        ops_per_minute = status.get('operations_per_minute', 0) or (total_ops / max(duration_mins, 0.1))
-        
-        operations_history_list = status.get('operations_history') or []
-        if not isinstance(operations_history_list, list):
-            operations_history_list = []
-        
-        successful_ops = status.get('successful_operations', 0) or sum(1 for op in operations_history_list if isinstance(op, dict) and op.get('status') == 'SUCCESS')
-        success_rate = status.get('success_rate', 0) or (successful_ops / max(total_ops, 1)) * 100
-        
-        # Get all operations history (not just last 20)
-        if isinstance(operations_history_list, list) and len(operations_history_list) > 0:
-            operations_history = operations_history_list
-        else:
-            operations_history = []
-        
-        # Get enhanced metrics (safely handle None)
-        final_metrics = status.get('current_metrics') or status.get('final_metrics') or {}
-        if not isinstance(final_metrics, dict):
-            final_metrics = {}
-        
-        baseline_metrics = status.get('baseline_metrics') or {}
-        if not isinstance(baseline_metrics, dict):
-            baseline_metrics = {}
-        
-        # Get Phase 1-3 data (safely handle None values)
-        predictions = status.get('predictions') or report_data.get('predictions') if isinstance(report_data, dict) else None
-        if predictions is None:
-            predictions = {}
-        elif not isinstance(predictions, dict):
-            predictions = {}
-        
-        anomalies = status.get('detected_anomalies') or (report_data.get('detected_anomalies') if isinstance(report_data, dict) else [])
-        if not isinstance(anomalies, list):
-            anomalies = []
-        
-        recommendations = status.get('recommendations') or (report_data.get('recommendations') if isinstance(report_data, dict) else [])
-        if not isinstance(recommendations, list):
-            recommendations = []
-        
-        operation_effectiveness = status.get('operation_effectiveness') or (report_data.get('operation_effectiveness') if isinstance(report_data, dict) else [])
-        if not isinstance(operation_effectiveness, list):
-            operation_effectiveness = []
-        
-        entity_breakdown = status.get('entity_breakdown') or (report_data.get('entity_breakdown') if isinstance(report_data, dict) else {})
-        if not isinstance(entity_breakdown, dict):
-            entity_breakdown = {}
-        
-        # Extract pod correlation data
-        pod_operation_correlation = status.get('pod_operation_correlation') or (report_data.get('pod_operation_correlation') if isinstance(report_data, dict) else {})
-        if not isinstance(pod_operation_correlation, dict):
-            pod_operation_correlation = {}
-        
-        # Safely get testbed_label - ensure status is valid first
-        if status is None:
-            logging.error("CRITICAL: status is None when trying to get testbed_info")
-            return jsonify({'success': False, 'error': 'Execution status is None'}), 500
-        
-        if not isinstance(status, dict):
-            logging.error("CRITICAL: status is not a dict when trying to get testbed_info")
-            status = {}
-        
-        testbed_info = status.get('testbed_info') if isinstance(status, dict) else {}
-        if not isinstance(testbed_info, dict):
-            testbed_info = {}
-        testbed_label = testbed_info.get('testbed_label') or (report_data.get('testbed') if isinstance(report_data, dict) else 'Unknown') or 'Unknown'
-        
-        # Ensure final_metrics is a dict before accessing nested keys
-        if not isinstance(final_metrics, dict):
-            final_metrics = {}
-        
-        # Safely extract nested metrics
-        network_metrics = final_metrics.get('network', {}) if isinstance(final_metrics, dict) else {}
-        if not isinstance(network_metrics, dict):
-            network_metrics = {}
-        
-        disk_metrics = final_metrics.get('disk', {}) if isinstance(final_metrics, dict) else {}
-        if not isinstance(disk_metrics, dict):
-            disk_metrics = {}
-        
-        latency_metrics = final_metrics.get('latency', {}) if isinstance(final_metrics, dict) else {}
-        if not isinstance(latency_metrics, dict):
-            latency_metrics = {}
-        
-        # Ensure baseline_metrics is a dict
-        if not isinstance(baseline_metrics, dict):
-            baseline_metrics = {}
-        
-        # Ensure operations_history is a list
-        if not isinstance(operations_history, list):
-            operations_history = []
-        
-        # Ensure target_config is a dict
-        target_config = status.get('target_config') or {}
-        if not isinstance(target_config, dict):
-            target_config = {}
-        
-        logging.info(f"DEBUG: Template variables prepared - final_metrics type: {type(final_metrics)}, baseline_metrics type: {type(baseline_metrics)}")
-        
-        html_content = template.render(
-            execution_id=execution_id,
-            testbed_label=testbed_label,
-            status=status.get('status', 'UNKNOWN') if isinstance(status, dict) else 'UNKNOWN',
-            timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            total_operations=total_ops,
-            duration_minutes=duration_mins,
-            ops_per_minute=ops_per_minute,
-            success_rate=success_rate,
-            target_config=target_config,
-            baseline_metrics=baseline_metrics,
-            final_metrics=final_metrics,
-            operations_history=operations_history,
-            predictions=predictions,
-            anomalies=anomalies,
-            recommendations=recommendations,
-            operation_effectiveness=operation_effectiveness,
-            entity_breakdown=entity_breakdown,
-            threshold_reached=status.get('threshold_reached', False) if isinstance(status, dict) else False,
-            network_metrics=network_metrics,
-            disk_metrics=disk_metrics,
-            latency_metrics=latency_metrics,
-            pod_operation_correlation=pod_operation_correlation
-        )
-        
-        from flask import make_response
-        response = make_response(html_content)
-        response.headers['Content-Type'] = 'text/html'
-        response.headers['Content-Disposition'] = f'attachment; filename=smart-execution-{execution_id[:10]}.html'
-        
-        return response
-        
+        return _smart_execution_legacy_download_response(execution_id)
     except Exception as e:
         logging.exception("Error generating HTML report")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -5514,6 +5009,11 @@ def get_enhanced_smart_execution_report(execution_id):
 
         final_metrics = status.get('current_metrics') or status.get('final_metrics') or {}
         baseline_metrics = status.get('baseline_metrics') or {}
+        effm = enhanced_data.get('effective_metrics') or {}
+        if isinstance(effm.get('final'), dict) and effm['final']:
+            final_metrics = effm['final']
+        if isinstance(effm.get('baseline'), dict) and effm['baseline']:
+            baseline_metrics = effm['baseline']
         target_config = status.get('target_config') or {}
         entity_breakdown = status.get('entity_breakdown') or report_data.get('entity_breakdown') or {}
         operation_effectiveness = status.get('operation_effectiveness') or report_data.get('operation_effectiveness') or []
@@ -5553,6 +5053,9 @@ def get_enhanced_smart_execution_report(execution_id):
             cluster_health=enhanced_data['cluster_health'],
             capacity_planning=enhanced_data['capacity_planning'],
             historical_comparison=enhanced_data['historical_comparison'],
+            iteration_timeline=enhanced_data.get('iteration_timeline') or {},
+            entity_operation_counts=enhanced_data.get('entity_operation_counts') or [],
+            metrics_resolution_note=effm.get('resolution_note') or 'stored',
             # JSON for charts
             metrics_history_json=json_mod.dumps(metrics_history),
             operations_history_json=json_mod.dumps(operations_history),
@@ -5578,6 +5081,17 @@ def get_enhanced_smart_execution_report(execution_id):
     except Exception as e:
         logging.exception("Error generating enhanced report")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _smart_execution_legacy_download_response(execution_id):
+    """Reuse enhanced HTML report for /download (parity with UI); shorter attachment filename."""
+    resp = get_enhanced_smart_execution_report(execution_id)
+    if resp.status_code != 200:
+        return resp
+    ct = resp.headers.get('Content-Type', '')
+    if ct and 'text/html' in ct:
+        resp.headers['Content-Disposition'] = f'attachment; filename=smart-execution-{execution_id[:10]}.html'
+    return resp
 
 
 @app.route('/api/smart-execution/<execution_id>', methods=['DELETE'])
@@ -6183,9 +5697,16 @@ def get_smart_execution_report(execution_id):
                 
                 report['ai_insights'] = ai_insights
             
+            # Include resource_summary and anomaly data from DB
+            report['resource_summary'] = db_data.get('resource_summary') or {}
+            report['anomaly_data'] = db_data.get('anomaly_data') or []
+            report['anomaly_count'] = db_data.get('anomaly_count', 0)
+            report['learning_summary'] = db_data.get('learning_summary')
+            report['latency_summary'] = db_data.get('latency_summary')
+            
             # Include full execution data if available
             full_data = db_data.get('full_execution_data', {})
-            if full_data:
+            if full_data and isinstance(full_data, dict):
                 report.update({
                     'predictions': full_data.get('predictions'),
                     'detected_anomalies': full_data.get('detected_anomalies', []),
@@ -6196,12 +5717,83 @@ def get_smart_execution_report(execution_id):
                     'disk': full_data.get('current_metrics', {}).get('disk'),
                     'latency': full_data.get('current_metrics', {}).get('latency')
                 })
+                # Longevity data from full execution data
+                longevity = full_data.get('longevity', {})
+                if longevity:
+                    report['longevity'] = longevity
             return jsonify(report), 200
         
         return jsonify({'success': False, 'error': 'Execution not found'}), 404
         
     except Exception as e:
         logging.exception("Error getting smart execution report")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ===========================
+# Longevity Health Check APIs
+# ===========================
+
+@app.route('/api/smart-execution/<execution_id>/health-check', methods=['POST'])
+def trigger_health_check(execution_id):
+    """Manually trigger a health check for a running longevity execution."""
+    try:
+        from services.smart_execution_service import get_smart_execution
+        controller = get_smart_execution(execution_id)
+        if not controller:
+            return jsonify({'success': False, 'error': 'Execution not found or not running'}), 404
+
+        if not hasattr(controller, '_health_checker') or not controller._health_checker:
+            return jsonify({'success': False, 'error': 'Health checker not initialized. Enable longevity mode.'}), 400
+
+        result = controller._health_checker.run_all_checks(
+            interval_minutes=controller._longevity_health_interval_min
+        )
+        controller._health_check_results.append(result)
+        controller._last_health_check_time = datetime.now(timezone.utc)
+
+        return jsonify({'success': True, 'health_check': result}), 200
+    except Exception as e:
+        logging.exception("Error triggering health check")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/smart-execution/<execution_id>/health-history', methods=['GET'])
+def get_health_history(execution_id):
+    """Get health check history for an execution."""
+    try:
+        from services.smart_execution_service import get_smart_execution
+        from services.smart_execution_db import load_smart_execution
+
+        controller = get_smart_execution(execution_id)
+        if controller:
+            return jsonify({
+                'success': True,
+                'execution_id': execution_id,
+                'health_baseline': controller._health_baseline,
+                'health_checks': controller._health_check_results,
+                'checkpoint_reports': controller._checkpoint_reports,
+                'entity_parity': controller._entity_parity_snapshots,
+                'longevity_enabled': controller._longevity_enabled,
+            }), 200
+
+        db_data = load_smart_execution(execution_id)
+        if db_data:
+            full = db_data.get('full_execution_data', {}) or {}
+            longevity = full.get('longevity', {})
+            return jsonify({
+                'success': True,
+                'execution_id': execution_id,
+                'health_baseline': longevity.get('health_baseline', {}),
+                'health_checks': longevity.get('health_check_results', []),
+                'checkpoint_reports': longevity.get('checkpoint_reports', []),
+                'entity_parity': longevity.get('entity_parity', []),
+                'longevity_enabled': longevity.get('enabled', False),
+            }), 200
+
+        return jsonify({'success': False, 'error': 'Execution not found'}), 404
+    except Exception as e:
+        logging.exception("Error getting health history")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

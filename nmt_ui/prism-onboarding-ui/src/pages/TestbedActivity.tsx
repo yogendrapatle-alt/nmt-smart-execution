@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import Layout from '../components/Layout';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Execution {
   execution_id: string;
@@ -39,7 +40,7 @@ const TestbedActivity: React.FC = () => {
   const fetchTestbedAndExecutions = async () => {
     try {
       setLoading(true);
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       
       // Fetch testbed details
       const testbedResponse = await fetch(`${backendUrl}/api/get-testbeds`);

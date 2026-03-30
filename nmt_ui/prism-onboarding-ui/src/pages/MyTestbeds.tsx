@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import ntnxLogo from '../assets/new_nutanix_logo.png';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds } from '../fake-data';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Testbed {
   id: number;
@@ -41,7 +42,7 @@ const MyTestbeds: React.FC = () => {
         return;
       }
 
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       console.log('Fetching testbeds from:', backendUrl);
 
       const response = await fetch(`${backendUrl}/api/get-testbeds`);
@@ -97,7 +98,7 @@ const MyTestbeds: React.FC = () => {
         return;
       }
 
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       console.log(`Deleting testbed: ${testbed.unique_testbed_id}`);
       
       const response = await fetch(`${backendUrl}/api/delete-testbed/${testbed.unique_testbed_id}`, {

@@ -7,6 +7,7 @@ import { sortAlerts, SORTABLE_COLUMNS } from '../utils/summary_sort';
 import { AlertDetailModal } from './AlertDetailModel';
 import MultiUserEmailSchedule from './MultiUserEmailSchedule';
 import { useAlertSearch } from '../hooks/useAlertSearch';
+import { getApiBase } from '../utils/backendUrl';
 
 
 
@@ -36,7 +37,7 @@ const AlertSummary: React.FC = () => {
 
   useEffect(() => {
     // Fetch the host_ip and host_port from backend - always use localhost:5000 in development
-    const backendUrl = 'http://localhost:5000';
+    const backendUrl = getApiBase();
     fetch(`${backendUrl}/api/prometheus-port`)
       .then(res => res.json())
       .then(data => {
@@ -70,7 +71,7 @@ const AlertSummary: React.FC = () => {
       // Pagination can be added here if needed
 
       // Always use localhost:5000 for backend in development
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const response = await fetch(`${backendUrl}/api/alerts?${params.toString()}`);
       if (!response.ok) {
         const errorText = await response.text();

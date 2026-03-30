@@ -17,11 +17,36 @@ import joblib
 import os
 from typing import List, Dict, Tuple, Optional
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
+
+# Fixed vocabulary avoids LabelEncoder instability across train/predict cycles
+KNOWN_ENTITIES = [
+    'vm', 'blueprint_single_vm', 'blueprint_multi_vm', 'playbook',
+    'scenario', 'rate_card', 'business_unit', 'cost_center',
+    'project', 'recovery_plan', 'protection_policy', 'category',
+]
+
+KNOWN_OPERATIONS = [
+    'CREATE', 'DELETE', 'UPDATE', 'LIST', 'EXECUTE', 'READ',
+    'CLONE', 'POWER_ON', 'POWER_OFF', 'MIGRATE', 'SNAPSHOT',
+]
+
+_ENTITY_MAP = {e: i for i, e in enumerate(KNOWN_ENTITIES)}
+_OPERATION_MAP = {o: i for i, o in enumerate(KNOWN_OPERATIONS)}
+_UNKNOWN_ENTITY_IDX = len(KNOWN_ENTITIES)
+_UNKNOWN_OP_IDX = len(KNOWN_OPERATIONS)
+
+
+def encode_entity(entity_type: str) -> int:
+    return _ENTITY_MAP.get(entity_type.lower(), _UNKNOWN_ENTITY_IDX)
+
+
+def encode_operation(operation: str) -> int:
+    return _OPERATION_MAP.get(operation.upper(), _UNKNOWN_OP_IDX)
 
 
 class OperationImpactPredictor:
@@ -42,7 +67,6 @@ class OperationImpactPredictor:
         Args:
             model_dir: Directory to save/load models (optional)
         """
-        # ML Models for CPU and Memory prediction
         self.cpu_model = GradientBoostingRegressor(
             n_estimators=100,
             learning_rate=0.1,
@@ -61,11 +85,6 @@ class OperationImpactPredictor:
             random_state=42
         )
         
-        # Encoders for categorical features
-        self.entity_encoder = LabelEncoder()
-        self.operation_encoder = LabelEncoder()
-        
-        # Training state
         self.is_trained = False
         self.feature_names = [
             'entity_encoded',
@@ -73,14 +92,21 @@ class OperationImpactPredictor:
             'current_cpu',
             'current_memory',
             'cluster_size',
-            'current_load'
+            'current_load',
+            'duration_seconds',
+            'concurrent_ops',
+            'hour_of_day',
+            'cpu_trend',
         ]
         
-        # Model directory
+        self._scaler = StandardScaler()
+        self._numeric_cols = list(range(2, 10))
+        self._scaler_fitted = False
+        
         self.model_dir = model_dir or '/tmp/nmt_ml_models'
         os.makedirs(self.model_dir, exist_ok=True)
         
-        logger.info("🤖 ML Operation Impact Predictor initialized")
+        logger.info("ML Operation Impact Predictor initialized (10-feature, normalized, fixed vocab)")
     
     def train(self, historical_data: List[Dict]) -> Dict:
         """
@@ -107,6 +133,11 @@ class OperationImpactPredictor:
         
         # Extract features and targets
         X, y_cpu, y_memory = self._prepare_training_data(historical_data)
+        
+        # Normalize continuous numeric features (columns 2-9)
+        self._scaler.fit(X[:, self._numeric_cols])
+        self._scaler_fitted = True
+        X[:, self._numeric_cols] = self._scaler.transform(X[:, self._numeric_cols])
         
         # Split into train and test
         X_train, X_test, y_cpu_train, y_cpu_test, y_memory_train, y_memory_test = \
@@ -143,38 +174,25 @@ class OperationImpactPredictor:
     
     def _prepare_training_data(self, data: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Convert raw data into feature matrix and target vectors
-        
-        Args:
-            data: List of historical records
-            
-        Returns:
-            Tuple of (X, y_cpu, y_memory)
+        Convert raw data into 10-feature matrix and target vectors.
+        Uses fixed vocabulary encoding (no LabelEncoder refit).
         """
-        # Extract all unique entities and operations for encoding
-        entities = [d['entity_type'] for d in data]
-        operations = [d['operation'] for d in data]
-        
-        # Fit encoders
-        self.entity_encoder.fit(entities)
-        self.operation_encoder.fit(operations)
-        
-        # Build feature matrix
         features = []
         cpu_targets = []
         memory_targets = []
         
         for record in data:
-            entity_encoded = self.entity_encoder.transform([record['entity_type']])[0]
-            operation_encoded = self.operation_encoder.transform([record['operation']])[0]
-            
             feature_vector = [
-                entity_encoded,
-                operation_encoded,
+                encode_entity(record.get('entity_type', '')),
+                encode_operation(record.get('operation', '')),
                 record.get('current_cpu', 0),
                 record.get('current_memory', 0),
                 record.get('cluster_size', 1),
-                record.get('current_load', 10)
+                record.get('current_load', 10),
+                record.get('duration_seconds', 0),
+                record.get('concurrent_ops', 0),
+                record.get('hour_of_day', 12),
+                record.get('cpu_trend', 0.0),
             ]
             
             features.append(feature_vector)
@@ -189,55 +207,36 @@ class OperationImpactPredictor:
     
     def predict(self, entity_type: str, operation: str, current_metrics: Dict) -> Dict:
         """
-        Predict impact of a specific operation
-        
-        Args:
-            entity_type: Entity type (e.g., 'vm', 'blueprint')
-            operation: Operation (e.g., 'CREATE', 'DELETE')
-            current_metrics: Current system state with:
-                - cpu: Current CPU %
-                - memory: Current Memory %
-                - cluster_size: Number of nodes
-                - current_load: Current ops/min
-                
-        Returns:
-            Dictionary with:
-                - cpu_impact: Predicted CPU increase (%)
-                - memory_impact: Predicted Memory increase (%)
-                - confidence: Prediction confidence (0-1)
+        Predict impact of a specific operation.
+        Uses fixed vocabulary encoding — unknown entities/ops get a safe fallback index.
         """
         if not self.is_trained:
             raise RuntimeError("Model not trained yet. Call train() first.")
         
-        # Check if entity/operation are known
-        if entity_type not in self.entity_encoder.classes_:
-            logger.warning(f"Unknown entity type: {entity_type}, using default")
-            entity_type = self.entity_encoder.classes_[0]
-        
-        if operation not in self.operation_encoder.classes_:
-            logger.warning(f"Unknown operation: {operation}, using default")
-            operation = self.operation_encoder.classes_[0]
-        
-        # Encode features
-        entity_encoded = self.entity_encoder.transform([entity_type])[0]
-        operation_encoded = self.operation_encoder.transform([operation])[0]
-        
         feature_vector = np.array([[
-            entity_encoded,
-            operation_encoded,
+            encode_entity(entity_type),
+            encode_operation(operation),
             current_metrics.get('cpu', 0),
             current_metrics.get('memory', 0),
             current_metrics.get('cluster_size', 1),
-            current_metrics.get('current_load', 10)
+            current_metrics.get('current_load', 10),
+            current_metrics.get('duration_seconds', 0),
+            current_metrics.get('concurrent_ops', 0),
+            current_metrics.get('hour_of_day', 12),
+            current_metrics.get('cpu_trend', 0.0),
         ]])
         
-        # Predict
+        if self._scaler_fitted:
+            feature_vector[:, self._numeric_cols] = self._scaler.transform(
+                feature_vector[:, self._numeric_cols]
+            )
+        
         cpu_impact = self.cpu_model.predict(feature_vector)[0]
         memory_impact = self.memory_model.predict(feature_vector)[0]
         
-        # Estimate confidence (based on feature importances)
-        # Higher for operations seen during training
-        confidence = 0.8  # Default confidence
+        entity_known = entity_type.lower() in _ENTITY_MAP
+        op_known = operation.upper() in _OPERATION_MAP
+        confidence = 0.85 if (entity_known and op_known) else 0.5
         
         return {
             'cpu_impact': round(max(0, cpu_impact), 3),
@@ -270,9 +269,8 @@ class OperationImpactPredictor:
         
         recommendations = []
         
-        # Try all known entity-operation combinations
-        for entity_type in self.entity_encoder.classes_:
-            for operation in self.operation_encoder.classes_:
+        for entity_type in KNOWN_ENTITIES:
+            for operation in KNOWN_OPERATIONS:
                 try:
                     prediction = self.predict(entity_type, operation, current_metrics)
                     
@@ -345,13 +343,13 @@ class OperationImpactPredictor:
         model_data = {
             'cpu_model': self.cpu_model,
             'memory_model': self.memory_model,
-            'entity_encoder': self.entity_encoder,
-            'operation_encoder': self.operation_encoder,
-            'feature_names': self.feature_names
+            'feature_names': self.feature_names,
+            'scaler': self._scaler if self._scaler_fitted else None,
+            'model_version': 3,
         }
         
         joblib.dump(model_data, model_path)
-        logger.info(f"💾 Models saved to {model_path}")
+        logger.info(f"Models saved to {model_path}")
     
     def load(self, name: str = 'default'):
         """
@@ -369,12 +367,14 @@ class OperationImpactPredictor:
         
         self.cpu_model = model_data['cpu_model']
         self.memory_model = model_data['memory_model']
-        self.entity_encoder = model_data['entity_encoder']
-        self.operation_encoder = model_data['operation_encoder']
-        self.feature_names = model_data['feature_names']
+        self.feature_names = model_data.get('feature_names', self.feature_names)
+        loaded_scaler = model_data.get('scaler')
+        if loaded_scaler is not None:
+            self._scaler = loaded_scaler
+            self._scaler_fitted = True
         self.is_trained = True
         
-        logger.info(f"📂 Models loaded from {model_path}")
+        logger.info(f"Models loaded from {model_path}")
 
 
 def generate_synthetic_training_data(num_samples: int = 100) -> List[Dict]:
@@ -443,6 +443,11 @@ def generate_synthetic_training_data(num_samples: int = 100) -> List[Dict]:
         cpu_impact *= saturation_factor
         memory_impact *= saturation_factor
         
+        duration = random.uniform(2, 120)
+        concurrent = random.randint(1, 10)
+        hour = random.randint(0, 23)
+        cpu_trend = random.uniform(-2.0, 5.0)
+
         data.append({
             'entity_type': entity,
             'operation': operation,
@@ -451,7 +456,11 @@ def generate_synthetic_training_data(num_samples: int = 100) -> List[Dict]:
             'cluster_size': cluster_size,
             'current_load': current_load,
             'cpu_impact': cpu_impact,
-            'memory_impact': memory_impact
+            'memory_impact': memory_impact,
+            'duration_seconds': duration,
+            'concurrent_ops': concurrent,
+            'hour_of_day': hour,
+            'cpu_trend': cpu_trend,
         })
     
     return data

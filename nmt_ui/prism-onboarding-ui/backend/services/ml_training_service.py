@@ -418,8 +418,38 @@ def get_ml_insights(testbed_id: Optional[str] = None) -> Dict:
     return insights
 
 
+_drift_error_buffer: Dict[str, list] = {}
+
+DRIFT_WINDOW = 20
+DRIFT_THRESHOLD = 0.5
+
+
+def _check_prediction_drift(testbed_id: str) -> bool:
+    """Return True if recent prediction errors suggest model drift."""
+    errors = _drift_error_buffer.get(testbed_id, [])
+    if len(errors) < DRIFT_WINDOW:
+        return False
+    recent = errors[-DRIFT_WINDOW:]
+    older = errors[-(DRIFT_WINDOW * 2):-DRIFT_WINDOW] if len(errors) >= DRIFT_WINDOW * 2 else recent[:len(recent) // 2]
+    if not older:
+        return False
+    recent_mae = sum(abs(e) for e in recent) / len(recent)
+    older_mae = sum(abs(e) for e in older) / len(older)
+    drift = recent_mae - older_mae
+    return drift > DRIFT_THRESHOLD
+
+
+def record_prediction_error(testbed_id: str, predicted: float, actual: float):
+    """Record a prediction error for drift detection."""
+    if testbed_id not in _drift_error_buffer:
+        _drift_error_buffer[testbed_id] = []
+    _drift_error_buffer[testbed_id].append(predicted - actual)
+    if len(_drift_error_buffer[testbed_id]) > 200:
+        _drift_error_buffer[testbed_id] = _drift_error_buffer[testbed_id][-200:]
+
+
 def check_auto_retrain(testbed_id: str):
-    """Check if auto-retrain is needed based on new samples count."""
+    """Check if auto-retrain is needed based on sample count OR prediction drift."""
     try:
         stats = _get_data_stats(testbed_id)
         total_samples = stats.get('total_samples', 0)
@@ -433,6 +463,16 @@ def check_auto_retrain(testbed_id: str):
                     args=(testbed_id, 'auto_first'),
                     daemon=True
                 ).start()
+            return
+
+        # Drift-based trigger takes priority
+        if _check_prediction_drift(testbed_id):
+            logger.info(f"Drift-based retrain triggered for testbed {testbed_id}")
+            threading.Thread(
+                target=train_model,
+                args=(testbed_id, 'auto_drift'),
+                daemon=True
+            ).start()
             return
 
         trained_on = active.get('samples_used', 0)

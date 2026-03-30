@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import '../styles/CostOptimization.css';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Recommendation {
   type: string;
@@ -23,7 +24,7 @@ const CostOptimization: React.FC = () => {
 
   const loadRecommendations = async () => {
     try {
-      const response = await axios.get('http://localhost:5000/api/costs/optimization-recommendations');
+      const response = await axios.get(`${getApiBase()}/api/costs/optimization-recommendations`);
       if (response.data.success) {
         setRecommendations(response.data.recommendations);
         

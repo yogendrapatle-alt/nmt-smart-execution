@@ -13,6 +13,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import '../styles/ScheduledExecutions.css';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Schedule {
   id: number;
@@ -91,7 +92,7 @@ const ScheduledExecutions: React.FC = () => {
 
   const fetchTestbeds = async () => {
     try {
-      const response = await fetch('http://localhost:5000/api/get-testbeds');
+      const response = await fetch(`${getApiBase()}/api/get-testbeds`);
       const data = await response.json();
       
       if (data.success && data.testbeds) {

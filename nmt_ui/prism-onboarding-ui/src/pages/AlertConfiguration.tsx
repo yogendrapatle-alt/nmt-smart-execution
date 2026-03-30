@@ -6,6 +6,7 @@
 
 import React, { useState, useEffect } from 'react';
 import '../styles/AlertConfiguration.css';
+import { getApiBase } from '../utils/backendUrl';
 
 interface AlertConfig {
   slack: {
@@ -56,7 +57,7 @@ const AlertConfiguration: React.FC = () => {
 
   const fetchTestbeds = async () => {
     try {
-      const response = await fetch('http://localhost:5000/api/get-testbeds');
+      const response = await fetch(`${getApiBase()}/api/get-testbeds`);
       const data = await response.json();
       if (data.success && data.testbeds) {
         setTestbeds(data.testbeds);

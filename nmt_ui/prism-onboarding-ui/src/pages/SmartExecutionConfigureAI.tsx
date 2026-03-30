@@ -13,6 +13,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import '../styles/SmartExecutionConfigureAI.css';
 import { IS_FAKE_MODE } from '../config/fakeMode';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Testbed {
   unique_testbed_id: string;
@@ -49,8 +50,15 @@ const SmartExecutionConfigureAI: React.FC = () => {
   const [testbeds, setTestbeds] = useState<Testbed[]>([]);
   const [selectedTestbed, setSelectedTestbed] = useState<string>('');
   const [availableEntities, setAvailableEntities] = useState<string[]>([
-    'vm', 'blueprint_single_vm', 'blueprint_multi_vm', 'playbook', 'scenario',
-    'rate_card', 'business_unit', 'cost_center', 'analysis_session', 'budget'
+    'vm', 'project', 'category', 'image', 'subnet', 'cluster', 'alert',
+    'endpoint', 'library_variable', 'runbook',
+    'blueprint_single_vm', 'blueprint_multi_vm', 'playbook',
+    'application', 'marketplace_item',
+    'uda_policy', 'scenario', 'analysis_session',
+    'report_config', 'report_instance',
+    'business_unit', 'cost_center', 'budget', 'rate_card',
+    'action_rule', 'dashboard', 'network_security_policy',
+    'address_group', 'service_group', 'vpc', 'environment'
   ]);
   const [selectedEntities, setSelectedEntities] = useState<Record<string, string[]>>({});
   
@@ -113,6 +121,24 @@ const SmartExecutionConfigureAI: React.FC = () => {
   // Entity cooldown
   const [entityCooldown, setEntityCooldown] = useState<number>(0);
   
+  // Longevity Mode
+  const [longevityEnabled, setLongevityEnabled] = useState<boolean>(false);
+  const [longevityDuration, setLongevityDuration] = useState<number>(24);
+  const [churnIntervalMin, setChurnIntervalMin] = useState<number>(30);
+  const [healthCheckIntervalMin, setHealthCheckIntervalMin] = useState<number>(60);
+  const [checkpointIntervalMin, setCheckpointIntervalMin] = useState<number>(120);
+  const [maintainLoadPct, setMaintainLoadPct] = useState<number>(75);
+  const [healthChecks, setHealthChecks] = useState<Record<string, boolean>>({
+    fatal_scan: true,
+    process_restarts: true,
+    cgroup_oom: true,
+    thread_count: true,
+    disk_usage: true,
+    core_dumps: true,
+    memory_leaks: true,
+  });
+  const [showLongevitySettings, setShowLongevitySettings] = useState<boolean>(false);
+
   // UI State
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
@@ -155,7 +181,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
 
   const fetchTestbeds = async () => {
     try {
-      const response = await fetch('http://localhost:5000/api/get-testbeds');
+      const response = await fetch(`${getApiBase()}/api/get-testbeds`);
       if (response.ok) {
         const data = await response.json();
         if (data.success && data.testbeds) {
@@ -220,7 +246,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
       }
       
       // Try to fetch from backend (if not in fake mode)
-      const response = await fetch('http://localhost:5000/api/smart-execution/available-pods', {
+      const response = await fetch(`${getApiBase()}/api/smart-execution/available-pods`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ testbed_id: selectedTestbed })
@@ -284,19 +310,40 @@ const SmartExecutionConfigureAI: React.FC = () => {
   const getAvailableOperations = (entity: string): string[] => {
     // Define available operations per entity
     const operationsMap: Record<string, string[]> = {
-      vm: ['CREATE', 'DELETE', 'LIST', 'UPDATE'],
-      blueprint_single_vm: ['CREATE', 'DELETE', 'EXECUTE'],
-      blueprint_multi_vm: ['CREATE', 'DELETE', 'EXECUTE'],
+      vm: ['CREATE', 'DELETE', 'LIST', 'UPDATE', 'POWER_ON', 'POWER_OFF', 'CLONE', 'MIGRATE', 'SNAPSHOT_CREATE', 'SNAPSHOT_DELETE', 'ADD_DISK', 'CPU_UPDATE', 'MEMORY_UPDATE'],
+      project: ['CREATE', 'UPDATE', 'DELETE', 'LIST'],
+      category: ['CREATE', 'DELETE'],
+      image: ['CREATE', 'DELETE', 'LIST', 'UPDATE'],
+      subnet: ['LIST'],
+      cluster: ['LIST'],
+      alert: ['LIST'],
+      endpoint: ['CREATE', 'DELETE', 'LIST'],
+      library_variable: ['CREATE', 'DELETE', 'LIST'],
+      runbook: ['CREATE', 'DELETE', 'LIST', 'EXECUTE'],
+      blueprint_single_vm: ['CREATE', 'DELETE', 'EXECUTE', 'LIST'],
+      blueprint_multi_vm: ['CREATE', 'DELETE', 'EXECUTE', 'LIST'],
       playbook: ['CREATE', 'DELETE', 'EXECUTE', 'LIST'],
+      application: ['CREATE', 'DELETE', 'LIST'],
+      marketplace_item: ['LIST', 'PUBLISH', 'UNPUBLISH'],
+      uda_policy: ['CREATE', 'LIST'],
       scenario: ['CREATE', 'DELETE', 'LIST'],
-      rate_card: ['CREATE', 'UPDATE', 'DELETE'],
-      business_unit: ['CREATE', 'UPDATE', 'DELETE'],
-      cost_center: ['CREATE', 'UPDATE', 'DELETE'],
       analysis_session: ['CREATE', 'DELETE'],
-      budget: ['CREATE', 'UPDATE', 'DELETE']
+      report_config: ['CREATE', 'DELETE', 'LIST'],
+      report_instance: ['CREATE', 'DELETE', 'LIST'],
+      business_unit: ['CREATE', 'DELETE'],
+      cost_center: ['CREATE', 'DELETE'],
+      budget: ['CREATE', 'DELETE'],
+      rate_card: ['CREATE', 'DELETE'],
+      action_rule: ['CREATE', 'DELETE', 'LIST'],
+      dashboard: ['CREATE', 'DELETE'],
+      network_security_policy: ['CREATE', 'DELETE'],
+      address_group: ['CREATE', 'DELETE'],
+      service_group: ['CREATE', 'DELETE'],
+      vpc: ['CREATE', 'DELETE'],
+      environment: ['CREATE', 'LIST'],
     };
     
-    return operationsMap[entity] || ['CREATE', 'DELETE', 'LIST', 'UPDATE'];
+    return operationsMap[entity] || ['CREATE', 'DELETE', 'LIST'];
   };
 
   const fetchMLRecommendations = async () => {
@@ -309,7 +356,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
     setError('');
     
     try {
-      const response = await fetch('http://localhost:5000/api/smart-execution/ml-recommendations', {
+      const response = await fetch(`${getApiBase()}/api/smart-execution/ml-recommendations`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -362,7 +409,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
     setRunningPreCheck(true);
     setPreCheckResult(null);
     try {
-      const res = await fetch('http://localhost:5000/api/smart-execution/pre-check', {
+      const res = await fetch(`${getApiBase()}/api/smart-execution/pre-check`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -395,13 +442,22 @@ const SmartExecutionConfigureAI: React.FC = () => {
     setError('');
     
     try {
-      const config = {
+      const config: any = {
         testbed_id: selectedTestbed,
         target_config: {
           cpu_threshold: cpuThreshold,
           memory_threshold: memoryThreshold,
           stop_condition: stopCondition,
-          timeout_minutes: timeoutMinutes > 0 ? timeoutMinutes : undefined
+          timeout_minutes: timeoutMinutes > 0 ? timeoutMinutes : undefined,
+          longevity: longevityEnabled ? {
+            enabled: true,
+            duration_hours: longevityDuration,
+            churn_interval_minutes: churnIntervalMin,
+            health_check_interval_minutes: healthCheckIntervalMin,
+            checkpoint_interval_minutes: checkpointIntervalMin,
+            maintain_load_percent: maintainLoadPct,
+            health_checks: healthChecks,
+          } : { enabled: false }
         },
         entities_config: selectedEntities,
         rule_config: {
@@ -427,7 +483,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
         }
       };
       
-      const response = await fetch('http://localhost:5000/api/smart-execution/start', {
+      const response = await fetch(`${getApiBase()}/api/smart-execution/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config)
@@ -999,6 +1055,82 @@ const SmartExecutionConfigureAI: React.FC = () => {
                     onChange={(e) => setFailureRateThreshold(Number(e.target.value))} />
                 </label>
                 <small style={{ color: '#64748b', display: 'block', marginTop: 4 }}>Trigger anomaly when failure rate exceeds this</small>
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {/* Longevity Mode */}
+      <section className="config-section">
+        <h2 style={{ cursor: 'pointer' }} onClick={() => setShowLongevitySettings(!showLongevitySettings)}>
+          {showLongevitySettings ? '▼' : '▶'} Longevity Mode (NCM Long-Run Testing)
+        </h2>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+          <label className="toggle-label" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={longevityEnabled}
+              onChange={(e) => setLongevityEnabled(e.target.checked)}
+            />
+            <strong>Enable Longevity Mode</strong>
+          </label>
+          <span style={{ fontSize: 13, color: '#64748b' }}>
+            Maintains load at target and runs periodic health checks for extended testing
+          </span>
+        </div>
+
+        {showLongevitySettings && longevityEnabled && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: 16 }}>
+            <div>
+              <label>Duration (hours)</label>
+              <input type="number" min={1} max={720} value={longevityDuration}
+                onChange={(e) => setLongevityDuration(Number(e.target.value))} />
+              <small style={{ color: '#64748b' }}>0 = run indefinitely until stopped</small>
+            </div>
+            <div>
+              <label>Churn Interval (min)</label>
+              <input type="number" min={5} max={240} value={churnIntervalMin}
+                onChange={(e) => setChurnIntervalMin(Number(e.target.value))} />
+              <small style={{ color: '#64748b' }}>How often to cycle entity operations</small>
+            </div>
+            <div>
+              <label>Health Check Interval (min)</label>
+              <input type="number" min={10} max={360} value={healthCheckIntervalMin}
+                onChange={(e) => setHealthCheckIntervalMin(Number(e.target.value))} />
+              <small style={{ color: '#64748b' }}>How often to run system health checks</small>
+            </div>
+            <div>
+              <label>Checkpoint Interval (min)</label>
+              <input type="number" min={30} max={480} value={checkpointIntervalMin}
+                onChange={(e) => setCheckpointIntervalMin(Number(e.target.value))} />
+              <small style={{ color: '#64748b' }}>How often to save progress report</small>
+            </div>
+            <div>
+              <label>Maintain Load at (%)</label>
+              <input type="number" min={20} max={95} value={maintainLoadPct}
+                onChange={(e) => setMaintainLoadPct(Number(e.target.value))} />
+              <small style={{ color: '#64748b' }}>Re-escalate if load drops below this</small>
+            </div>
+
+            <div style={{ gridColumn: '1 / -1' }}>
+              <h3 style={{ margin: '12px 0 8px' }}>Health Checks</h3>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
+                {Object.entries({
+                  fatal_scan: 'FATAL Log Scanning',
+                  process_restarts: 'Process Restart Detection',
+                  cgroup_oom: 'Cgroup OOM Monitoring',
+                  thread_count: 'Thread Count Check',
+                  disk_usage: 'Disk Usage Monitoring',
+                  core_dumps: 'Core Dump Detection',
+                  memory_leaks: 'Memory Leak Detection',
+                }).map(([key, label]) => (
+                  <label key={key} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', background: healthChecks[key] ? '#f0fdf4' : '#f8fafc', border: `1px solid ${healthChecks[key] ? '#22c55e' : '#e2e8f0'}`, borderRadius: 8, cursor: 'pointer', fontSize: 13 }}>
+                    <input type="checkbox" checked={healthChecks[key]}
+                      onChange={(e) => setHealthChecks(prev => ({...prev, [key]: e.target.checked}))} />
+                    {label}
+                  </label>
+                ))}
               </div>
             </div>
           </div>

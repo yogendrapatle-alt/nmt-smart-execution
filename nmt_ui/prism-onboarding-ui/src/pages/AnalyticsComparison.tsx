@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import '../styles/AnalyticsComparison.css';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Testbed {
   unique_testbed_id: string;
@@ -32,7 +33,7 @@ const AnalyticsComparison: React.FC = () => {
 
   const loadTestbeds = async () => {
     try {
-      const response = await axios.get('http://localhost:5000/api/testbeds');
+      const response = await axios.get(`${getApiBase()}/api/testbeds`);
       if (response.data.success) {
         setTestbeds(response.data.testbeds);
       }
@@ -64,7 +65,7 @@ const AnalyticsComparison: React.FC = () => {
       const startDate = new Date();
       startDate.setDate(endDate.getDate() - parseInt(dateRange));
       
-      const response = await axios.post('http://localhost:5000/api/analytics/compare-testbeds', {
+      const response = await axios.post(`${getApiBase()}/api/analytics/compare-testbeds`, {
         testbed_ids: selectedTestbeds,
         start_date: startDate.toISOString().split('T')[0],
         end_date: endDate.toISOString().split('T')[0]

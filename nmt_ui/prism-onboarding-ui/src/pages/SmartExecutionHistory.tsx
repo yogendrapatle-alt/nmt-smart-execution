@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { getApiBase } from '../utils/backendUrl';
 
 interface ChildExecution {
   execution_id: string;
@@ -47,6 +48,7 @@ const SmartExecutionHistory: React.FC = () => {
   const [filterTestbed, setFilterTestbed] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [stoppingId, setStoppingId] = useState<string | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   const [selectedForCompare, setSelectedForCompare] = useState<Set<string>>(new Set());
   const [compareData, setCompareData] = useState<any>(null);
@@ -59,7 +61,7 @@ const SmartExecutionHistory: React.FC = () => {
   const fetchExecutions = async () => {
     try {
       setLoading(true);
-      const response = await fetch('http://localhost:5000/api/smart-execution/history');
+      const response = await fetch(`${getApiBase()}/api/smart-execution/history`);
       const data = await response.json();
       
       if (data.success) {
@@ -76,7 +78,7 @@ const SmartExecutionHistory: React.FC = () => {
 
   const downloadReport = async (executionId: string) => {
     try {
-      const response = await fetch(`http://localhost:5000/api/smart-execution/report/${executionId}/enhanced`);
+      const response = await fetch(`${getApiBase()}/api/smart-execution/report/${executionId}/enhanced`);
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -97,7 +99,7 @@ const SmartExecutionHistory: React.FC = () => {
 
   const rerunExecution = async (executionId: string) => {
     try {
-      const res = await fetch(`http://localhost:5000/api/smart-execution/rerun-config/${executionId}`);
+      const res = await fetch(`${getApiBase()}/api/smart-execution/rerun-config/${executionId}`);
       const data = await res.json();
       if (data.success && data.config) {
         sessionStorage.setItem('rerun_config', JSON.stringify(data.config));
@@ -112,7 +114,7 @@ const SmartExecutionHistory: React.FC = () => {
 
   const downloadCSV = async (executionId: string) => {
     try {
-      const res = await fetch(`http://localhost:5000/api/smart-execution/csv/${executionId}`);
+      const res = await fetch(`${getApiBase()}/api/smart-execution/csv/${executionId}`);
       const blob = await res.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -140,7 +142,7 @@ const SmartExecutionHistory: React.FC = () => {
     if (selectedForCompare.size < 2) { alert('Select at least 2 executions to compare'); return; }
     setComparingFlag(true);
     try {
-      const res = await fetch('http://localhost:5000/api/smart-execution/compare', {
+      const res = await fetch(`${getApiBase()}/api/smart-execution/compare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ execution_ids: Array.from(selectedForCompare) })
@@ -158,7 +160,7 @@ const SmartExecutionHistory: React.FC = () => {
   const cleanupEntities = async (executionId: string) => {
     if (!confirm('🧹 Delete all entities created by this execution?\n(VMs, projects, blueprints, etc.)')) return;
     try {
-      const response = await fetch(`http://localhost:5000/api/smart-execution/cleanup/${executionId}`, { method: 'POST' });
+      const response = await fetch(`${getApiBase()}/api/smart-execution/cleanup/${executionId}`, { method: 'POST' });
       const data = await response.json();
       if (data.success) {
         alert(`Cleanup done: ${data.cleanup_summary?.success || 0}/${data.cleanup_summary?.total || 0} entities deleted`);
@@ -177,7 +179,7 @@ const SmartExecutionHistory: React.FC = () => {
 
     try {
       setDeletingId(executionId);
-      const response = await fetch(`http://localhost:5000/api/smart-execution/${executionId}`, {
+      const response = await fetch(`${getApiBase()}/api/smart-execution/${executionId}`, {
         method: 'DELETE'
       });
       const data = await response.json();
@@ -191,6 +193,44 @@ const SmartExecutionHistory: React.FC = () => {
       alert(`Failed to delete execution: ${err.message}`);
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  const stopExecution = async (executionId: string) => {
+    if (!confirm('Stop this running execution?')) return;
+    try {
+      setStoppingId(executionId);
+      const response = await fetch(`${getApiBase()}/api/smart-execution/stop/${executionId}`, {
+        method: 'POST'
+      });
+      const data = await response.json();
+      if (data.success) {
+        fetchExecutions();
+      } else {
+        alert(data.error || 'Failed to stop execution');
+      }
+    } catch (err: any) {
+      alert(`Failed to stop execution: ${err.message}`);
+    } finally {
+      setStoppingId(null);
+    }
+  };
+
+  const stopAllRunning = async () => {
+    const runningCount = executions.filter(e => e.status === 'RUNNING').length;
+    if (runningCount === 0) { alert('No running executions found.'); return; }
+    if (!confirm(`Stop all ${runningCount} running execution(s)?`)) return;
+    try {
+      const response = await fetch(`${getApiBase()}/api/smart-execution/stop-all`, { method: 'POST' });
+      const data = await response.json();
+      if (data.success) {
+        alert(data.message || 'All executions stopped');
+        fetchExecutions();
+      } else {
+        alert(data.error || 'Failed to stop executions');
+      }
+    } catch (err: any) {
+      alert(`Error: ${err.message}`);
     }
   };
 
@@ -211,7 +251,9 @@ const SmartExecutionHistory: React.FC = () => {
       'COMPLETED': { bg: 'bg-success', icon: 'check_circle' },
       'STOPPED': { bg: 'bg-warning', icon: 'stop_circle' },
       'FAILED': { bg: 'bg-danger', icon: 'error' },
-      'THRESHOLD_REACHED': { bg: 'bg-primary', icon: 'flag' }
+      'THRESHOLD_REACHED': { bg: 'bg-primary', icon: 'flag' },
+      'LONGEVITY_SUSTAINING': { bg: 'bg-purple', icon: 'repeat' },
+      'TIMEOUT': { bg: 'bg-secondary', icon: 'timer_off' },
     };
     return badges[status] || { bg: 'bg-secondary', icon: 'help_outline' };
   };
@@ -227,7 +269,7 @@ const SmartExecutionHistory: React.FC = () => {
   });
 
   const uniqueTestbeds = Array.from(new Set(executions.map(e => e.testbed_label)));
-  const statuses = ['RUNNING', 'COMPLETED', 'STOPPED', 'FAILED', 'THRESHOLD_REACHED'];
+  const statuses = ['RUNNING', 'LONGEVITY_SUSTAINING', 'COMPLETED', 'STOPPED', 'FAILED', 'THRESHOLD_REACHED', 'TIMEOUT'];
 
   const toggleExpand = (executionId: string) => {
     setExpandedRows(prev => {
@@ -278,13 +320,26 @@ const SmartExecutionHistory: React.FC = () => {
               </h2>
               <p className="text-muted mb-0">View, analyze, and download reports from past executions</p>
             </div>
-            <button 
-              className="btn btn-primary btn-lg rounded-4 d-flex align-items-center gap-2"
-              onClick={() => navigate('/smart-execution')}
-            >
-              <i className="material-icons-outlined" style={{ fontSize: 20 }}>add</i>
-              New Execution
-            </button>
+            <div className="d-flex gap-2">
+              {executions.some(e => e.status === 'RUNNING' || e.status === 'LONGEVITY_SUSTAINING') && (
+                <button 
+                  className="btn btn-danger btn-lg rounded-4 d-flex align-items-center gap-2"
+                  onClick={stopAllRunning}
+                  title="Stop all currently running executions"
+                >
+                  <i className="material-icons-outlined" style={{ fontSize: 20 }}>stop_circle</i>
+                  Stop All Running
+                </button>
+              )}
+              <button 
+                className="btn btn-primary btn-lg rounded-4 d-flex align-items-center gap-2"
+                onClick={() => navigate('/smart-execution')}
+                title="Start a new smart execution"
+              >
+                <i className="material-icons-outlined" style={{ fontSize: 20 }}>add</i>
+                New Execution
+              </button>
+            </div>
           </div>
         </div>
 
@@ -580,54 +635,89 @@ const SmartExecutionHistory: React.FC = () => {
                               )}
                             </td>
                             <td className="text-center pe-4">
-                              <div className="btn-group" role="group">
+                              <div className="d-flex align-items-center justify-content-center gap-1 flex-wrap">
+                                {(exec.status === 'RUNNING' || exec.status === 'LONGEVITY_SUSTAINING') && (
+                                  <button
+                                    className="btn btn-danger btn-sm rounded-3 d-inline-flex align-items-center gap-1"
+                                    onClick={() => stopExecution(exec.execution_id)}
+                                    disabled={stoppingId === exec.execution_id}
+                                    data-bs-toggle="tooltip"
+                                    data-bs-placement="top"
+                                    title="Stop this running execution"
+                                  >
+                                    {stoppingId === exec.execution_id ? (
+                                      <span className="spinner-border spinner-border-sm" role="status"></span>
+                                    ) : (
+                                      <i className="material-icons-outlined" style={{ fontSize: 16 }}>stop_circle</i>
+                                    )}
+                                    <span className="d-none d-xl-inline small">Stop</span>
+                                  </button>
+                                )}
                                 <button
-                                  className="btn btn-outline-primary btn-sm rounded-3"
+                                  className="btn btn-outline-primary btn-sm rounded-3 d-inline-flex align-items-center gap-1"
                                   onClick={() => viewReport(exec.execution_id)}
-                                  title="View Report"
+                                  data-bs-toggle="tooltip"
+                                  data-bs-placement="top"
+                                  title="View detailed execution report"
                                 >
-                                  <i className="material-icons-outlined" style={{ fontSize: 18 }}>visibility</i>
+                                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>visibility</i>
+                                  <span className="d-none d-xl-inline small">Report</span>
                                 </button>
                                 <button
-                                  className="btn btn-outline-success btn-sm rounded-3"
+                                  className="btn btn-outline-success btn-sm rounded-3 d-inline-flex align-items-center gap-1"
                                   onClick={() => downloadReport(exec.execution_id)}
-                                  title="Download HTML Report"
+                                  data-bs-toggle="tooltip"
+                                  data-bs-placement="top"
+                                  title="Download HTML report file"
                                 >
-                                  <i className="material-icons-outlined" style={{ fontSize: 18 }}>download</i>
+                                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>download</i>
+                                  <span className="d-none d-xl-inline small">HTML</span>
                                 </button>
                                 <button
-                                  className="btn btn-outline-info btn-sm rounded-3"
+                                  className="btn btn-outline-info btn-sm rounded-3 d-inline-flex align-items-center gap-1"
                                   onClick={() => downloadCSV(exec.execution_id)}
-                                  title="Download CSV"
+                                  data-bs-toggle="tooltip"
+                                  data-bs-placement="top"
+                                  title="Download operations data as CSV"
                                 >
-                                  <i className="material-icons-outlined" style={{ fontSize: 18 }}>table_view</i>
+                                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>table_view</i>
+                                  <span className="d-none d-xl-inline small">CSV</span>
                                 </button>
                                 <button
-                                  className="btn btn-outline-secondary btn-sm rounded-3"
+                                  className="btn btn-outline-secondary btn-sm rounded-3 d-inline-flex align-items-center gap-1"
                                   onClick={() => rerunExecution(exec.execution_id)}
-                                  title="Re-run with same config"
+                                  data-bs-toggle="tooltip"
+                                  data-bs-placement="top"
+                                  title="Re-run execution with the same configuration"
                                 >
-                                  <i className="material-icons-outlined" style={{ fontSize: 18 }}>replay</i>
+                                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>replay</i>
+                                  <span className="d-none d-xl-inline small">Re-run</span>
                                 </button>
                                 <button
-                                  className="btn btn-outline-warning btn-sm rounded-3"
+                                  className="btn btn-outline-warning btn-sm rounded-3 d-inline-flex align-items-center gap-1"
                                   onClick={() => cleanupEntities(exec.execution_id)}
-                                  title="Cleanup created entities"
-                                  disabled={exec.status === 'RUNNING'}
+                                  disabled={exec.status === 'RUNNING' || exec.status === 'LONGEVITY_SUSTAINING'}
+                                  data-bs-toggle="tooltip"
+                                  data-bs-placement="top"
+                                  title="Delete all entities (VMs, blueprints, etc.) created by this execution"
                                 >
-                                  <i className="material-icons-outlined" style={{ fontSize: 18 }}>cleaning_services</i>
+                                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>cleaning_services</i>
+                                  <span className="d-none d-xl-inline small">Cleanup</span>
                                 </button>
                                 <button
-                                  className="btn btn-outline-danger btn-sm rounded-3"
+                                  className="btn btn-outline-danger btn-sm rounded-3 d-inline-flex align-items-center gap-1"
                                   onClick={() => deleteExecution(exec.execution_id)}
-                                  title="Delete"
                                   disabled={deletingId === exec.execution_id}
+                                  data-bs-toggle="tooltip"
+                                  data-bs-placement="top"
+                                  title="Permanently delete this execution record"
                                 >
                                   {deletingId === exec.execution_id ? (
                                     <span className="spinner-border spinner-border-sm" role="status"></span>
                                   ) : (
-                                    <i className="material-icons-outlined" style={{ fontSize: 18 }}>delete</i>
+                                    <i className="material-icons-outlined" style={{ fontSize: 16 }}>delete</i>
                                   )}
+                                  <span className="d-none d-xl-inline small">Delete</span>
                                 </button>
                               </div>
                             </td>

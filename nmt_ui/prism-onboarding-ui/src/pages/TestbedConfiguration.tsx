@@ -4,6 +4,7 @@ import Select from 'react-select';
 import { useNavigate } from 'react-router-dom';
 import JSONPreviewModal from '../components/JSONPreviewModal';
 import ntnxLogo from '../assets/new_nutanix_logo.png';
+import { getApiBase } from '../utils/backendUrl';
 
 const TestbedConfiguration: React.FC = () => {
   const navigate = useNavigate();
@@ -80,7 +81,7 @@ const TestbedConfiguration: React.FC = () => {
   const handleSaveTestbed = async () => {
     try {
       const testbedData = generateOutputJSON();
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const res = await fetch(
         `${backendUrl}/api/upload-testbed`,
         {
@@ -119,7 +120,7 @@ const TestbedConfiguration: React.FC = () => {
     setJitaStatus('Executing JITA jobs...');
   
     try {
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       const res = await fetch(`${backendUrl}/api/run-jita-jobs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -494,7 +495,7 @@ const TestbedConfiguration: React.FC = () => {
                                   return;
                                 }
                                 
-                                const backendUrl = 'http://localhost:5000';
+                                const backendUrl = getApiBase();
                                 await fetch(`${backendUrl}/api/save-environment`, {
                                   method: 'POST',
                                   headers: { 'Content-Type': 'application/json' },

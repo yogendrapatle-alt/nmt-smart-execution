@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import '../styles/BudgetConfiguration.css';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Budget {
   id: number;
@@ -68,7 +69,7 @@ const BudgetConfiguration: React.FC = () => {
 
   const loadBudgets = async () => {
     try {
-      const response = await axios.get('http://localhost:5000/api/budgets');
+      const response = await axios.get(`${getApiBase()}/api/budgets`);
       if (response.data.success) {
         setBudgets(response.data.budgets);
       }
@@ -81,7 +82,7 @@ const BudgetConfiguration: React.FC = () => {
 
   const loadTestbeds = async () => {
     try {
-      const response = await axios.get('http://localhost:5000/api/testbeds');
+      const response = await axios.get(`${getApiBase()}/api/testbeds`);
       if (response.data.success) {
         setTestbeds(response.data.testbeds);
       }
@@ -138,11 +139,11 @@ const BudgetConfiguration: React.FC = () => {
       
       if (editingBudget) {
         // Update
-        await axios.put(`http://localhost:5000/api/budgets/${editingBudget.budget_id}`, payload);
+        await axios.put(`${getApiBase()}/api/budgets/${editingBudget.budget_id}`, payload);
         alert('Budget updated successfully!');
       } else {
         // Create
-        await axios.post('http://localhost:5000/api/budgets', payload);
+        await axios.post(`${getApiBase()}/api/budgets`, payload);
         alert('Budget created successfully!');
       }
       
@@ -161,7 +162,7 @@ const BudgetConfiguration: React.FC = () => {
     }
     
     try {
-      await axios.delete(`http://localhost:5000/api/budgets/${budgetId}`);
+      await axios.delete(`${getApiBase()}/api/budgets/${budgetId}`);
       alert('Budget deleted successfully!');
       loadBudgets();
     } catch (error) {

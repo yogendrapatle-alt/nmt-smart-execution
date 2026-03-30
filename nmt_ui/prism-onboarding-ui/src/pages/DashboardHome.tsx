@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeAlerts, getFakeExecutions } from '../fake-data';
+import { getApiBase } from '../utils/backendUrl';
 
 interface DashboardStats {
   totalTestbeds: number;
@@ -99,7 +100,7 @@ const DashboardHome: React.FC = () => {
       }
 
       // Always use localhost:5000 for backend in development
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       
       console.log('Fetching dashboard data from:', backendUrl);
 
@@ -208,7 +209,7 @@ const DashboardHome: React.FC = () => {
     } catch (err) {
       console.error('Error fetching dashboard data:', err);
       const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-      setError(`Failed to load dashboard data: ${errorMessage}. Please check if backend is running on http://localhost:5000`);
+      setError(`Failed to load dashboard data: ${errorMessage}. Ensure the backend is reachable (same host as this page, or set VITE_API_BASE_URL).`);
     } finally {
       setLoading(false);
     }

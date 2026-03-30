@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import '../styles/CostDashboard.css';
+import { getApiBase } from '../utils/backendUrl';
 
 interface CostSummary {
   total_cost: number;
@@ -48,7 +49,7 @@ const CostDashboard: React.FC = () => {
       setLoading(true);
       
       // Load dashboard summary
-      const dashboardRes = await axios.get('http://localhost:5000/api/costs/dashboard');
+      const dashboardRes = await axios.get(`${getApiBase()}/api/costs/dashboard`);
       if (dashboardRes.data.success) {
         setTodaySummary(dashboardRes.data.today);
         setWeekSummary(dashboardRes.data.week);
@@ -56,13 +57,13 @@ const CostDashboard: React.FC = () => {
       }
       
       // Load top spending testbeds
-      const topSpendingRes = await axios.get('http://localhost:5000/api/costs/top-spending?days=30&limit=5');
+      const topSpendingRes = await axios.get(`${getApiBase()}/api/costs/top-spending?days=30&limit=5`);
       if (topSpendingRes.data.success) {
         setTopSpending(topSpendingRes.data.top_spending);
       }
       
       // Load cost trends
-      const trendsRes = await axios.get('http://localhost:5000/api/costs/trends?days=30');
+      const trendsRes = await axios.get(`${getApiBase()}/api/costs/trends?days=30`);
       if (trendsRes.data.success) {
         setTrends(trendsRes.data.trends);
       }

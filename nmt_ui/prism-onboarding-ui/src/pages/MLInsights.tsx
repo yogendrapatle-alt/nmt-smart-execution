@@ -7,6 +7,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import '../styles/MLInsights.css';
+import { getApiBase } from '../utils/backendUrl';
 
 interface ModelInfo {
   model_id: string;
@@ -58,7 +59,7 @@ interface Testbed {
   testbed_label: string;
 }
 
-const API_BASE = 'http://localhost:5000';
+const API_BASE = getApiBase();
 
 const MLInsights: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'overview' | 'models' | 'training' | 'predict'>('overview');

@@ -12,7 +12,7 @@ def run_migration():
     """Add testbed_label column to workloads table"""
     
     # Get database URL from environment
-    DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://alertuser:alertpass@localhost/alerts')
+    DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://alertuser:alertpass@127.0.0.1:5432/alerts')
     
     try:
         # Create engine

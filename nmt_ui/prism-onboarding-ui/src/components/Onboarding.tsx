@@ -3,6 +3,7 @@ import ntnxLogo from '../assets/new_nutanix_logo.png';
 import type { OnboardingForm } from '../types/onboarding';
 import { useOnboarding } from '../context/OnboardingContext';
 import { useNavigate } from 'react-router-dom';
+import { getApiBase } from '../utils/backendUrl';
 
 interface Props {
   onSubmit: (form: OnboardingForm) => void;
@@ -38,7 +39,7 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
 
     try {
       // Always use localhost:5000 for backend in development
-      const backendUrl = 'http://localhost:5000';
+      const backendUrl = getApiBase();
       console.log('Backend URL:', backendUrl);
       console.log('Full URL:', `${backendUrl}/api/expose-prometheus`);
 

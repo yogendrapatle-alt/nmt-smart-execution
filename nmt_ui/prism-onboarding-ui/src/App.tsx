@@ -69,6 +69,7 @@ const App: React.FC = () => {
         
         {/* Smart Execution - AI/ML Powered (New Primary) */}
         <Route path="/smart-execution" element={<Layout><SmartExecutionConfigureAI /></Layout>} />
+        <Route path="/smart-execution/configure" element={<Layout><SmartExecutionConfigureAI /></Layout>} />
         <Route path="/smart-execution/monitor/:executionId" element={<Layout><SmartExecutionMonitorAI /></Layout>} />
         <Route path="/smart-execution/history" element={<Layout><SmartExecutionHistory /></Layout>} />
         <Route path="/smart-execution/report/:executionId" element={<Layout><SmartExecutionReport /></Layout>} />

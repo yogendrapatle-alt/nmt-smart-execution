@@ -1,0 +1,14 @@
+node_modules/
+.git/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/*.log
+dist/
+.vscode/
+.idea/
+**/test_*.py
+**/*_test.py
+playwright-report/
+coverage/
+*.tsbuildinfo

@@ -206,6 +206,11 @@
                     </td>
                 </tr>
             </table>
+            {% if metrics_resolution_note and metrics_resolution_note != 'stored' %}
+            <p style="color: var(--muted); font-size: 12px; margin-top: 12px;">
+                <strong>Metrics source:</strong> {{ metrics_resolution_note }} — values were adjusted from stored <code>baseline_metrics</code>/<code>final_metrics</code> using the first/last samples in <code>metrics_history</code> when stored finals were zero.
+            </p>
+            {% endif %}
         </div>
     </div>
 
@@ -267,7 +272,7 @@
 
                 {% if spike.causal_operations %}
                 <div class="spike-ops">
-                    <div class="spike-detail-label" style="margin-bottom:6px;">Causal Operations ({{ spike.causal_operations|length }})</div>
+                    <div class="spike-detail-label" style="margin-bottom:6px;">Causal Operations — {{ spike.causal_operations|length }} event(s) near this spike</div>
                     <table>
                         <tr><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Timing</th></tr>
                         {% for op in spike.causal_operations[:5] %}
@@ -361,7 +366,7 @@
                     <tbody>
                         {% for eo in operation_heatmap.entity_ops %}
                         <tr>
-                            <td style="font-weight:600; font-size:13px;">{{ eo }}</td>
+                            <td style="font-weight:600; font-size:13px;">{{ eo }} <span style="color:var(--muted); font-weight:500;">(n={% if operation_heatmap.row_totals and eo in operation_heatmap.row_totals %}{{ operation_heatmap.row_totals[eo] }}{% else %}0{% endif %})</span></td>
                             {% for bi in range(operation_heatmap.buckets|length) %}
                             {% set cell = operation_heatmap.data[eo][bi|string] or operation_heatmap.data[eo][bi] %}
                             {% if cell and cell.count > 0 %}
@@ -544,6 +549,9 @@
                 </div>
                 {% endif %}
             </div>
+            <p style="color: var(--muted); font-size: 13px; margin-top: 12px;">
+                <strong>Note:</strong> CPU/Memory per operation = average <em>magnitude</em> of cluster usage change per op (or average step-change when start/end metrics cancel out). Higher values mean each operation tends to move metrics more.
+            </p>
             <div style="background:#f0f9ff; padding:16px; border-radius:8px; margin-top:8px;">
                 <strong>Bottleneck:</strong> {{ capacity_planning.bottleneck|upper }}<br>
                 <strong>Recommendation:</strong> {{ capacity_planning.recommendation }}
@@ -562,6 +570,88 @@
     </div>
     {% endif %}
 
+    <!-- ENTITY × OPERATION COUNTS (how many times each was executed) -->
+    {% if entity_operation_counts and entity_operation_counts|length > 0 %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #0ea5e9, #0369a1);">🔢</div>
+            <h2>Entity × Operation — Execution Counts</h2>
+        </div>
+        <div class="card-body">
+            <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">
+                Number of times each <strong>entity type</strong> and <strong>operation</strong> pair was run in this execution (same as summing rows in the operations log).
+            </p>
+            <table>
+                <thead><tr><th>Entity.Operation</th><th>Count</th></tr></thead>
+                <tbody>
+                    {% for row in entity_operation_counts %}
+                    <tr>
+                        <td><strong>{{ row.key }}</strong></td>
+                        <td><span class="badge badge-info">{{ row.count }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- ITERATION TIMELINE (per-iteration ops & breakdown) -->
+    {% if iteration_timeline and iteration_timeline.total_iterations > 0 %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #6366f1, #4338ca);">📋</div>
+            <h2>Iteration Timeline</h2>
+        </div>
+        <div class="card-body">
+            <div class="stat-grid" style="margin-bottom: 16px;">
+                <div class="stat-card"><div class="stat-value" style="font-size:22px;">{{ iteration_timeline.total_iterations }}</div><div class="stat-label">Iterations</div></div>
+                <div class="stat-card"><div class="stat-value" style="font-size:22px;">{{ iteration_timeline.summary.total_ops }}</div><div class="stat-label">Total Ops (in table)</div></div>
+                <div class="stat-card"><div class="stat-value" style="font-size:22px;">{{ iteration_timeline.summary.avg_ops_per_iteration }}</div><div class="stat-label">Avg Ops / Iteration</div></div>
+                <div class="stat-card"><div class="stat-value" style="font-size:22px;">{{ iteration_timeline.summary.total_creates }}</div><div class="stat-label">Create Ops</div></div>
+                <div class="stat-card"><div class="stat-value" style="font-size:22px;">{{ iteration_timeline.summary.total_deletes }}</div><div class="stat-label">Delete Ops</div></div>
+            </div>
+            <div style="overflow-x:auto; max-height: 480px; overflow-y: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Iter</th><th>Time</th><th>CPU</th><th>Mem</th><th>CPU Δ</th><th>Mem Δ</th>
+                            <th>Ops</th><th>Creates</th><th>Deletes</th><th>OK</th><th>Fail</th><th>Spike</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for it in iteration_timeline.iterations %}
+                        <tr style="{% if it.is_spike %}background: #fffbeb;{% endif %}">
+                            <td><strong>#{{ it.iteration }}</strong></td>
+                            <td class="text-muted" style="font-size:12px;">{{ it.timestamp[:19] if it.timestamp else '-' }}</td>
+                            <td>{{ it.cpu }}%</td>
+                            <td>{{ it.memory }}%</td>
+                            <td>{{ '%+.1f'|format(it.cpu_delta) }}%</td>
+                            <td>{{ '%+.1f'|format(it.memory_delta) }}%</td>
+                            <td><span class="badge badge-info">{{ it.operations_count }}</span></td>
+                            <td>{{ it.creates or '—' }}</td>
+                            <td>{{ it.deletes or '—' }}</td>
+                            <td style="color:var(--pass);">{{ it.operations_success }}</td>
+                            <td style="color:var(--fail);">{{ it.operations_failed }}</td>
+                            <td>{% if it.is_spike %}<span class="badge badge-warn">YES</span>{% else %}—{% endif %}</td>
+                        </tr>
+                        {% if it.operation_breakdown %}
+                        <tr><td colspan="12" style="background:#f8fafc; font-size:12px; padding-left:24px;">
+                            <strong>By entity.operation (count):</strong>
+                            {% for k in it.operation_breakdown %}
+                            {% set v = it.operation_breakdown[k] %}
+                            <span class="badge badge-info" style="margin:2px;">{{ k }}: <strong>{{ v.count }}</strong> ({{ v.success }} ok / {{ v.failed }} fail)</span>
+                            {% endfor %}
+                        </td></tr>
+                        {% endif %}
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
     <!-- HISTORICAL COMPARISON -->
     {% if historical_comparison.available %}
     <div class="card">
@@ -572,7 +662,7 @@
         <div class="card-body">
             <table>
                 <thead>
-                    <tr><th>Execution</th><th>Status</th><th>Duration</th><th>Total Ops</th><th>Success Rate</th><th>Start CPU</th><th>End CPU</th></tr>
+                    <tr><th>Execution</th><th>Status</th><th>Duration</th><th>Iterations</th><th>Total Ops</th><th>Success Rate</th><th>Start CPU</th><th>End CPU</th></tr>
                 </thead>
                 <tbody>
                     {% for h in historical_comparison.previous_executions %}
@@ -580,6 +670,7 @@
                         <td><code>{{ h.execution_id[:12] }}...</code></td>
                         <td><span class="badge badge-{% if h.status == 'COMPLETED' %}pass{% else %}warn{% endif %}">{{ h.status }}</span></td>
                         <td>{{ h.duration_minutes }}m</td>
+                        <td>{{ h.iterations|default('—') }}</td>
                         <td>{{ h.total_operations }}</td>
                         <td>{{ h.success_rate }}%</td>
                         <td>{{ h.baseline_cpu|round(1) }}%</td>
@@ -597,11 +688,14 @@
     <div class="card">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #10b981, #059669);">📋</div>
-            <h2>Entity Breakdown</h2>
+            <h2>Entity Breakdown (counts per entity type)</h2>
         </div>
         <div class="card-body">
+            <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">
+                <strong>Total</strong> = how many operations targeted that entity type. See <em>Entity × Operation — Execution Counts</em> above for per-operation-type totals.
+            </p>
             <table>
-                <thead><tr><th>Entity Type</th><th>Total</th><th>Success</th><th>Failed</th><th>Success Rate</th></tr></thead>
+                <thead><tr><th>Entity Type</th><th>Total ops</th><th>Success</th><th>Failed</th><th>Success Rate</th></tr></thead>
                 <tbody>
                     {% for etype, stats in entity_breakdown.items() %}
                     <tr>
@@ -630,12 +724,13 @@
         </div>
         <div class="card-body">
             <table>
-                <thead><tr><th>Operation</th><th>Impact Score</th><th>Avg CPU Δ</th><th>Avg Memory Δ</th></tr></thead>
+                <thead><tr><th>Operation</th><th>Executions</th><th>Impact Score</th><th>Avg CPU Δ</th><th>Avg Memory Δ</th></tr></thead>
                 <tbody>
                     {% for eff in operation_effectiveness[:10] %}
                     <tr>
                         <td><strong>{{ eff.get('key', eff.get('entity_type', '?') + '.' + eff.get('operation', '?')) }}</strong></td>
-                        <td>{{ eff.get('impact_score', 0)|round(2) }}</td>
+                        <td><span class="badge badge-info">{{ eff.get('execution_count', eff.get('count', '—')) }}</span></td>
+                        <td>{{ eff.get('effectiveness_score', eff.get('impact_score', 0))|round(2) }}</td>
                         <td style="color:{% if eff.get('avg_cpu_delta', 0) > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:600;">
                             {{ '%+.2f'|format(eff.get('avg_cpu_delta', 0)) }}%
                         </td>
@@ -660,11 +755,12 @@
             <div class="card-body" style="padding:0;">
                 <div style="max-height:600px; overflow-y:auto;">
                     <table>
-                        <thead><tr><th>#</th><th>Entity</th><th>Operation</th><th>Name</th><th>Duration</th><th>Status</th></tr></thead>
+                        <thead><tr><th>#</th><th>Iter</th><th>Entity</th><th>Operation</th><th>Name</th><th>Duration</th><th>Status</th></tr></thead>
                         <tbody>
                             {% for op in operations_history %}
                             <tr>
                                 <td>{{ loop.index }}</td>
+                                <td>{{ op.get('iteration', '—') }}</td>
                                 <td>{{ op.get('entity_type', 'N/A') }}</td>
                                 <td>{{ op.get('operation', 'N/A') }}</td>
                                 <td><code>{{ op.get('entity_name', 'N/A')[:40] }}</code></td>

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { getApiBase } from '../utils/backendUrl';
 
 interface TimelineEvent {
   timestamp: string;
@@ -39,7 +40,7 @@ const TestbedTimeline: React.FC = () => {
       setError(null);
 
       // Fetch timeline
-      const response = await fetch(`http://localhost:5000/api/testbed-timeline/${testbedId}`);
+      const response = await fetch(`${getApiBase()}/api/testbed-timeline/${testbedId}`);
       const data = await response.json();
 
       if (data.success) {

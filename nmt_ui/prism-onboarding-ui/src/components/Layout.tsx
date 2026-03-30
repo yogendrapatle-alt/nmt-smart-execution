@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import ntnxLogo from '../assets/new_nutanix_logo.png';
+import { getApiBase } from '../utils/backendUrl';
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -17,7 +18,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
     const fetchAlertCount = async () => {
       try {
         // Always use localhost:5000 for backend in development
-        const backendUrl = 'http://localhost:5000';
+        const backendUrl = getApiBase();
         console.log('Layout: Fetching alert count from:', backendUrl);
         
         const res = await fetch(`${backendUrl}/api/alerts`);
