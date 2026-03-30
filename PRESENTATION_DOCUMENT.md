@@ -29,7 +29,7 @@
 
 ### What is Load Sense?
 
-**Load Sense** is an enterprise-grade, autonomous monitoring and load generation platform specifically designed for **Nutanix NCM (Network Configuration Management)** infrastructure. It provides comprehensive real-time monitoring, intelligent alerting, automated reporting, and advanced execution tracking capabilities.
+**Load Sense** is an enterprise-grade, autonomous monitoring and load generation platform specifically designed for **Nutanix Cloud Manager (NCM)** infrastructure. It provides comprehensive real-time monitoring, intelligent alerting, automated reporting, and advanced execution tracking capabilities.
 
 ### Key Highlights
 

@@ -2,7 +2,7 @@
 
 # 🚀 Load Sense - Autonomous Load & Monitoring Tool
 
-**A comprehensive NCM (Network Configuration Management) Monitoring Tool for Nutanix Infrastructure**
+**A comprehensive NCM (Nutanix Cloud Manager) Monitoring Tool for Nutanix Infrastructure**
 
 [![Hackathon XII](https://img.shields.io/badge/Hackathon-XII-blue)](https://nutanix.brightidea.com/D3176)
 [![Python](https://img.shields.io/badge/Python-3.6+-green.svg)](https://www.python.org/)
@@ -36,7 +36,7 @@
 
 ## 🎯 Overview
 
-**Load Sense** is an enterprise-grade monitoring and load generation platform designed specifically for **Nutanix NCM (Network Configuration Management)** infrastructure. It provides real-time monitoring, intelligent alerting, automated reporting, and comprehensive execution tracking capabilities.
+**Load Sense** is an enterprise-grade monitoring and load generation platform designed specifically for **Nutanix Cloud Manager (NCM)** infrastructure. It provides real-time monitoring, intelligent alerting, automated reporting, and comprehensive execution tracking capabilities.
 
 ### What Makes Load Sense Special?
 

@@ -1,6 +1,6 @@
-# NCM Monitoring Tool
+# Nutanix Cloud Manager (NCM) Monitoring Tool
 
-A React + TypeScript frontend with Flask backend for Prometheus monitoring and alert management.
+A React + TypeScript frontend with Flask backend for Prometheus monitoring and alert management. **NCM** stands for **Nutanix Cloud Manager** (not Network Configuration Management).
 
 ## Quick Start
 
