@@ -96,7 +96,27 @@ fix_pg_hba_local_tcp_password() {
     cat "$HBA"
   } >"$tmp"
   mv "$tmp" "$HBA"
+  chown postgres:postgres "$HBA"
+  chmod 600 "$HBA"
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon -v "$HBA" 2>/dev/null || true
+  fi
   systemctl restart postgresql
+}
+
+# Rocky/RHEL package ships a default_server block inside nginx.conf (welcome page).
+# Our nmt.conf also uses server_name _; strip default_server from the stock block so
+# conf.d/nmt.conf (with default_server) serves the SPA.
+strip_rhel_nginx_conf_welcome_default_server() {
+  local f="/etc/nginx/nginx.conf"
+  [[ -f "$f" ]] || return 0
+  grep -q 'root.*/usr/share/nginx/html' "$f" 2>/dev/null || return 0
+  grep -q 'default_server' "$f" 2>/dev/null || return 0
+  cp -a "$f" "${f}.bak.nmtstrip-$(date +%s)"
+  sed -i.bak.nmtstrip \
+    -e '/listen[[:space:]]\+80[[:space:]]\+default_server/s/ default_server//' \
+    -e '/listen[[:space:]]\+\[::\]:80[[:space:]]\+default_server/s/ default_server//' \
+    "$f"
 }
 
 # Avoid localhost → ::1 + ident; force IPv4 TCP password auth.
@@ -192,6 +212,7 @@ fi
 
 echo "==> nginx..."
 install_nginx_site "$NGINX_SRC"
+strip_rhel_nginx_conf_welcome_default_server
 nginx -t
 systemctl reload nginx 2>/dev/null || systemctl restart nginx
 systemctl enable nginx

@@ -35,6 +35,11 @@ cp "${ROOT}/deploy/nginx-nmt-site.conf" \
 cp "${ROOT}/deploy/remote-install.sh" "${STAGE}/${BUNDLE_NAME}/"
 chmod +x "${STAGE}/${BUNDLE_NAME}/remote-install.sh"
 
+cp "${ROOT}/deploy/vm-verify.sh" "${STAGE}/${BUNDLE_NAME}/deploy-artifacts/"
+cp "${ROOT}/deploy/vm-fix-db-auth.sh" "${STAGE}/${BUNDLE_NAME}/deploy-artifacts/"
+chmod +x "${STAGE}/${BUNDLE_NAME}/deploy-artifacts/vm-verify.sh" \
+  "${STAGE}/${BUNDLE_NAME}/deploy-artifacts/vm-fix-db-auth.sh"
+
 # Avoid macOS extended attributes in the tarball (stops Linux tar "LIBARCHIVE.xattr" warnings)
 export COPYFILE_DISABLE=1
 tar -C "${STAGE}" -czf "${OUT}" "${BUNDLE_NAME}"

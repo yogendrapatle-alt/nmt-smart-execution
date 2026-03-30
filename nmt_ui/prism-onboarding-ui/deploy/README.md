@@ -31,7 +31,16 @@ Then open **http://10.117.66.44/** in a browser.
 
 **macOS tar warnings** (`LIBARCHIVE.xattr...`) on the server are harmless; rebundling with `./deploy/package-for-vm.sh` reduces them (`COPYFILE_DISABLE=1`).
 
-**Rocky/RHEL `Ident authentication failed for user "alertuser"`:** default `pg_hba.conf` matches `ident` before password auth. The current `remote-install.sh` prepends `md5` rules for `127.0.0.1` / `::1` and rewrites `DATABASE_URL` to use `127.0.0.1` instead of `localhost`. Copy the updated script to the VM and re-run it, or fix by hand: `sed -i.bak '/^DATABASE_URL=/s/@localhost/@127.0.0.1/g' /opt/nmt/prism-onboarding-ui/backend/.env` and prepend the two `host ... md5` lines to `/var/lib/pgsql/data/pg_hba.conf`, then `systemctl reload postgresql` and re-run the `init_db` step.
+**Rocky/RHEL `Ident authentication failed for user "alertuser"`:** default `pg_hba.conf` matches `ident` before password auth. The current `remote-install.sh` prepends `md5` rules for `127.0.0.1` / `::1` and rewrites `DATABASE_URL` to use `127.0.0.1` instead of `localhost`. After editing `pg_hba.conf`, ownership must stay **`postgres:postgres`** (otherwise reload fails and `ident` rules stick). `remote-install.sh` sets `chown`/`chmod` on `pg_hba.conf` automatically.
+
+**“Welcome to nginx on Rocky Linux” instead of the app:** the stock `server { ... default_server; root /usr/share/nginx/html; }` in **`/etc/nginx/nginx.conf`** wins over `conf.d/nmt.conf`. Current `remote-install.sh` strips `default_server` from that block and installs **`nmt.conf` with `listen 80 default_server`** so the SPA is served. Re-run the installer from an updated bundle, or comment out that `server` block by hand.
+
+**Verify on the VM (after install):**
+
+```bash
+chmod +x /opt/nmt/prism-onboarding-ui/deploy-artifacts/vm-verify.sh
+VM_PUBLIC_HOST=10.117.66.44 /opt/nmt/prism-onboarding-ui/deploy-artifacts/vm-verify.sh
+```
 
 ---
 

@@ -59,6 +59,11 @@ if ! grep -q 'NMT local TCP md5' "$HBA" 2>/dev/null; then
   } >"$tmp"
   mv "$tmp" "$HBA"
 fi
+chown postgres:postgres "$HBA"
+chmod 600 "$HBA"
+if command -v restorecon >/dev/null 2>&1; then
+  restorecon -v "$HBA" 2>/dev/null || true
+fi
 systemctl restart postgresql
 
 echo "==> Verify top of pg_hba (NMT md5 lines must be first matching host rules):"
