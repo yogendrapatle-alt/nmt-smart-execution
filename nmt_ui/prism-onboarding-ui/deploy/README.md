@@ -1,5 +1,7 @@
 # Deploying to a Linux VM
 
+**Shortest instructions:** see **`CLEAN-DEPLOY.md`** (also included in the tarball).
+
 ## Fast path (password SSH — no keys required)
 
 From your **laptop** (in `prism-onboarding-ui/`):
@@ -15,12 +17,20 @@ scp deploy/prism-onboarding-ui-bundle.tar.gz root@10.117.66.44:/tmp/
 ssh root@10.117.66.44
 ```
 
-On the **VM**:
+On the **VM** (one flow — extract + install + verify):
+
+```bash
+export VM_PUBLIC_HOST=10.117.66.44
+mkdir -p /opt/nmt && tar xzf /tmp/prism-onboarding-ui-bundle.tar.gz -C /opt/nmt && bash /opt/nmt/prism-onboarding-ui/vm-clean-deploy.sh
+```
+
+Or without `vm-clean-deploy.sh` (same effect, manual):
 
 ```bash
 mkdir -p /opt/nmt && tar xzf /tmp/prism-onboarding-ui-bundle.tar.gz -C /opt/nmt
 cd /opt/nmt/prism-onboarding-ui
 VM_PUBLIC_HOST=10.117.66.44 ./remote-install.sh
+VM_PUBLIC_HOST=10.117.66.44 ./deploy-artifacts/vm-verify.sh
 ```
 
 Then open **http://10.117.66.44/** in a browser.

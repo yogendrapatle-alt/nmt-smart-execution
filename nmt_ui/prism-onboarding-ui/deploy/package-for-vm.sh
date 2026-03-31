@@ -32,8 +32,13 @@ cp "${ROOT}/deploy/nginx-nmt-site.conf" \
   "${ROOT}/deploy/env.backend.example" \
   "${STAGE}/${BUNDLE_NAME}/deploy-artifacts/"
 
-cp "${ROOT}/deploy/remote-install.sh" "${STAGE}/${BUNDLE_NAME}/"
-chmod +x "${STAGE}/${BUNDLE_NAME}/remote-install.sh"
+cp "${ROOT}/deploy/remote-install.sh" \
+  "${ROOT}/deploy/vm-clean-deploy.sh" \
+  "${STAGE}/${BUNDLE_NAME}/"
+chmod +x "${STAGE}/${BUNDLE_NAME}/remote-install.sh" \
+  "${STAGE}/${BUNDLE_NAME}/vm-clean-deploy.sh"
+
+cp "${ROOT}/deploy/CLEAN-DEPLOY.md" "${STAGE}/${BUNDLE_NAME}/"
 
 cp "${ROOT}/deploy/vm-verify.sh" "${STAGE}/${BUNDLE_NAME}/deploy-artifacts/"
 cp "${ROOT}/deploy/vm-fix-db-auth.sh" "${STAGE}/${BUNDLE_NAME}/deploy-artifacts/"
@@ -51,6 +56,7 @@ ls -lh "${OUT}"
 echo ""
 echo "Copy to VM (from your Mac):"
 echo "  scp \"${OUT}\" root@10.117.66.44:/tmp/"
-echo "Then on the VM:"
-echo "  mkdir -p /opt/nmt && tar xzf /tmp/prism-onboarding-ui-bundle.tar.gz -C /opt/nmt"
-echo "  cd /opt/nmt/prism-onboarding-ui && VM_PUBLIC_HOST=10.117.66.44 ./remote-install.sh"
+echo "Then on the VM (as root, set IP):"
+echo "  export VM_PUBLIC_HOST=10.117.66.44"
+echo "  mkdir -p /opt/nmt && tar xzf /tmp/prism-onboarding-ui-bundle.tar.gz -C /opt/nmt && bash /opt/nmt/prism-onboarding-ui/vm-clean-deploy.sh"
+echo "See CLEAN-DEPLOY.md inside the bundle for the short version."

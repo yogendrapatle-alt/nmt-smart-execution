@@ -67,6 +67,7 @@ vertical-menu/
 *.md
 !README.md
 !PRESENTATION_DOCUMENT.md
+!nmt_ui/prism-onboarding-ui/deploy/CLEAN-DEPLOY.md
 
 # ==========================================
 # Exclude test files
