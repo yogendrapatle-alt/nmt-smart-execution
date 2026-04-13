@@ -209,15 +209,6 @@ const AlertSummary: React.FC = () => {
     return Object.keys(selectedDigest.testbeds);
   };
 
-  const inputStyle: React.CSSProperties = {
-    padding: '8px 12px',
-    border: '1px solid #ccc',
-    borderRadius: 4,
-    fontSize: 14,
-    backgroundColor: '#fff',
-    color: '#000'
-  };
-
   return (
     <div className="main-content">
       {/* Breadcrumb */}
@@ -820,25 +811,34 @@ const AlertSummary: React.FC = () => {
                         </th>
                       ))}
                       <th style={{ borderBottom: '2px solid #dee2e6', padding: 16, textAlign: 'center', fontWeight: 700, color: '#333', fontSize: 14 }}>Alert Name</th>
-                      <th style={{ borderBottom: '2px solid #dee2e6', padding: 16, textAlign: 'center', fontWeight: 700, color: '#333', fontSize: 14 }}>Summary</th>
-                      <th style={{ borderBottom: '2px solid #dee2e6', padding: 16, textAlign: 'center', fontWeight: 700, color: '#333', fontSize: 14 }}>Description</th>
+                      <th style={{ borderBottom: '2px solid #dee2e6', padding: 16, textAlign: 'center', fontWeight: 700, color: '#333', fontSize: 14 }}>Duration</th>
+                      <th style={{ borderBottom: '2px solid #dee2e6', padding: 16, textAlign: 'center', fontWeight: 700, color: '#333', fontSize: 14, minWidth: 250 }}>Diagnosis</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {paginatedAlerts.map((alert, idx) => (
+                    {paginatedAlerts.map((alert, idx) => {
+                      const isCriticalActive = alert.severity === 'Critical' && alert.status === 'Active';
+                      const isActionable = alert.is_actionable;
+                      const baseBg = isCriticalActive ? '#fff5f5' : idx % 2 === 0 ? '#fff' : '#f8f9fa';
+                      const durMin = alert.duration_minutes;
+                      const durLabel = durMin != null
+                        ? (durMin < 1 ? `${Math.round(durMin * 60)}s` : durMin < 60 ? `${Math.round(durMin)}m` : `${Math.floor(durMin / 60)}h ${Math.round(durMin % 60)}m`)
+                        : null;
+                      return (
                       <tr 
                         key={`${alert.id}-${idx}`} 
                         style={{ 
-                          backgroundColor: idx % 2 === 0 ? '#fff' : '#f8f9fa',
+                          backgroundColor: baseBg,
                           transition: 'background-color 0.2s ease',
-                          cursor: 'pointer'
+                          cursor: 'pointer',
+                          borderLeft: isCriticalActive ? '4px solid #dc3545' : undefined,
                         }}
                         onClick={() => handleAlertClick(alert)}
                         onMouseEnter={(e) => {
                           e.currentTarget.style.backgroundColor = '#e8f4fd';
                         }}
                         onMouseLeave={(e) => {
-                          e.currentTarget.style.backgroundColor = idx % 2 === 0 ? '#fff' : '#f8f9fa';
+                          e.currentTarget.style.backgroundColor = baseBg;
                         }}
                       >
                         <td style={{ border: '1px solid #dee2e6', padding: 14, fontSize: 13, color: '#000', verticalAlign: 'middle' }}>
@@ -874,11 +874,32 @@ const AlertSummary: React.FC = () => {
                             {alert.status}
                           </span>
                         </td>
-                        <td style={{ border: '1px solid #dee2e6', padding: 14, fontWeight: 600, color: '#000', verticalAlign: 'middle' }}>{alert.ruleName}</td>
-                        <td style={{ border: '1px solid #dee2e6', padding: 14, color: '#000', verticalAlign: 'middle' }}>{alert.summary || 'N/A'}</td>
-                        <td style={{ border: '1px solid #dee2e6', padding: 14, color: '#000', maxWidth: 200, verticalAlign: 'middle' }}>{alert.description}</td>
+                        <td style={{ border: '1px solid #dee2e6', padding: 14, fontWeight: 600, color: '#000', verticalAlign: 'middle' }}>
+                          {alert.ruleName}
+                          {isActionable && (
+                            <span style={{
+                              display: 'inline-block', marginLeft: 6, padding: '2px 6px',
+                              borderRadius: 3, fontSize: 10, fontWeight: 700,
+                              backgroundColor: '#dc3545', color: '#fff',
+                            }}>NEEDS ATTENTION</span>
+                          )}
+                        </td>
+                        <td style={{ border: '1px solid #dee2e6', padding: 14, verticalAlign: 'middle', textAlign: 'center', whiteSpace: 'nowrap' }}>
+                          {durLabel ? (
+                            <span style={{ fontSize: 13, color: '#333', fontWeight: 500 }}>{durLabel}</span>
+                          ) : (
+                            <span className="badge" style={{
+                              padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+                              color: '#fff', backgroundColor: '#dc3545', animation: 'pulse 2s infinite',
+                            }}>Active</span>
+                          )}
+                        </td>
+                        <td style={{ border: '1px solid #dee2e6', padding: 14, color: '#495057', fontSize: 13, verticalAlign: 'middle', maxWidth: 320, lineHeight: 1.4 }}>
+                          {alert.short_diagnosis || alert.description || 'Click for details'}
+                        </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1075,9 +1096,9 @@ const AlertSummary: React.FC = () => {
               }}
             />
 
-            {/* PDF Export Button */}
+            {/* Export Buttons */}
 
-            <div style={{ display: 'flex', justifyContent: 'center', gap: 16, marginTop: 24 }}>
+            <div style={{ display: 'flex', justifyContent: 'center', gap: 16, marginTop: 24, flexWrap: 'wrap' }}>
               <PDFExportButton
                 alerts={searchFilteredAlerts}
                 selectedDate={selectedDate}
@@ -1087,7 +1108,36 @@ const AlertSummary: React.FC = () => {
                 disabled={loading}
               />
 
-              {/* Your existing CSV export button can stay here */}
+              <button
+                onClick={() => {
+                  const params = new URLSearchParams();
+                  if (selectedTestbed) params.append('testbed', selectedTestbed);
+                  if (selectedSeverity !== 'All') params.append('severity', selectedSeverity);
+                  if (selectedStatus !== 'All') params.append('status', selectedStatus);
+                  if (selectedDate) params.append('date', selectedDate);
+                  const backendUrl = getApiBase();
+                  window.open(`${backendUrl}/api/alerts/download-html?${params.toString()}`, '_blank');
+                }}
+                disabled={loading || searchFilteredAlerts.length === 0}
+                className="btn"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  borderRadius: 8,
+                  padding: '10px 24px',
+                  fontWeight: 600,
+                  fontSize: 15,
+                  background: searchFilteredAlerts.length === 0 ? '#ccc' : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                  color: '#fff',
+                  border: 'none',
+                  cursor: searchFilteredAlerts.length === 0 ? 'not-allowed' : 'pointer',
+                  boxShadow: searchFilteredAlerts.length === 0 ? 'none' : '0 2px 8px rgba(102,126,234,0.25)'
+                }}
+              >
+                <i className="material-icons-outlined" style={{ fontSize: 20 }}>download</i>
+                Download HTML Report
+              </button>
             </div>
 
         {/* Export/Download Button */}

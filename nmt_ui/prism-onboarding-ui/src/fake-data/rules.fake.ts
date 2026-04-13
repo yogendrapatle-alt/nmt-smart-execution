@@ -5,8 +5,6 @@
  * Cross-linked with testbeds.
  */
 
-import { FAKE_TESTBEDS } from './testbeds.fake';
-
 export interface FakeRule {
   id: number;
   unique_rule_id: string;

@@ -95,6 +95,10 @@ class SchedulerService:
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown(wait=True)
             logger.info("✅ Scheduler shutdown complete")
+
+    def stop(self):
+        """Alias for shutdown (used by app graceful_shutdown)."""
+        self.shutdown()
     
     def add_schedule(self, schedule: Dict) -> bool:
         """

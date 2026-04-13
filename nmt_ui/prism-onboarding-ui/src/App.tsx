@@ -1,10 +1,9 @@
 import React from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 
 import Onboarding from './components/Onboarding';
 import OnboardingExperimental from './components/OnboardingExperimental';
 import Loading from './components/Loading';
-import Dashboard from './pages/Dashboard';
 import DashboardHome from './pages/DashboardHome';
 import MyTestbeds from './pages/MyTestbeds';
 import DeployNew from './pages/DeployNew';
@@ -39,9 +38,8 @@ import ExecutiveSummary from './pages/ExecutiveSummary';
 import ErrorBoundaryTest from './pages/ErrorBoundaryTest';
 
 const App: React.FC = () => {
-  // Placeholder for authentication state
-  const [isAuthenticated, setIsAuthenticated] = React.useState(false);
-  const [onboarded, setOnboarded] = React.useState(false);
+  const [, setIsAuthenticated] = React.useState(false);
+  const [, setOnboarded] = React.useState(false);
 
   return (
     <Router>

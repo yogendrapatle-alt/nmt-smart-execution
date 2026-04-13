@@ -52,7 +52,7 @@ interface Alert {
 }
 
 const ExecutionReport: React.FC = () => {
-  const { testbedId, executionId } = useParams<{ testbedId: string; executionId: string }>();
+  const { executionId } = useParams<{ testbedId: string; executionId: string }>();
   const navigate = useNavigate();
   
   const [loading, setLoading] = useState(true);
@@ -547,7 +547,6 @@ const ExecutionReport: React.FC = () => {
                 </thead>
                 <tbody>
                   {operationMetrics.map((op, idx) => {
-                    const statusColor = op.status === 'SUCCESS' ? 'success' : 'danger';
                     const rowClass = op.status === 'SUCCESS' ? 'table-success' : 'table-danger';
                     
                     return (

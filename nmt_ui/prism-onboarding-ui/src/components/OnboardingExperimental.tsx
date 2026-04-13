@@ -65,32 +65,12 @@ const OnboardingExperimental: React.FC<Props> = ({ onSubmit }) => {
       } else {
         setError(data.error || 'Unknown error');
       }
-    } catch (err) {
+    } catch (_err) {
       setError('Failed to connect to backend');
     }
 
     setLoading(false);
   };
-
-  const inputStyle: React.CSSProperties = {
-    width: '100%',
-    padding: '10px 0px',
-    border: '1px solid #ccc',
-    borderRadius: 4,
-    fontSize: 14,
-    marginTop: 4,
-    backgroundColor: '#fff', // makes the input field white
-    color: '#000' // ensures the text inside is black
-  };
-
-
-  const labelStyle: React.CSSProperties = {
-    color: '#333',
-    fontWeight: 500,
-    display: 'block',
-    marginBottom: 4
-  };
-
 
   return (
     <div className="main-content">

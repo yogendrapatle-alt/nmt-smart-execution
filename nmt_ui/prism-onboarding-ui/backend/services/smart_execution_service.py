@@ -20,6 +20,8 @@ from urllib.parse import urljoin
 import sys
 import os
 
+from services.prometheus_url import resolve_working_prometheus_url
+
 logger = logging.getLogger(__name__)
 
 # WebSocket support for live logs
@@ -45,6 +47,39 @@ def broadcast_log(execution_id: str, log_level: str, message: str, data: Dict = 
             })
         except Exception as e:
             logger.debug(f"Failed to broadcast log: {e}")
+
+
+def get_slack_webhook_for_testbed(unique_testbed_id: Optional[str]) -> Optional[str]:
+    """Resolve Slack incoming webhook URL from first rule config for this testbed (if any)."""
+    if not unique_testbed_id:
+        return None
+    try:
+        from database import SessionLocal
+        from models.config import Config
+        session = SessionLocal()
+        try:
+            row = session.query(Config).filter_by(unique_testbed_id=unique_testbed_id).first()
+            if row and row.config_json and isinstance(row.config_json, dict):
+                ad = row.config_json.get('alert_destination') or {}
+                if isinstance(ad, dict):
+                    url = ad.get('value')
+                    if url and isinstance(url, str) and url.startswith('http'):
+                        return url.strip()
+        finally:
+            session.close()
+    except Exception as e:
+        logger.debug(f"Could not resolve Slack webhook for testbed: {e}")
+    return None
+
+
+def post_slack_incoming_webhook(webhook_url: str, text: str, timeout: int = 12) -> bool:
+    """POST plain text to Slack incoming webhook."""
+    try:
+        r = requests.post(webhook_url, json={'text': text}, timeout=timeout)
+        return r.status_code == 200
+    except Exception as e:
+        logger.debug(f"Slack webhook POST failed: {e}")
+        return False
 
 # Add loadgen to path for NCMClient
 # NCMClient lives in loadgen/ncm-lg/http_client_auth/base_client.py
@@ -220,6 +255,7 @@ class SmartExecutionController:
         
         # K8s stress escalation: deploy stress pods when API ops alone can't reach target
         self._stress_pods_deployed = []
+        self._max_stress_pods_deployed = 0
         self._stagnation_count = 0
         self._stress_escalation_enabled = adv.get('stress_escalation', True)
         self._max_stress_pods = adv.get('max_stress_pods', 5)
@@ -241,6 +277,19 @@ class SmartExecutionController:
         self.created_entities: Dict[str, List[Dict]] = {}  # {entity_type: [{uuid, name, created_at}]}
         self.cleanup_on_stop: bool = False  # Whether to cleanup entities on stop
         
+        # ── Sustain Mode (hold load at threshold for N minutes) ─────
+        self._sustain_minutes = target_config.get('sustain_minutes',
+                                                   adv.get('sustain_minutes', 5))
+        self._sustain_start_time: Optional[datetime] = None
+        self._sustain_hysteresis_pct = 5.0  # re-escalate if drops more than 5% below target
+        self._sustain_min_ops = 2  # set properly after min_operations_per_cycle is initialized
+        self._sustain_stats: Dict[str, Any] = {
+            'entered_at': None, 'duration_seconds': 0,
+            'reescalations': 0, 'min_cpu': 999, 'max_cpu': 0,
+            'min_memory': 999, 'max_memory': 0, 'ops_during_sustain': 0,
+            'sustain_ops_per_minute': 0, 'stress_pod_restarts': 0,
+        }
+
         # ── Longevity Mode ──────────────────────────────────────────
         longevity = target_config.get('longevity', {})
         self._longevity_enabled = longevity.get('enabled', False)
@@ -264,6 +313,7 @@ class SmartExecutionController:
         self.poll_interval = 15  # seconds between metric checks
         self.min_operations_per_cycle = 2
         self.max_operations_per_cycle = 20
+        self._sustain_min_ops = max(5, self.operations_per_iteration // 2)
         
         # Prometheus URL - auto-discover with multiple strategies
         self.prometheus_url = None
@@ -315,6 +365,8 @@ class SmartExecutionController:
         # Cached cluster and subnet info
         self.cluster_uuid = None
         self.cluster_name = None
+        self._all_clusters: List[Dict] = []
+        self._ncm_cluster_name: Optional[str] = None
         self.subnet_uuid = None
         self.subnet_name = None
         
@@ -369,24 +421,68 @@ class SmartExecutionController:
             # Use pc_client (direct PC IP) for infrastructure discovery
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
             
-            # Get first available cluster
+            # List ALL clusters (up to 50) for multi-cluster awareness
             clusters_response = await pc.v3_request(
                 endpoint="/clusters/list",
                 method="POST",
-                payload={"kind": "cluster", "length": 10}
+                payload={"kind": "cluster", "length": 50}
             )
             
             if clusters_response and clusters_response[0].status in (200, 202) and isinstance(clusters_response[0].body, dict) and clusters_response[0].body.get('entities'):
-                for cluster in clusters_response[0].body['entities']:
-                    cluster_name = cluster.get('spec', {}).get('name', '')
-                    if cluster_name and cluster_name != 'Unnamed':
-                        self.cluster_uuid = cluster['metadata']['uuid']
-                        self.cluster_name = cluster_name
-                        break
-                if not self.cluster_uuid:
-                    cluster = clusters_response[0].body['entities'][0]
+                all_clusters = clusters_response[0].body['entities']
+                named_clusters = []
+                for c in all_clusters:
+                    cname = c.get('spec', {}).get('name', '')
+                    if cname and cname != 'Unnamed':
+                        net = c.get('spec', {}).get('resources', {}).get('network', {})
+                        named_clusters.append({
+                            'uuid': c['metadata']['uuid'],
+                            'name': cname,
+                            'external_ip': net.get('external_ip', ''),
+                            'data_services_ip': net.get('external_data_services_ip', ''),
+                        })
+                self._all_clusters = named_clusters
+                cluster_names = [c['name'] for c in named_clusters]
+                logger.info(f"🔍 Detected {len(named_clusters)} cluster(s): {cluster_names}")
+
+                # Identify the cluster that hosts NCM.
+                # Strategy: match ncm_ip against cluster external_ip / data_services_ip,
+                # then try name-based heuristics (auto_cluster patterns indicate NCM host).
+                ncm_ip = self.testbed_info.get('ncm_ip', '').strip()
+                ncm_cluster = None
+                if ncm_ip:
+                    for c in named_clusters:
+                        if c['external_ip'] == ncm_ip or c.get('data_services_ip') == ncm_ip:
+                            ncm_cluster = c
+                            break
+                if not ncm_cluster:
+                    for c in named_clusters:
+                        cname_lower = c['name'].lower()
+                        if 'auto_cluster' in cname_lower or 'ncm' in cname_lower:
+                            ncm_cluster = c
+                            break
+                if not ncm_cluster and ncm_ip:
+                    for c in named_clusters:
+                        if ncm_ip in c['name']:
+                            ncm_cluster = c
+                            break
+
+                if ncm_cluster:
+                    self.cluster_uuid = ncm_cluster['uuid']
+                    self.cluster_name = ncm_cluster['name']
+                    self._ncm_cluster_name = ncm_cluster['name']
+                    logger.info(f"✅ NCM cluster identified: {ncm_cluster['name']} (external_ip matches ncm_ip={ncm_ip})")
+                elif named_clusters:
+                    self.cluster_uuid = named_clusters[0]['uuid']
+                    self.cluster_name = named_clusters[0]['name']
+                    self._ncm_cluster_name = None
+                    logger.warning(f"⚠️ Could not match ncm_ip={ncm_ip} to any cluster external_ip; "
+                                   f"falling back to first cluster: {self.cluster_name}")
+                else:
+                    cluster = all_clusters[0]
                     self.cluster_uuid = cluster['metadata']['uuid']
                     self.cluster_name = cluster.get('spec', {}).get('name', 'default-cluster')
+                    self._ncm_cluster_name = None
                 logger.info(f"✅ Using cluster: {self.cluster_name} ({self.cluster_uuid})")
             else:
                 raise ValueError("No clusters found on testbed")
@@ -519,6 +615,8 @@ class SmartExecutionController:
                 checks['image'] = self.IMAGE_NAME
                 checks['subnet'] = self.subnet_name
                 checks['cluster'] = self.cluster_name
+                checks['all_clusters'] = [c['name'] for c in getattr(self, '_all_clusters', [])]
+                checks['ncm_cluster'] = getattr(self, '_ncm_cluster_name', None)
                 if not has_image:
                     checks['warnings'].append('No VM image discovered - VM create operations will fail')
                 if not has_subnet:
@@ -714,13 +812,14 @@ class SmartExecutionController:
             if tunnel_url:
                 return tunnel_url
         
-        # Strategy 2: Try explicit URL from testbed_json
+        # Strategy 2: Try explicit URL from testbed_json (HTTP→HTTPS resolution for TLS-only endpoints)
         for key in ('prometheus_url', 'prometheus_endpoint'):
             url = testbed_info.get(key, '')
             if url and not url.startswith('http://localhost:'):
-                if _test_prometheus(url):
-                    logger.info(f"✅ Prometheus reachable at stored {key}: {url}")
-                    return url
+                resolved = resolve_working_prometheus_url(url.strip())
+                if resolved and _test_prometheus(resolved):
+                    logger.info(f"✅ Prometheus reachable at stored {key}: {resolved}")
+                    return resolved
         
         # Strategy 3: Try NCM Prometheus (HTTPS on node_port)
         if ncm_ip:
@@ -813,6 +912,19 @@ class SmartExecutionController:
         
         return None
     
+    def _capture_cluster_health_before_teardown(self):
+        """Collect cluster health snapshot while SSH tunnel / Prometheus is still alive."""
+        if self._cluster_health_snapshot.get('collection_status') == 'success':
+            return
+        try:
+            if self.prometheus_url:
+                from services.enhanced_report_service import EnhancedReportService
+                ers = EnhancedReportService(prometheus_url=self.prometheus_url)
+                self._cluster_health_snapshot = ers._collect_cluster_health()
+                logger.info(f"📊 Cluster health snapshot: {self._cluster_health_snapshot.get('collection_status')}")
+        except Exception as e:
+            logger.debug(f"Could not collect cluster health snapshot: {e}")
+
     def _cleanup_ssh_tunnel(self):
         """Clean up the SSH tunnel process."""
         if self._ssh_tunnel_proc:
@@ -857,7 +969,13 @@ class SmartExecutionController:
             logger.info(f"📊 Baseline metrics: CPU={baseline_cpu:.1f}%, Memory={baseline_mem:.1f}%")
             logger.info(f"🎯 Target metrics: CPU={target_cpu}%, Memory={target_mem}% (Stop: {stop_condition})")
             
-            if stop_condition == 'any':
+            if stop_condition == 'cpu':
+                if baseline_cpu >= target_cpu:
+                    logger.warning(f"⚠️  WARNING: Baseline CPU ({baseline_cpu:.1f}%) already exceeds target ({target_cpu}%)!")
+            elif stop_condition == 'memory':
+                if baseline_mem >= target_mem:
+                    logger.warning(f"⚠️  WARNING: Baseline Memory ({baseline_mem:.1f}%) already exceeds target ({target_mem}%)!")
+            elif stop_condition == 'any':
                 if baseline_cpu >= target_cpu:
                     logger.warning(f"⚠️  WARNING: Baseline CPU ({baseline_cpu:.1f}%) already exceeds target ({target_cpu}%)!")
                 if baseline_mem >= target_mem:
@@ -898,15 +1016,10 @@ class SmartExecutionController:
                 self._learning_summary = ""
                 logger.debug(f"Could not generate learning summary: {le}")
             
-            # Collect cluster health snapshot while Prometheus is still available
-            try:
-                if self.prometheus_url:
-                    from services.enhanced_report_service import EnhancedReportService
-                    ers = EnhancedReportService(prometheus_url=self.prometheus_url)
-                    self._cluster_health_snapshot = ers._collect_cluster_health()
-                    logger.info(f"📊 Cluster health snapshot: {self._cluster_health_snapshot.get('collection_status')}")
-            except Exception as che:
-                logger.debug(f"Could not collect cluster health: {che}")
+            # Cluster health snapshot was already collected inside _execution_loop
+            # (before tunnel teardown) — log it here.
+            ch_status = self._cluster_health_snapshot.get('collection_status', 'not_collected')
+            logger.info(f"📊 Cluster health snapshot status: {ch_status}")
             
             return {
                 'success': True,
@@ -934,7 +1047,78 @@ class SmartExecutionController:
             except Exception:
                 pass
             self._persist_to_database()
-    
+            self._send_completion_alert()
+
+    def _send_completion_alert(self):
+        """Send Slack/Email/Webhook alert on execution completion or failure."""
+        try:
+            testbed_id = self.testbed_info.get('unique_testbed_id', '')
+            if not testbed_id:
+                return
+
+            from services.alert_service import get_alert_service
+            alert_service = get_alert_service()
+            channels_config = alert_service.get_channels_config_for_testbed(testbed_id)
+            if not channels_config:
+                logger.debug(f"No alert config for testbed {testbed_id}, skipping notification")
+                return
+
+            successful_ops = sum(1 for op in self.operations_history if op.get('status') == 'SUCCESS')
+            failed_ops = sum(1 for op in self.operations_history if op.get('status') == 'FAILED')
+            countable = successful_ops + failed_ops
+            success_rate = (successful_ops / countable * 100) if countable > 0 else 100
+            duration_min = 0
+            if self.start_time:
+                end = self.end_time or datetime.now(timezone.utc)
+                start = self.start_time.replace(tzinfo=timezone.utc) if self.start_time.tzinfo is None else self.start_time
+                end = end.replace(tzinfo=timezone.utc) if end.tzinfo is None else end
+                duration_min = (end - start).total_seconds() / 60
+
+            execution_data = {
+                'execution_id': self.execution_id,
+                'testbed_id': testbed_id,
+                'testbed_label': self.testbed_info.get('testbed_label', 'Unknown'),
+                'total_operations': self.total_operations,
+                'successful_operations': successful_ops,
+                'failed_operations': failed_ops,
+                'success_rate': round(success_rate, 1),
+                'cpu_achieved': float(self.current_metrics.get('cpu_percent', 0)),
+                'memory_achieved': float(self.current_metrics.get('memory_percent', 0)),
+                'duration_minutes': round(duration_min, 1),
+                'threshold_reached': self.status in ('COMPLETED', 'SUSTAINING'),
+                'started_at': self.start_time.isoformat() if self.start_time else '',
+                'completed_at': (self.end_time or datetime.now(timezone.utc)).isoformat(),
+            }
+
+            if self.status in ('COMPLETED', 'SUSTAINING', 'LONGEVITY_SUSTAINING'):
+                results = alert_service.send_execution_complete_alert(execution_data, channels_config)
+            elif self.status in ('FAILED', 'ERROR', 'STOPPED'):
+                error_msg = self.error_message or f'Execution {self.status}'
+                results = alert_service.send_execution_failed_alert(execution_data, error_msg, channels_config)
+            else:
+                results = alert_service.send_execution_complete_alert(execution_data, channels_config)
+
+            logger.info(f"Alert dispatch results for {self.execution_id}: {results}")
+
+            try:
+                from database import SessionLocal
+                from models.smart_execution import SmartExecution
+                db = SessionLocal()
+                try:
+                    exc = db.query(SmartExecution).filter_by(execution_id=self.execution_id).first()
+                    if exc:
+                        exc.alert_generated = True
+                        exc.alert_sent_slack = results.get('slack', False)
+                        exc.alert_timestamp = datetime.now(timezone.utc)
+                        db.commit()
+                        logger.info(f"📧 Alert flags persisted for {self.execution_id}")
+                finally:
+                    db.close()
+            except Exception as db_err:
+                logger.warning(f"Failed to persist alert flags: {db_err}")
+        except Exception as e:
+            logger.warning(f"Failed to send completion alert: {e}")
+
     async def _ensure_final_metrics(self):
         """Refresh final cluster metrics before persist: prefer live Prometheus, else last metrics_history sample."""
         try:
@@ -985,6 +1169,7 @@ class SmartExecutionController:
                     self._log_event('WARNING', f'Execution timeout reached after {elapsed:.1f} minutes')
                     self.status = "TIMEOUT"
                     self._cleanup_stress_pods()
+                    self._capture_cluster_health_before_teardown()
                     self._cleanup_ssh_tunnel()
                     break
             
@@ -1049,35 +1234,89 @@ class SmartExecutionController:
                 if self._adaptive_parallelism:
                     self._adjust_parallelism(cpu, memory)
                 
-                # 2. Check if thresholds reached
-                if self._check_thresholds_reached(cpu, memory):
-                    if self._longevity_enabled:
-                        if self.status != "LONGEVITY_SUSTAINING":
+                # 2. Check if thresholds reached — enter sustain phase
+                is_sustaining = self.status in ("SUSTAINING", "LONGEVITY_SUSTAINING")
+                if self._check_thresholds_reached(cpu, memory) or is_sustaining:
+                    if not is_sustaining:
+                        # First time hitting threshold — enter sustain
+                        self._sustain_start_time = datetime.now(timezone.utc)
+                        self._sustain_stats['entered_at'] = self._sustain_start_time.isoformat()
+                        self._send_threshold_alert(cpu, memory)
+                        if self._longevity_enabled:
+                            self.status = "LONGEVITY_SUSTAINING"
                             logger.info(f"🎯 Threshold reached, entering longevity sustain mode. CPU={cpu:.1f}%, Mem={memory:.1f}%")
                             self._log_event('SUCCESS', f'🎯 Threshold reached! Entering longevity sustain mode. CPU={cpu:.1f}%, Mem={memory:.1f}%')
-                            self._send_threshold_alert(cpu, memory)
-                            self.status = "LONGEVITY_SUSTAINING"
                             if self._health_checker:
                                 try:
                                     self._health_baseline = self._health_checker.capture_baseline()
                                     self._log_event('INFO', 'Longevity health baseline captured')
                                 except Exception as hbe:
                                     logger.warning(f"Health baseline capture failed: {hbe}")
-                    else:
-                        logger.info(f"🎯 Threshold reached! CPU={cpu:.1f}%, Memory={memory:.1f}%")
-                        self._log_event('SUCCESS', f'🎯 Target threshold reached! CPU={cpu:.1f}%, Memory={memory:.1f}%', cpu=cpu, memory=memory)
-                        self._send_threshold_alert(cpu, memory)
-                        self.status = "COMPLETED"
-                        self._cleanup_stress_pods()
-                        self._cleanup_ssh_tunnel()
-                        break
-                
+                        else:
+                            sustain_dur = self._sustain_minutes
+                            self.status = "SUSTAINING"
+                            logger.info(f"🎯 Threshold reached! Entering sustain phase for {sustain_dur}m. CPU={cpu:.1f}%, Mem={memory:.1f}%")
+                            self._log_event('SUCCESS', f'🎯 Threshold reached! Sustaining load for {sustain_dur} minutes. CPU={cpu:.1f}%, Mem={memory:.1f}%', cpu=cpu, memory=memory)
+
+                    # Track sustain stats
+                    self._sustain_stats['min_cpu'] = min(self._sustain_stats['min_cpu'], cpu)
+                    self._sustain_stats['max_cpu'] = max(self._sustain_stats['max_cpu'], cpu)
+                    self._sustain_stats['min_memory'] = min(self._sustain_stats['min_memory'], memory)
+                    self._sustain_stats['max_memory'] = max(self._sustain_stats['max_memory'], memory)
+
+                    # Check if sustain duration has elapsed (non-longevity)
+                    if self.status == "SUSTAINING" and self._sustain_start_time:
+                        elapsed_sustain = (datetime.now(timezone.utc) - self._sustain_start_time).total_seconds() / 60
+                        remaining = self._sustain_minutes - elapsed_sustain
+                        self._sustain_stats['duration_seconds'] = elapsed_sustain * 60
+                        sustain_ops = self._sustain_stats.get('ops_during_sustain', 0)
+                        sustain_opm = sustain_ops / max(elapsed_sustain, 0.1)
+                        self._sustain_stats['sustain_ops_per_minute'] = round(sustain_opm, 1)
+
+                        if remaining <= 0:
+                            logger.info(f"✅ Sustain phase complete ({self._sustain_minutes}m). CPU={cpu:.1f}%, Mem={memory:.1f}%. "
+                                       f"Ops during sustain: {sustain_ops} ({sustain_opm:.1f}/min)")
+                            self._log_event('SUCCESS', f'✅ Sustain phase complete after {self._sustain_minutes} minutes. '
+                                           f'CPU range: {self._sustain_stats["min_cpu"]:.1f}-{self._sustain_stats["max_cpu"]:.1f}%, '
+                                           f'Memory range: {self._sustain_stats["min_memory"]:.1f}-{self._sustain_stats["max_memory"]:.1f}%, '
+                                           f'Ops: {sustain_ops} ({sustain_opm:.1f}/min), Re-escalations: {self._sustain_stats["reescalations"]}')
+                            self.status = "COMPLETED"
+                            self._cleanup_stress_pods()
+                            self._capture_cluster_health_before_teardown()
+                            self._cleanup_ssh_tunnel()
+                            break
+                        elif int(elapsed_sustain * 2) % 2 == 0 and elapsed_sustain > 0.2:
+                            self._log_event('INFO', f'⏱️ Sustaining: {elapsed_sustain:.1f}/{self._sustain_minutes}m | '
+                                           f'CPU={cpu:.1f}% Mem={memory:.1f}% | '
+                                           f'{sustain_ops} ops ({sustain_opm:.1f}/min) | '
+                                           f'{len(self._stress_pods_deployed)} pods | '
+                                           f'remaining: {remaining:.1f}m')
+
+                    # Hysteresis: re-escalate if load drops below threshold - hysteresis band
+                    cpu_target = self.target_config.get('cpu_threshold', 80)
+                    mem_target = self.target_config.get('memory_threshold', 80)
+                    cpu_floor = cpu_target - self._sustain_hysteresis_pct
+                    mem_floor = mem_target - self._sustain_hysteresis_pct
+
+                    if cpu < cpu_floor or memory < mem_floor:
+                        self._sustain_stats['reescalations'] = self._sustain_stats.get('reescalations', 0) + 1
+                        dropper = []
+                        if cpu < cpu_floor:
+                            dropper.append(f'CPU={cpu:.1f}%<{cpu_floor:.0f}%')
+                        if memory < mem_floor:
+                            dropper.append(f'Mem={memory:.1f}%<{mem_floor:.0f}%')
+                        logger.info(f"📉 Load dropped during sustain ({', '.join(dropper)}), re-escalating...")
+                        self._log_event('WARNING', f'Load dropped during sustain ({", ".join(dropper)}), deploying more stress')
+                        self._stagnation_count = 2
+                        self._check_stagnation_and_escalate(cpu, memory)
+
                 # Longevity mode: periodic health checks and checkpoints
                 if self._longevity_enabled and self.status == "LONGEVITY_SUSTAINING":
                     await self._longevity_periodic_tasks(cpu, memory, iteration)
                 
-                # Escalation: deploy stress pods if metrics stagnant
-                self._check_stagnation_and_escalate(cpu, memory)
+                # Escalation: deploy stress pods if metrics stagnant (ramp-up phase only)
+                if not is_sustaining:
+                    self._check_stagnation_and_escalate(cpu, memory)
                 
                 # Phase 7: CPU velocity prediction — record & throttle
                 velocity_throttle = 1.0
@@ -1100,15 +1339,22 @@ class SmartExecutionController:
                         logger.debug(f"CPU velocity prediction skipped: {vp_err}")
                 
                 # 3. Calculate operations to execute (with rate limiting)
+                rate_limit = self.operations_per_iteration
+                if self.status in ("SUSTAINING", "LONGEVITY_SUSTAINING"):
+                    rate_limit = max(rate_limit, self._sustain_min_ops + 3)
                 operations_count = min(
                     self._calculate_operations_count(cpu, memory),
-                    self.operations_per_iteration  # Apply rate limit
+                    rate_limit
                 )
                 
-                # Apply velocity throttle
+                # Apply velocity throttle (but not below sustain minimum during sustain)
                 if velocity_throttle < 1.0:
-                    operations_count = max(1, int(operations_count * velocity_throttle))
-                
+                    throttled = max(1, int(operations_count * velocity_throttle))
+                    if self.status in ("SUSTAINING", "LONGEVITY_SUSTAINING"):
+                        operations_count = max(throttled, self._sustain_min_ops)
+                    else:
+                        operations_count = throttled
+
                 logger.info(f"📝 Planning to execute {operations_count} operations (rate limit: {self.operations_per_iteration}/iteration)")
                 
                 # Periodic checkpoint: persist state to DB every 5 iterations
@@ -1132,6 +1378,8 @@ class SmartExecutionController:
                     if batch_results:
                         successes = sum(1 for r in batch_results if r.get('status') == 'SUCCESS')
                         batch_success_rate = successes / len(batch_results)
+                        if self.status in ("SUSTAINING", "LONGEVITY_SUSTAINING"):
+                            self._sustain_stats['ops_during_sustain'] += len(batch_results)
                         
                         # Post-batch metric poll: capture fresh metrics AFTER the
                         # entire batch completes so impact attribution is accurate.
@@ -1308,13 +1556,21 @@ class SmartExecutionController:
             except Exception as e:
                 logger.warning(f"Checkpoint error: {e}")
 
-        # Maintain load at target by adjusting stress pods
+        # Maintain load at target by adjusting stress pods (check both CPU and memory)
         maintain_threshold = self._longevity_maintain_load_pct
         if maintain_threshold > 0:
-            cpu_target = self.target_config.get('cpu_threshold', 80)
+            mem_target = self.target_config.get('memory_threshold', 80)
+            needs_escalation = False
+            reasons = []
             if cpu < maintain_threshold:
-                logger.info(f"📉 CPU dropped to {cpu:.1f}% (maintain target: {maintain_threshold}%), re-escalating")
-                self._log_event('INFO', f'Load maintenance: CPU={cpu:.1f}% below maintain threshold ({maintain_threshold}%)')
+                needs_escalation = True
+                reasons.append(f'CPU={cpu:.1f}%<{maintain_threshold}%')
+            if memory < maintain_threshold:
+                needs_escalation = True
+                reasons.append(f'Mem={memory:.1f}%<{maintain_threshold}%')
+            if needs_escalation:
+                logger.info(f"📉 Load dropped ({', '.join(reasons)}), re-escalating")
+                self._log_event('INFO', f'Load maintenance: {", ".join(reasons)}, re-escalating')
                 self._stagnation_count = 2
                 self._check_stagnation_and_escalate(cpu, memory)
 
@@ -1332,10 +1588,16 @@ class SmartExecutionController:
         cpu_reached = cpu >= cpu_threshold
         memory_reached = memory >= memory_threshold
         
-        if stop_condition == 'any':
+        if stop_condition == 'cpu':
+            hit = cpu_reached
+        elif stop_condition == 'memory':
+            hit = memory_reached
+        elif stop_condition == 'any':
             hit = cpu_reached or memory_reached
-        else:
+        elif stop_condition in ('all', 'both'):
             hit = cpu_reached and memory_reached
+        else:
+            hit = cpu_reached or memory_reached
         
         # 2-of-3 confirmation: threshold must be met in >=2 of last 3 polls
         self._threshold_hit_history.append(hit)
@@ -1370,9 +1632,29 @@ class SmartExecutionController:
         """
         Calculate how many operations to execute based on current metrics.
         Applies workload profile scaling and adaptive intensity.
+        When Prometheus is dead (cpu=0 AND memory=0), use a conservative fixed
+        count instead of the max-intensity path to avoid flooding the cluster.
         """
         cpu_threshold = self.target_config.get('cpu_threshold', 80)
         memory_threshold = self.target_config.get('memory_threshold', 80)
+        
+        # Guard: Prometheus is dead — both metrics stuck at 0
+        if cpu == 0 and memory == 0:
+            consecutive_zeros = getattr(self, '_consecutive_zero_metrics', 0) + 1
+            self._consecutive_zero_metrics = consecutive_zeros
+            if consecutive_zeros >= 3:
+                logger.warning(
+                    f"⚠️  Prometheus appears unreachable ({consecutive_zeros} consecutive "
+                    f"zero reads). Using conservative operation count."
+                )
+                self._log_event(
+                    'WARNING',
+                    f'Prometheus unreachable — {consecutive_zeros} consecutive 0% readings. '
+                    f'Running {self.min_operations_per_cycle} ops/iteration (conservative).',
+                )
+            return self.min_operations_per_cycle
+        else:
+            self._consecutive_zero_metrics = 0
         
         cpu_delta = cpu_threshold - cpu
         memory_delta = memory_threshold - memory
@@ -1402,6 +1684,8 @@ class SmartExecutionController:
         if profile_mult != 1.0:
             logger.info(f"📊 Workload profile '{self.workload_profile}' multiplier: {profile_mult:.2f}")
         
+        is_sustaining = self.status in ("SUSTAINING", "LONGEVITY_SUSTAINING")
+
         if min_delta > 40:
             operations = int(self.max_operations_per_cycle * 2.0 * combined_mult)
         elif min_delta > 20:
@@ -1412,6 +1696,20 @@ class SmartExecutionController:
             operations = int(self.max_operations_per_cycle * 0.4 * combined_mult)
         elif min_delta > 0:
             operations = max(int(self.min_operations_per_cycle * combined_mult), 1)
+        elif is_sustaining:
+            # At or above threshold during sustain: keep real NCM API pressure
+            # to genuinely stress the cluster — not just fire-and-forget
+            cpu_target = self.target_config.get('cpu_threshold', 80)
+            cpu_margin = cpu - cpu_target
+            if cpu_margin < 0:
+                # Below target during sustain — push harder
+                operations = max(self._sustain_min_ops + 3, self.operations_per_iteration)
+            elif cpu_margin < 5:
+                # Near threshold — maintain steady pressure
+                operations = self._sustain_min_ops + 2
+            else:
+                # Well above threshold — keep minimum real ops flowing
+                operations = self._sustain_min_ops
         else:
             operations = 0
         
@@ -1553,15 +1851,16 @@ class SmartExecutionController:
         return None
 
     def _build_weighted_task_list(self, count: int) -> List[tuple]:
-        """Build operation task list: ML-guided > bandit > weighted > uniform."""
+        """Build operation task list: ML-guided > bandit > weighted > uniform.
+        All paths are sanitized to avoid delete/update before any entity exists."""
         ml_tasks = self._try_ml_guided_selection(count)
         if ml_tasks:
-            return ml_tasks
+            return self._sanitize_task_list(ml_tasks)
         
         # Phase 5: Thompson Sampling bandit selection
         bandit_tasks = self._try_bandit_selection(count)
         if bandit_tasks:
-            return bandit_tasks
+            return self._sanitize_task_list(bandit_tasks)
         
         if not self.operation_weights:
             return self._build_uniform_task_list(count)
@@ -1595,7 +1894,7 @@ class SmartExecutionController:
                 if cumulative >= r:
                     tasks.append((entity_type, op))
                     break
-        return tasks
+        return self._sanitize_task_list(tasks)
 
     def _try_bandit_selection(self, count: int) -> Optional[List[tuple]]:
         """Phase 5: Select operations via Thompson Sampling bandit."""
@@ -1625,6 +1924,26 @@ class SmartExecutionController:
             logger.debug(f"Bandit selection failed: {e}")
         return None
 
+    def _sanitize_task_list(self, tasks: List[tuple]) -> List[tuple]:
+        """Replace delete/update with create/list when no entity of that type has been created yet."""
+        sanitized = []
+        for entity_type, operation in tasks:
+            op_lower = operation.lower()
+            if op_lower in ('delete', 'update') and not self.created_entities.get(entity_type):
+                ops_config = self.entities_config.get(entity_type, {})
+                available = list(ops_config.keys()) if isinstance(ops_config, dict) else (
+                    ops_config if isinstance(ops_config, list) else [str(ops_config)]
+                )
+                if 'create' in available:
+                    sanitized.append((entity_type, 'create'))
+                elif 'list' in available:
+                    sanitized.append((entity_type, 'list'))
+                else:
+                    sanitized.append((entity_type, available[0] if available else operation))
+            else:
+                sanitized.append((entity_type, operation))
+        return sanitized
+
     def _build_uniform_task_list(self, count: int) -> List[tuple]:
         """Build uniformly-distributed operation tasks (original logic)."""
         entity_types = list(self.entities_config.keys())
@@ -1644,7 +1963,7 @@ class SmartExecutionController:
             for i in range(operations_per_entity):
                 operation = operations_list[(self.total_operations + i) % len(operations_list)]
                 tasks.append((entity_type, operation))
-        return tasks
+        return self._sanitize_task_list(tasks)
 
     async def _execute_operations_batch(self, count: int, iteration: int):
         """Execute a batch of operations with parallel execution, weighted distribution, and latency tracking."""
@@ -1841,6 +2160,7 @@ class SmartExecutionController:
                     'operation': operation,
                     'entity_name': entity_name,
                     'status': 'SKIPPED',
+                    'mode': 'REAL' if (self.ncm_client_ready and self.ncm_client) else 'SIMULATED',
                     'error': 'High predicted failure probability',
                     'start_time': start_time.isoformat(),
                     'duration_seconds': 0,
@@ -1848,11 +2168,11 @@ class SmartExecutionController:
                 }
         
         try:
-            if self.ncm_client_ready and self.ncm_client:
+            is_real = bool(self.ncm_client_ready and self.ncm_client)
+            if is_real:
                 logger.info(f"🚀 REAL: {entity_type}.{operation} ({entity_name})")
                 result = await self._execute_real_operation(entity_type, operation, entity_name)
             else:
-                # Fallback to simulation
                 logger.debug(f"⚠️ SIMULATED: {entity_type}.{operation} - ncm_client_ready={self.ncm_client_ready}, ncm_client={self.ncm_client is not None}")
                 result = await self._execute_simulated_operation(entity_type, operation, entity_name)
             
@@ -1870,10 +2190,21 @@ class SmartExecutionController:
                 })
                 logger.info(f"📝 Tracked entity for cleanup: {entity_type}/{entity_name} ({result.get('uuid')})")
             
+            # Remove deleted entity from tracking so future deletes don't target a ghost UUID
+            if result.get('status') == 'SUCCESS' and operation == 'delete' and result.get('uuid'):
+                tracked = self.created_entities.get(entity_type, [])
+                self.created_entities[entity_type] = [
+                    e for e in tracked if e.get('uuid') != result['uuid']
+                ]
+            
+            execution_mode = 'REAL' if is_real else 'SIMULATED'
+            http_status_code = result.get('http_status_code') or result.get('error_code')
+            
             return {
                 'entity_type': entity_type,
                 'operation': operation,
                 'status': result.get('status', 'SUCCESS'),
+                'mode': execution_mode,
                 'start_time': start_time.isoformat(),
                 'end_time': end_time.isoformat(),
                 'duration_seconds': duration,
@@ -1882,6 +2213,7 @@ class SmartExecutionController:
                 'error': result.get('error'),
                 'error_type': result.get('error_type'),
                 'error_code': result.get('error_code'),
+                'http_status_code': http_status_code,
                 'iteration': iteration,
             }
             
@@ -1897,6 +2229,7 @@ class SmartExecutionController:
                 'entity_type': entity_type,
                 'operation': operation,
                 'status': 'FAILED',
+                'mode': 'REAL' if is_real else 'SIMULATED',
                 'start_time': start_time.isoformat(),
                 'end_time': end_time.isoformat(),
                 'duration_seconds': duration,
@@ -1905,6 +2238,7 @@ class SmartExecutionController:
                 'error': str(e),
                 'error_type': type(e).__name__,
                 'error_code': getattr(e, 'status_code', None),
+                'http_status_code': getattr(e, 'status_code', None),
                 'traceback': error_traceback,
                 'iteration': iteration,
             }
@@ -2434,35 +2768,34 @@ class SmartExecutionController:
             }
     
     async def _delete_vm(self) -> Dict:
-        """Delete a VM (find one created by this execution)"""
+        """Delete a VM — prefer tracked UUID from created_entities, fall back to API list."""
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
+
+            tracked = self.created_entities.get('VM', []) or self.created_entities.get('vm', [])
+            if tracked:
+                entry = tracked[-1]
+                vm_uuid = entry['uuid']
+                logger.info(f"🗑️  Deleting tracked VM: {entry.get('name')} ({vm_uuid})")
+                await pc.v3_request(endpoint=f"/vms/{vm_uuid}", method="DELETE")
+                logger.info(f"✅ VM deleted (tracked): {vm_uuid}")
+                return {'status': 'SUCCESS', 'uuid': vm_uuid, 'error': None}
+
             response = await pc.v3_request(
-                endpoint="/vms/list",
-                method="POST",
+                endpoint="/vms/list", method="POST",
                 payload={"kind": "vm", "length": 10}
             )
-            
             if response and isinstance(response[0].body, dict) and response[0].body.get('entities'):
-                # Find a VM we created (starts with "smart-vm-")
                 for vm in response[0].body['entities']:
                     vm_name = vm.get('spec', {}).get('name', '')
                     if vm_name.startswith('smart-vm-'):
                         vm_uuid = vm['metadata']['uuid']
                         logger.info(f"🗑️  Deleting VM: {vm_name} ({vm_uuid})")
-                        
-                        await pc.v3_request(
-                            endpoint=f"/vms/{vm_uuid}",
-                            method="DELETE"
-                        )
-                        
+                        await pc.v3_request(endpoint=f"/vms/{vm_uuid}", method="DELETE")
                         logger.info(f"✅ VM deleted: {vm_name}")
                         return {'status': 'SUCCESS', 'uuid': vm_uuid, 'error': None}
-                
-                return {'status': 'FAILED', 'error': 'No VMs found to delete'}
-            else:
-                return {'status': 'FAILED', 'error': 'No VMs found'}
-                
+
+            return {'status': 'SKIPPED', 'error': 'No smart-vm exists yet — nothing to delete', 'uuid': None}
         except Exception as e:
             logger.error(f"VM deletion failed: {e}")
             return {'status': 'FAILED', 'error': str(e)}
@@ -2490,40 +2823,56 @@ class SmartExecutionController:
             return {'status': 'FAILED', 'error': str(e), 'uuid': None}
 
     async def _update_vm(self, vm_name: str) -> Dict:
-        """Update a VM (find an existing smart-vm and update its description)."""
+        """Update a VM — prefer tracked UUID, fall back to API list."""
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
-            response = await asyncio.wait_for(
-                pc.v3_request(endpoint="/vms/list", method="POST",
-                              payload={"kind": "vm", "length": 20,
-                                       "filter": "vm_name==smart-vm-*"}),
+            target_uuid = None
+
+            tracked = self.created_entities.get('VM', []) or self.created_entities.get('vm', [])
+            if tracked:
+                target_uuid = tracked[-1]['uuid']
+                logger.info(f"📝 Using tracked VM UUID for update: {target_uuid}")
+
+            if not target_uuid:
+                response = await asyncio.wait_for(
+                    pc.v3_request(endpoint="/vms/list", method="POST",
+                                  payload={"kind": "vm", "length": 20,
+                                           "filter": "vm_name==smart-vm-*"}),
+                    timeout=30.0
+                )
+                if response and isinstance(response[0].body, dict):
+                    for vm in response[0].body.get('entities', []):
+                        uid = vm.get('metadata', {}).get('uuid')
+                        if uid:
+                            target_uuid = uid
+                            break
+
+            if not target_uuid:
+                return {'status': 'SKIPPED', 'error': 'No smart-vm exists yet — nothing to update', 'uuid': None}
+
+            get_resp = await asyncio.wait_for(
+                pc.v3_request(endpoint=f"/vms/{target_uuid}", method="GET"),
                 timeout=30.0
             )
-            if response and isinstance(response[0].body, dict):
-                entities = response[0].body.get('entities', [])
-                for vm in entities:
-                    vm_uuid = vm.get('metadata', {}).get('uuid')
-                    if not vm_uuid:
-                        continue
-                    spec = vm.get('spec', {})
-                    spec.setdefault('description', '')
-                    spec['description'] = f'Updated by smart execution {self.execution_id}'
-                    update_payload = {
-                        'spec': spec,
-                        'metadata': vm.get('metadata', {}),
-                    }
-                    update_resp = await asyncio.wait_for(
-                        pc.v3_request(endpoint=f"/vms/{vm_uuid}", method="PUT",
-                                      payload=update_payload),
-                        timeout=30.0
-                    )
-                    if update_resp and update_resp[0].status in (200, 202):
-                        logger.info(f"✅ VM updated: {vm_uuid}")
-                        return {'status': 'SUCCESS', 'uuid': vm_uuid, 'error': None}
-                    else:
-                        error_msg = self._extract_api_error(update_resp)
-                        return {'status': 'FAILED', 'error': f'VM update failed: {error_msg}', 'uuid': None}
-            return {'status': 'FAILED', 'error': 'No smart-vm found to update', 'uuid': None}
+            if not (get_resp and isinstance(get_resp[0].body, dict)):
+                return {'status': 'FAILED', 'error': f'Cannot GET VM {target_uuid}', 'uuid': None}
+
+            vm_body = get_resp[0].body
+            spec = vm_body.get('spec', {})
+            spec.setdefault('description', '')
+            spec['description'] = f'Updated by smart execution {self.execution_id}'
+            update_payload = {'spec': spec, 'metadata': vm_body.get('metadata', {})}
+
+            update_resp = await asyncio.wait_for(
+                pc.v3_request(endpoint=f"/vms/{target_uuid}", method="PUT", payload=update_payload),
+                timeout=30.0
+            )
+            if update_resp and update_resp[0].status in (200, 202):
+                logger.info(f"✅ VM updated: {target_uuid}")
+                return {'status': 'SUCCESS', 'uuid': target_uuid, 'error': None}
+            else:
+                error_msg = self._extract_api_error(update_resp)
+                return {'status': 'FAILED', 'error': f'VM update failed: {error_msg}', 'uuid': None}
         except asyncio.TimeoutError:
             return {'status': 'FAILED', 'error': 'VM update timed out', 'uuid': None}
         except Exception as e:
@@ -2951,42 +3300,76 @@ class SmartExecutionController:
             return {'status': 'FAILED', 'error': str(e)}
     
     async def _update_project(self, project_name: str) -> Dict:
-        """Update an existing project's description."""
+        """Update an existing project — prefer tracked UUID, fall back to API list."""
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
-            resp = await asyncio.wait_for(
-                pc.v3_request(endpoint="/projects/list", method="POST",
-                              payload={"kind": "project", "length": 20}),
+            target_uuid = None
+
+            tracked = self.created_entities.get('Project', []) or self.created_entities.get('project', [])
+            if tracked:
+                target_uuid = tracked[-1]['uuid']
+                logger.info(f"📝 Using tracked Project UUID for update: {target_uuid}")
+
+            if not target_uuid:
+                resp = await asyncio.wait_for(
+                    pc.v3_request(endpoint="/projects/list", method="POST",
+                                  payload={"kind": "project", "length": 20}),
+                    timeout=30.0
+                )
+                if resp and isinstance(resp[0].body, dict):
+                    for proj in resp[0].body.get('entities', []):
+                        pname = proj.get('spec', {}).get('name', '')
+                        if pname.startswith('smart-'):
+                            target_uuid = proj['metadata']['uuid']
+                            break
+
+            if not target_uuid:
+                return {'status': 'SKIPPED', 'error': 'No smart- project exists yet — nothing to update', 'uuid': None}
+
+            get_resp = await asyncio.wait_for(
+                pc.v3_request(endpoint=f"/projects/{target_uuid}", method="GET"),
                 timeout=30.0
             )
-            if resp and isinstance(resp[0].body, dict):
-                for proj in resp[0].body.get('entities', []):
-                    pname = proj.get('spec', {}).get('name', '')
-                    if pname.startswith('smart-'):
-                        proj_uuid = proj['metadata']['uuid']
-                        spec = proj.get('spec', {})
-                        spec['description'] = f'Updated by smart execution {self.execution_id}'
-                        upd_resp = await asyncio.wait_for(
-                            pc.v3_request(endpoint=f"/projects/{proj_uuid}", method="PUT",
-                                          payload={'spec': spec, 'metadata': proj.get('metadata', {})}),
-                            timeout=30.0
-                        )
-                        if upd_resp and upd_resp[0].status in (200, 202):
-                            logger.info(f"✅ Project updated: {pname}")
-                            return {'status': 'SUCCESS', 'uuid': proj_uuid, 'error': None}
-                        else:
-                            error_msg = self._extract_api_error(upd_resp)
-                            return {'status': 'FAILED', 'error': f'Project update failed: {error_msg}', 'uuid': None}
-            return {'status': 'FAILED', 'error': 'No smart- project found to update', 'uuid': None}
+            if not (get_resp and isinstance(get_resp[0].body, dict)):
+                return {'status': 'FAILED', 'error': f'Cannot GET Project {target_uuid}', 'uuid': None}
+
+            proj_body = get_resp[0].body
+            spec = proj_body.get('spec', {})
+            spec['description'] = f'Updated by smart execution {self.execution_id}'
+            upd_resp = await asyncio.wait_for(
+                pc.v3_request(endpoint=f"/projects/{target_uuid}", method="PUT",
+                              payload={'spec': spec, 'metadata': proj_body.get('metadata', {})}),
+                timeout=30.0
+            )
+            if upd_resp and upd_resp[0].status in (200, 202):
+                logger.info(f"✅ Project updated: {target_uuid}")
+                return {'status': 'SUCCESS', 'uuid': target_uuid, 'error': None}
+            else:
+                error_msg = self._extract_api_error(upd_resp)
+                return {'status': 'FAILED', 'error': f'Project update failed: {error_msg}', 'uuid': None}
         except asyncio.TimeoutError:
             return {'status': 'FAILED', 'error': 'Project update timed out', 'uuid': None}
         except Exception as e:
             return {'status': 'FAILED', 'error': str(e), 'uuid': None}
 
     async def _delete_project(self) -> Dict:
-        """Delete a project created by smart execution."""
+        """Delete a project — prefer tracked UUID, fall back to API list."""
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
+
+            tracked = self.created_entities.get('Project', []) or self.created_entities.get('project', [])
+            if tracked:
+                entry = tracked[-1]
+                proj_uuid = entry['uuid']
+                logger.info(f"🗑️  Deleting tracked Project: {entry.get('name')} ({proj_uuid})")
+                del_resp = await asyncio.wait_for(
+                    pc.v3_request(endpoint=f"/projects/{proj_uuid}", method="DELETE"),
+                    timeout=30.0
+                )
+                if del_resp and del_resp[0].status in (200, 202, 204):
+                    logger.info(f"✅ Project deleted (tracked): {proj_uuid}")
+                    return {'status': 'SUCCESS', 'uuid': proj_uuid, 'error': None}
+
             resp = await asyncio.wait_for(
                 pc.v3_request(endpoint="/projects/list", method="POST",
                               payload={"kind": "project", "length": 20}),
@@ -3004,7 +3387,7 @@ class SmartExecutionController:
                         if del_resp and del_resp[0].status in (200, 202, 204):
                             logger.info(f"✅ Project deleted: {pname}")
                             return {'status': 'SUCCESS', 'uuid': proj_uuid, 'error': None}
-            return {'status': 'FAILED', 'error': 'No smart- project found to delete', 'uuid': None}
+            return {'status': 'SKIPPED', 'error': 'No smart- project exists yet — nothing to delete', 'uuid': None}
         except asyncio.TimeoutError:
             return {'status': 'FAILED', 'error': 'Project delete timed out', 'uuid': None}
         except Exception as e:
@@ -3106,31 +3489,33 @@ class SmartExecutionController:
             }
     
     async def _delete_category(self) -> Dict:
-        """Delete a category"""
+        """Delete a category — prefer tracked UUID, fall back to API list."""
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
+
+            tracked = self.created_entities.get('Category', []) or self.created_entities.get('category', [])
+            if tracked:
+                entry = tracked[-1]
+                cat_uuid = entry['uuid']
+                logger.info(f"🗑️  Deleting tracked Category: {entry.get('name')} ({cat_uuid})")
+                await pc.v3_request(endpoint=f"/categories/{cat_uuid}", method="DELETE")
+                logger.info(f"✅ Category deleted (tracked): {cat_uuid}")
+                return {'status': 'SUCCESS', 'uuid': cat_uuid, 'error': None}
+
             response = await pc.v3_request(
-                endpoint="/categories/list",
-                method="POST",
+                endpoint="/categories/list", method="POST",
                 payload={"kind": "category", "length": 10}
             )
-            
             if response and response[0].body.get('entities'):
                 for cat in response[0].body['entities']:
                     cat_name = cat.get('spec', {}).get('name', '')
                     if 'smart-category' in cat_name.lower():
                         cat_uuid = cat['metadata']['uuid']
                         logger.info(f"🗑️  Deleting Category: {cat_name} ({cat_uuid})")
-                        
-                        await pc.v3_request(
-                            endpoint=f"/categories/{cat_uuid}",
-                            method="DELETE"
-                        )
+                        await pc.v3_request(endpoint=f"/categories/{cat_uuid}", method="DELETE")
                         return {'status': 'SUCCESS', 'uuid': cat_uuid, 'error': None}
-                
-                return {'status': 'FAILED', 'error': 'No smart-category found to delete'}
-            else:
-                return {'status': 'FAILED', 'error': 'No categories found'}
+
+            return {'status': 'SKIPPED', 'error': 'No smart-category exists yet — nothing to delete', 'uuid': None}
         except Exception as e:
             logger.error(f"❌ Category deletion failed: {e}")
             return {
@@ -3172,54 +3557,54 @@ class SmartExecutionController:
             }
     
     async def _update_image(self, image_name: str) -> Dict:
-        """Update image metadata"""
+        """Update image metadata — prefer tracked UUID, fall back to API list."""
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
-            response = await pc.v3_request(
-                endpoint="/images/list",
-                method="POST",
-                payload={"kind": "image", "length": 1}
-            )
-            
-            if response and response[0].body.get('entities'):
-                image = response[0].body['entities'][0]
-                image_uuid = image['metadata']['uuid']
-                
-                # Update description
-                update_payload = image
-                update_payload['spec']['description'] = f"Updated by smart execution {self.execution_id}"
-                
-                logger.info(f"📤 Updating Image metadata: {image_uuid}")
-                update_response = await pc.v3_request(
-                    endpoint=f"/images/{image_uuid}",
-                    method="PUT",
-                    payload=update_payload
+            target_uuid = None
+
+            tracked = self.created_entities.get('Image', []) or self.created_entities.get('image', [])
+            if tracked:
+                target_uuid = tracked[-1]['uuid']
+                logger.info(f"📝 Using tracked Image UUID for update: {target_uuid}")
+
+            if not target_uuid:
+                response = await pc.v3_request(
+                    endpoint="/images/list", method="POST",
+                    payload={"kind": "image", "length": 20}
                 )
-                
-                if update_response:
-                    logger.info(f"✅ Image metadata updated: {image_uuid}")
-                    return {
-                        'status': 'SUCCESS',
-                        'uuid': image_uuid,
-                        'error': None,
-                        'error_type': None,
-                        'error_code': None
-                    }
-                else:
-                    return {
-                        'status': 'FAILED',
-                        'error': 'No response from NCM API',
-                        'error_type': 'EmptyResponseError',
-                        'error_code': None,
-                        'uuid': None
-                    }
+                if response and response[0].body.get('entities'):
+                    for img in response[0].body['entities']:
+                        if img.get('spec', {}).get('name', '').startswith('smart-'):
+                            target_uuid = img['metadata']['uuid']
+                            break
+                    if not target_uuid and response[0].body['entities']:
+                        target_uuid = response[0].body['entities'][0]['metadata']['uuid']
+
+            if not target_uuid:
+                return {'status': 'SKIPPED', 'error': 'No image exists yet — nothing to update', 'uuid': None}
+
+            get_resp = await pc.v3_request(endpoint=f"/images/{target_uuid}", method="GET")
+            if not (get_resp and isinstance(get_resp[0].body, dict)):
+                return {'status': 'FAILED', 'error': f'Cannot GET Image {target_uuid}', 'uuid': None}
+
+            img_body = get_resp[0].body
+            img_body['spec']['description'] = f"Updated by smart execution {self.execution_id}"
+
+            logger.info(f"📤 Updating Image metadata: {target_uuid}")
+            update_response = await pc.v3_request(
+                endpoint=f"/images/{target_uuid}", method="PUT", payload=img_body
+            )
+            if update_response:
+                logger.info(f"✅ Image metadata updated: {target_uuid}")
+                return {'status': 'SUCCESS', 'uuid': target_uuid, 'error': None,
+                        'error_type': None, 'error_code': None}
             else:
-                return {'status': 'FAILED', 'error': 'No images found'}
+                return {'status': 'FAILED', 'error': 'No response from NCM API',
+                        'error_type': 'EmptyResponseError', 'error_code': None, 'uuid': None}
         except Exception as e:
             logger.error(f"❌ Image update failed: {e}")
             return {
-                'status': 'FAILED',
-                'error': str(e),
+                'status': 'FAILED', 'error': str(e),
                 'error_type': type(e).__name__,
                 'error_code': getattr(e, 'status_code', None),
                 'uuid': None
@@ -3257,9 +3642,23 @@ class SmartExecutionController:
             return {'status': 'FAILED', 'error': str(e), 'uuid': None}
 
     async def _delete_image(self) -> Dict:
-        """Delete a smart-execution created image."""
+        """Delete an image — prefer tracked UUID, fall back to API list."""
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
+
+            tracked = self.created_entities.get('Image', []) or self.created_entities.get('image', [])
+            if tracked:
+                entry = tracked[-1]
+                img_uuid = entry['uuid']
+                logger.info(f"🗑️  Deleting tracked Image: {entry.get('name')} ({img_uuid})")
+                del_resp = await asyncio.wait_for(
+                    pc.v3_request(endpoint=f"/images/{img_uuid}", method="DELETE"),
+                    timeout=30.0
+                )
+                if del_resp and del_resp[0].status in (200, 202, 204):
+                    logger.info(f"✅ Image deleted (tracked): {img_uuid}")
+                    return {'status': 'SUCCESS', 'uuid': img_uuid, 'error': None}
+
             resp = await asyncio.wait_for(
                 pc.v3_request(endpoint="/images/list", method="POST",
                               payload={"kind": "image", "length": 20}),
@@ -3277,7 +3676,7 @@ class SmartExecutionController:
                         if del_resp and del_resp[0].status in (200, 202, 204):
                             logger.info(f"✅ Image deleted: {img_name}")
                             return {'status': 'SUCCESS', 'uuid': img_uuid, 'error': None}
-            return {'status': 'FAILED', 'error': 'No smart- image to delete', 'uuid': None}
+            return {'status': 'SKIPPED', 'error': 'No smart- image exists yet — nothing to delete', 'uuid': None}
         except asyncio.TimeoutError:
             return {'status': 'FAILED', 'error': 'Image delete timed out', 'uuid': None}
         except Exception as e:
@@ -3432,31 +3831,33 @@ class SmartExecutionController:
             }
     
     async def _delete_subnet(self) -> Dict:
-        """Delete a subnet"""
+        """Delete a subnet — prefer tracked UUID, fall back to API list."""
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
+
+            tracked = self.created_entities.get('Subnet', []) or self.created_entities.get('subnet', [])
+            if tracked:
+                entry = tracked[-1]
+                subnet_uuid = entry['uuid']
+                logger.info(f"🗑️  Deleting tracked Subnet: {entry.get('name')} ({subnet_uuid})")
+                await pc.v3_request(endpoint=f"/subnets/{subnet_uuid}", method="DELETE")
+                logger.info(f"✅ Subnet deleted (tracked): {subnet_uuid}")
+                return {'status': 'SUCCESS', 'uuid': subnet_uuid, 'error': None}
+
             response = await pc.v3_request(
-                endpoint="/subnets/list",
-                method="POST",
+                endpoint="/subnets/list", method="POST",
                 payload={"kind": "subnet", "length": 10}
             )
-            
             if response and response[0].body.get('entities'):
                 for subnet in response[0].body['entities']:
                     subnet_name = subnet.get('spec', {}).get('name', '')
                     if 'smart-subnet' in subnet_name.lower():
                         subnet_uuid = subnet['metadata']['uuid']
                         logger.info(f"🗑️  Deleting Subnet: {subnet_name} ({subnet_uuid})")
-                        
-                        await pc.v3_request(
-                            endpoint=f"/subnets/{subnet_uuid}",
-                            method="DELETE"
-                        )
+                        await pc.v3_request(endpoint=f"/subnets/{subnet_uuid}", method="DELETE")
                         return {'status': 'SUCCESS', 'uuid': subnet_uuid, 'error': None}
-                
-                return {'status': 'FAILED', 'error': 'No smart-subnet found to delete'}
-            else:
-                return {'status': 'FAILED', 'error': 'No subnets found'}
+
+            return {'status': 'SKIPPED', 'error': 'No smart-subnet exists yet — nothing to delete', 'uuid': None}
         except Exception as e:
             logger.error(f"❌ Subnet deletion failed: {e}")
             return {
@@ -4781,11 +5182,12 @@ class SmartExecutionController:
             namespace_filter = ""
             if filter_by_rule and self.rule_config.get('namespaces'):
                 namespaces = self.rule_config['namespaces']
-                namespace_filter = f',namespace=~"{'|'.join(namespaces)}"'
+                ns_regex = '|'.join(namespaces)
+                namespace_filter = f',namespace=~"{ns_regex}"'
             
-            # Get CPU usage per pod (rate over 1m)
+            # Get CPU usage per pod in cores (rate over 1m)
             cpu_query = f'sum(rate(container_cpu_usage_seconds_total{{container!="",container!="POD"{namespace_filter}}}[1m])) by (pod, namespace, node)'
-            cpu_data = {}
+            cpu_cores_data = {}
             try:
                 response = requests.get(url, params={'query': cpu_query}, verify=False, timeout=3)
                 if response.status_code == 200:
@@ -4794,11 +5196,38 @@ class SmartExecutionController:
                         for result in data.get('data', {}).get('result', []):
                             metric = result.get('metric', {})
                             pod_name = metric.get('pod')
-                            cpu_value = float(result.get('value', [0, 0])[1])
+                            cpu_cores = float(result.get('value', [0, 0])[1])
                             if pod_name:
-                                cpu_data[pod_name] = cpu_value * 100  # Convert to percentage
+                                cpu_cores_data[pod_name] = cpu_cores
             except Exception as e:
                 logger.debug(f"CPU query failed: {e}")
+            
+            # Get CPU limit per pod (to calculate real percentage)
+            cpu_limit_query = f'sum(kube_pod_container_resource_limits{{resource="cpu",container!=""{namespace_filter}}}) by (pod, namespace)'
+            cpu_limit_data = {}
+            try:
+                response = requests.get(url, params={'query': cpu_limit_query}, verify=False, timeout=3)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('status') == 'success':
+                        for result in data.get('data', {}).get('result', []):
+                            metric = result.get('metric', {})
+                            pod_name = metric.get('pod')
+                            limit_cores = float(result.get('value', [0, 0])[1])
+                            if pod_name and limit_cores > 0:
+                                cpu_limit_data[pod_name] = limit_cores
+            except Exception as e:
+                logger.debug(f"CPU limit query failed: {e}")
+            
+            # Calculate CPU percentage: (usage / limit) * 100, capped at 100%
+            # If no limit is set, use raw cores * 100 (approximate, for unlimited pods)
+            cpu_data = {}
+            for pod_name, cores in cpu_cores_data.items():
+                limit = cpu_limit_data.get(pod_name)
+                if limit and limit > 0:
+                    cpu_data[pod_name] = min((cores / limit) * 100, 100.0)
+                else:
+                    cpu_data[pod_name] = min(cores * 100, 100.0)
             
             # Get memory usage per pod
             memory_query = f'sum(container_memory_working_set_bytes{{container!="",container!="POD"{namespace_filter}}}) by (pod, namespace, node)'
@@ -5255,8 +5684,9 @@ class SmartExecutionController:
         self.status = "STOPPED"
         self.end_time = datetime.now(timezone.utc)
         
-        # Clean up stress pods and SSH tunnel on stop
+        # Capture cluster health and clean up
         self._cleanup_stress_pods()
+        self._capture_cluster_health_before_teardown()
         self._cleanup_ssh_tunnel()
         self._persist_to_database()
     
@@ -5330,21 +5760,21 @@ spec:
   - name: mem-vol
     emptyDir:
       medium: Memory
-      sizeLimit: 2Gi
+      sizeLimit: 3Gi
   containers:
   - name: stress
     image: busybox:latest
-    command: ["sh", "-c", "dd if=/dev/zero of=/mem/fill bs=1M count=1800 2>/dev/null; sleep infinity"]
+    command: ["sh", "-c", "dd if=/dev/zero of=/mem/fill bs=1M count=2500 2>/dev/null; while true; do cat /mem/fill > /dev/null; sleep 1; done"]
     volumeMounts:
     - name: mem-vol
       mountPath: /mem
     resources:
       requests:
-        cpu: "100m"
-        memory: "1800Mi"
-      limits:
         cpu: "500m"
-        memory: "2Gi"
+        memory: "2500Mi"
+      limits:
+        cpu: "1"
+        memory: "3Gi"
   restartPolicy: Never'''
             
             import base64, time as _time
@@ -5362,6 +5792,7 @@ spec:
                 out = (result.stdout + result.stderr).lower()
                 if result.returncode == 0 and ('created' in out or 'configured' in out):
                     self._stress_pods_deployed.append(pod_name)
+                    self._max_stress_pods_deployed = max(self._max_stress_pods_deployed, len(self._stress_pods_deployed))
                     logger.info(f"🚀 Deployed stress pod: {pod_name} ({pod_type})")
                     self._log_event('INFO', f'Deployed stress pod: {pod_name} ({pod_type})')
                     return pod_name
@@ -5391,8 +5822,10 @@ spec:
                  f'sudo kubectl --kubeconfig {self._kubectl_kubeconfig} delete pod {pod_names} --grace-period=0 --force 2>/dev/null || true'],
                 capture_output=True, text=True, timeout=30
             )
-            logger.info(f"🧹 Cleaned up {len(self._stress_pods_deployed)} stress pods")
-            self._log_event('INFO', f'Cleaned up {len(self._stress_pods_deployed)} stress pods')
+            cleaned_count = len(self._stress_pods_deployed)
+            logger.info(f"🧹 Cleaned up {cleaned_count} stress pods")
+            self._log_event('INFO', f'Cleaned up {cleaned_count} stress pods')
+            self._stress_pods_cleaned = cleaned_count
             self._stress_pods_deployed = []
         except Exception as e:
             logger.warning(f"⚠️ Stress pod cleanup error: {e}")
@@ -5402,6 +5835,16 @@ spec:
         if not self._stress_escalation_enabled:
             return
         if len(self._stress_pods_deployed) >= self._max_stress_pods:
+            # Pods maxed out but still not at threshold — boost operations intensity
+            if len(self.metrics_history) >= 3:
+                recent = self.metrics_history[-3:]
+                avg_cpu = sum(r.get('cpu_percent', 0) for r in recent) / 3
+                cpu_gap = self.target_config.get('cpu_threshold', 80) - avg_cpu
+                if cpu_gap > 5:
+                    self.max_operations_per_cycle = min(self.max_operations_per_cycle + 5, 50)
+                    self.operations_per_iteration = min(self.operations_per_iteration + 2, 20)
+                    logger.info(f"📈 Stress pods maxed ({self._max_stress_pods}), boosting ops: max_ops/cycle={self.max_operations_per_cycle}, ops/iter={self.operations_per_iteration}")
+                    self._log_event('INFO', f'Stress pods at max ({self._max_stress_pods}), increasing operations intensity to {self.max_operations_per_cycle}/cycle')
             return
         if len(self.metrics_history) < 3:
             return
@@ -5421,6 +5864,28 @@ spec:
         remaining_slots = self._max_stress_pods - len(self._stress_pods_deployed)
         if remaining_slots <= 0:
             return
+
+        # Gap-based trigger: if no pods yet and average CPU is far from target,
+        # deploy an initial batch regardless of metric volatility
+        if len(self._stress_pods_deployed) == 0 and len(self.metrics_history) >= 3:
+            all_recent = self.metrics_history[-4:] if len(self.metrics_history) >= 4 else self.metrics_history[-3:]
+            avg_cpu_all = sum(r.get('cpu_percent', 0) for r in all_recent) / len(all_recent)
+            avg_gap = cpu_target - avg_cpu_all
+            if avg_gap > 20:
+                import time as _time
+                initial_cpu = min(3, remaining_slots)
+                remaining_slots_local = remaining_slots - initial_cpu
+                initial_mem = min(3, remaining_slots_local)
+                logger.info(f"📊 No pods yet, avg CPU={avg_cpu_all:.1f}% (gap={avg_gap:.0f}%). Deploying initial batch: {initial_cpu} CPU + {initial_mem} memory pods.")
+                self._log_event('INFO', f'CPU averaging {avg_cpu_all:.0f}% (gap={avg_gap:.0f}% to target). Deploying initial stress pods.')
+                for _ in range(initial_cpu):
+                    self._deploy_stress_pod('cpu')
+                    _time.sleep(3)
+                for _ in range(initial_mem):
+                    self._deploy_stress_pod('memory')
+                    _time.sleep(3)
+                self._stagnation_count = 0
+                return
         
         # Fast-path: if one metric is already at target but the other isn't,
         # deploy stress pods for the lagging metric immediately
@@ -5443,14 +5908,48 @@ spec:
                         _time.sleep(3)
                 return
         
+        # Regression detection: metrics moving AWAY from target (dropping when we need them up)
+        cpu_values = [r.get('cpu_percent', 0) for r in recent]
+        cpu_trending_down = len(cpu_values) >= 3 and cpu_values[-1] < cpu_values[-2] < cpu_values[-3]
+        regression = cpu_trending_down and cpu_gap > 15 and len(self._stress_pods_deployed) > 0
+        if regression:
+            logger.info(f"📉 CPU regression detected ({cpu_values[-3]:.1f}→{cpu_values[-2]:.1f}→{cpu_values[-1]:.1f}%, gap={cpu_gap:.0f}%). Immediate escalation.")
+            self._log_event('WARNING', f'CPU regressing away from target ({cpu:.1f}% → gap={cpu_gap:.0f}%). Deploying more stress pods.')
+            extra_cpu = min(2, remaining_slots)
+            for _ in range(extra_cpu):
+                self._deploy_stress_pod('cpu')
+            remaining_slots -= extra_cpu
+            self._stagnation_count = 0
+            return
+        
+        # Plateau detection: avg CPU stuck far below target even if oscillating
+        avg_cpu_value = sum(r.get('cpu_percent', 0) for r in recent) / len(recent)
+        avg_cpu_gap = cpu_target - avg_cpu_value
+        plateau = avg_cpu_gap > 15 and len(self._stress_pods_deployed) > 0 and len(recent) >= 3
+        if plateau:
+            self._stagnation_count += 1
+            if self._stagnation_count >= 2:
+                logger.info(f"📊 CPU plateau detected: avg={avg_cpu_value:.1f}%, gap={avg_cpu_gap:.1f}% (oscillating but not reaching target). Deploying more pods.")
+                self._log_event('WARNING', f'CPU plateaued at {avg_cpu_value:.0f}% (target={cpu_target}%). Deploying more stress pods.')
+                more_cpu = min(2, remaining_slots)
+                for _ in range(more_cpu):
+                    self._deploy_stress_pod('cpu')
+                remaining_slots -= more_cpu
+                if remaining_slots > 0 and mem_gap > 15:
+                    self._deploy_stress_pod('memory')
+                self._stagnation_count = 0
+                return
+
         # Standard stagnation detection
         stagnation_threshold = min(3.0, cpu_gap * 0.1) if cpu_gap > 0 else 2.0
         stagnant = avg_cpu_change < stagnation_threshold and avg_mem_change < stagnation_threshold
         
         if stagnant and (cpu_gap > 10 or mem_gap > 10):
             self._stagnation_count += 1
-            if self._stagnation_count >= 2:
-                logger.info(f"📈 Stagnation detected (avg CPU Δ: {avg_cpu_change:.1f}%, avg Mem Δ: {avg_mem_change:.1f}%). Escalating...")
+            escalation_trigger = 1 if len(self._stress_pods_deployed) > 0 else 2
+            if self._stagnation_count >= escalation_trigger:
+                logger.info(f"📈 Stagnation detected (avg CPU Δ: {avg_cpu_change:.1f}%, avg Mem Δ: {avg_mem_change:.1f}%, count={self._stagnation_count}). Escalating...")
+                self._log_event('WARNING', f'Metrics stagnant (CPU gap={cpu_gap:.0f}%, Mem gap={mem_gap:.0f}%). Deploying more stress pods.')
                 
                 cpu_pods = 0
                 mem_pods = 0
@@ -6031,6 +6530,9 @@ spec:
             countable_ops = self.total_operations - skipped_ops
             success_rate = (successful_ops / countable_ops * 100) if countable_ops > 0 else 100
             ops_per_minute = self.total_operations / duration_minutes if duration_minutes and duration_minutes > 0 else 0
+
+            full_execution_data = dict(self.get_status())
+            full_execution_data['cluster_health_snapshot'] = getattr(self, '_cluster_health_snapshot', {})
             
             # Prepare execution data
             execution_data = {
@@ -6054,13 +6556,13 @@ spec:
                 'success_rate': success_rate,
                 'operations_per_minute': ops_per_minute,
                 'operations_history': self.operations_history,
-                'threshold_reached': self.status == 'COMPLETED',
+                'threshold_reached': self.status in ('COMPLETED', 'SUSTAINING', 'LONGEVITY_SUSTAINING'),
                 'created_entities': getattr(self, 'entities_tracked_for_cleanup', {}),
                 'entity_breakdown': self._get_entity_breakdown(),
                 'execution_mode': 'REAL' if self.ncm_client_ready else 'SIMULATED',
                 'cluster_name': self.cluster_name,
                 'cluster_uuid': self.cluster_uuid,
-                'full_execution_data': self.get_status(),
+                'full_execution_data': full_execution_data,
                 'tags': self.tags,
                 'anomaly_count': len(self.detected_anomalies),
                 'anomaly_high_count': sum(1 for a in self.detected_anomalies if a.get('severity') == 'high'),
@@ -6083,7 +6585,6 @@ spec:
                     'stress_pod_names': getattr(self, '_stress_pods_deployed', []),
                     'max_parallel_operations': getattr(self, 'max_parallel_operations', 0),
                 },
-                'cluster_health_snapshot': getattr(self, '_cluster_health_snapshot', {}),
             }
             
             # Save rule execution mapping if rule_config is provided
@@ -6103,6 +6604,22 @@ spec:
             result = save_smart_execution(execution_data)
             if result:
                 logger.debug(f"Persisted execution {self.execution_id} to database")
+
+                if not self.is_running:
+                    try:
+                        from database import SessionLocal as _SL
+                        from models.smart_execution import SmartExecution as _SE
+                        _db = _SL()
+                        try:
+                            _exc = _db.query(_SE).filter_by(execution_id=self.execution_id).first()
+                            if _exc:
+                                _exc.report_generated = True
+                                _db.commit()
+                        finally:
+                            _db.close()
+                        logger.info(f"📊 Report data persisted for {self.execution_id}")
+                    except Exception as rpt_err:
+                        logger.warning(f"⚠️ Report flag update failed (non-fatal): {rpt_err}")
             else:
                 logger.error(f"Failed to persist execution {self.execution_id} to database")
         except Exception as e:
@@ -6361,6 +6878,15 @@ spec:
             'capacity_estimate': self._get_capacity_estimate(),
             'system_health': self._get_system_health(),
             
+            # Sustain data
+            'sustain': {
+                'sustain_minutes': self._sustain_minutes,
+                'is_sustaining': self.status in ('SUSTAINING', 'LONGEVITY_SUSTAINING'),
+                'sustain_start_time': self._sustain_start_time.isoformat() if self._sustain_start_time else None,
+                'sustain_elapsed_seconds': (datetime.now(timezone.utc) - self._sustain_start_time).total_seconds() if self._sustain_start_time else 0,
+                'stats': self._sustain_stats,
+            },
+
             # Longevity data
             'longevity': {
                 'enabled': self._longevity_enabled,
@@ -6573,10 +7099,25 @@ spec:
             'entities_config': self.entities_config,
             'rule_config': self.rule_config,  # Rule configuration
             
+                # Peak metrics (computed from history)
+            'peak_metrics': {
+                'cpu_percent': max((m.get('cpu_percent', 0) for m in self.metrics_history), default=0),
+                'memory_percent': max((m.get('memory_percent', 0) for m in self.metrics_history), default=0),
+            },
+            
+            # Resource summary (stress pods)
+            'resource_summary': {
+                'stress_pods_deployed': getattr(self, '_max_stress_pods_deployed', 0) or len(self._stress_pods_deployed),
+                'stress_pods_cleaned': getattr(self, '_stress_pods_cleaned', 0),
+                'pod_health': 'healthy' if self._sustain_stats.get('stress_pod_restarts', 0) == 0 else 'degraded',
+                'pod_restarts': self._sustain_stats.get('stress_pod_restarts', 0),
+            },
+            
             # Operations
             'operations_history': self.operations_history,
             'entity_breakdown': entity_breakdown,
-            'threshold_reached': self.status == 'COMPLETED',
+            'threshold_reached': self.status in ('COMPLETED', 'SUSTAINING', 'LONGEVITY_SUSTAINING'),
+            'sustain_stats': self._sustain_stats,
             
             # NEW: Enhanced analysis
             'analysis': analysis,
@@ -6634,6 +7175,8 @@ spec:
                     if self._health_check_results else 'N/A'
                 ),
             },
+            # Prometheus cluster snapshot (end of run); used when live Prom is unreachable at report time
+            'cluster_health_snapshot': getattr(self, '_cluster_health_snapshot', {}),
         }
     
     def _generate_analysis(self) -> Dict[str, Any]:
@@ -7016,10 +7559,28 @@ spec:
             
             # Broadcast via WebSocket
             broadcast_log(self.execution_id, 'ALERT', '🎯 Threshold reached!', alert_data)
-            
-            # TODO: Integrate with Slack/Email alerting system
-            # This would call the existing alert service
-            logger.info(f"📢 Threshold alert prepared: {alert_data}")
+
+            webhook = get_slack_webhook_for_testbed(self.testbed_info.get('unique_testbed_id'))
+            if webhook:
+                sr = (
+                    (self.successful_operations / self.total_operations * 100)
+                    if self.total_operations else 0
+                )
+                text = (
+                    f":dart: *Smart Execution — threshold reached*\n"
+                    f"• Execution: `{self.execution_id}`\n"
+                    f"• Testbed: {alert_data.get('testbed_label', 'Unknown')}\n"
+                    f"• CPU: {cpu:.1f}% (target {alert_data.get('target_cpu', 80)}%)  "
+                    f"Memory: {memory:.1f}% (target {alert_data.get('target_memory', 80)}%)\n"
+                    f"• Operations: {self.total_operations}  Success rate: {sr:.1f}%\n"
+                    f"• Anomalies recorded: {len(self.detected_anomalies)}"
+                )
+                if post_slack_incoming_webhook(webhook, text):
+                    logger.info("📢 Threshold alert sent to Slack webhook")
+                else:
+                    logger.warning("Slack webhook configured but delivery failed or non-200")
+            else:
+                logger.info(f"📢 Threshold alert (no Slack webhook for testbed): {alert_data.get('execution_id')}")
             
         except Exception as e:
             logger.warning(f"Failed to send threshold alert: {e}")

@@ -1,4 +1,4 @@
-import React, { Component, ErrorInfo, ReactNode } from 'react';
+import { Component, type ErrorInfo, type ReactNode } from 'react';
 
 interface Props {
   children: ReactNode;
@@ -39,7 +39,7 @@ class ErrorBoundary extends Component<Props, State> {
   }
 
   static getDerivedStateFromError(error: Error): Partial<State> {
-    // Update state so the next render will show the fallback UI
+    void error;
     return { hasError: true };
   }
 
@@ -54,7 +54,7 @@ class ErrorBoundary extends Component<Props, State> {
       errorInfo
     });
 
-    // TODO: Send error to logging service (Sentry, LogRocket, etc.)
+    // Production can forward to an external logging service here; console is enough for local dev.
     // Example: logErrorToService(error, errorInfo);
   }
 

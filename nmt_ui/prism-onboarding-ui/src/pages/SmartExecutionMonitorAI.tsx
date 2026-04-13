@@ -62,6 +62,14 @@ interface MonitorData {
   alert_thresholds_config?: Record<string, number>;
 }
 
+const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'STOPPED', 'THRESHOLD_REACHED', 'TIMEOUT'];
+const ACTIVE_STATUSES = ['RUNNING', 'SUSTAINING', 'LONGEVITY_SUSTAINING'];
+
+const isTerminalStatus = (status: string | undefined): boolean => {
+  if (!status) return false;
+  return TERMINAL_STATUSES.includes(status.toUpperCase());
+};
+
 const SmartExecutionMonitorAI: React.FC = () => {
   const { executionId } = useParams<{ executionId: string }>();
   const navigate = useNavigate();
@@ -71,52 +79,62 @@ const SmartExecutionMonitorAI: React.FC = () => {
   const [error, setError] = useState<string>('');
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
   const [cleaningUp, setCleaningUp] = useState<boolean>(false);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [showStopConfirm, setShowStopConfirm] = useState(false);
+  const [showCleanupConfirm, setShowCleanupConfirm] = useState(false);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
-  // Fetch monitoring data
   const fetchMonitorData = async () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
-      const response = await fetch(`${getApiBase()}/api/smart-execution/monitor/${executionId}`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success) {
-          setMonitorData(data);
-          setError('');
-        } else {
-          setError(data.error || 'Failed to fetch data');
+      const response = await fetch(
+        `${getApiBase()}/api/smart-execution/monitor/${executionId}`,
+        { signal: controller.signal }
+      );
+      if (!response.ok) {
+        setError(`Failed to fetch monitoring data (${response.status})`);
+        return;
+      }
+      const data = await response.json();
+      if (data.success) {
+        setMonitorData(data);
+        setError('');
+        if (isTerminalStatus(data.status)) {
+          setAutoRefresh(false);
         }
       } else {
-        setError(`Failed to fetch monitoring data (${response.status})`);
+        setError(data.error || 'Failed to fetch data');
       }
-    } catch (err) {
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error('Error fetching monitor data:', err);
-      setError('Error connecting to backend. Check that the API is reachable (nginx proxy or backend on port 5000).');
+      setError('Error connecting to backend. Check that the API is reachable.');
     } finally {
       setLoading(false);
     }
   };
 
-  // Initial load and auto-refresh
   useEffect(() => {
     fetchMonitorData();
     
     if (autoRefresh) {
-      intervalRef.current = setInterval(fetchMonitorData, 2000); // Refresh every 2s
+      intervalRef.current = setInterval(fetchMonitorData, 2000);
     }
     
     return () => {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
       }
+      abortRef.current?.abort();
     };
   }, [executionId, autoRefresh]);
 
-  // Emergency stop
+  const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
   const handleEmergencyStop = async () => {
-    if (!confirm('⚠️ Are you sure you want to trigger EMERGENCY STOP? This cannot be undone.')) {
-      return;
-    }
-    
+    setShowStopConfirm(false);
     try {
       const response = await fetch(`${getApiBase()}/api/smart-execution/emergency-stop/${executionId}`, {
         method: 'POST',
@@ -125,30 +143,34 @@ const SmartExecutionMonitorAI: React.FC = () => {
       });
       
       if (response.ok) {
-        alert('✅ Emergency stop triggered');
+        setActionMessage({ type: 'success', text: 'Emergency stop triggered successfully' });
         fetchMonitorData();
       } else {
-        alert('❌ Failed to trigger emergency stop');
+        setActionMessage({ type: 'error', text: 'Failed to trigger emergency stop' });
       }
     } catch (err) {
       console.error('Error triggering emergency stop:', err);
-      alert('❌ Error triggering emergency stop');
+      setActionMessage({ type: 'error', text: 'Could not reach backend for emergency stop' });
     }
   };
 
   const handleCleanup = async () => {
-    if (!confirm('Are you sure you want to delete all entities created by this execution?')) return;
+    setShowCleanupConfirm(false);
     setCleaningUp(true);
     try {
       const res = await fetch(`${getApiBase()}/api/smart-execution/cleanup/${executionId}`, { method: 'POST' });
+      if (!res.ok) {
+        setActionMessage({ type: 'error', text: `Cleanup failed (HTTP ${res.status})` });
+        return;
+      }
       const data = await res.json();
       if (data.success) {
-        alert(`Cleanup done: ${data.cleanup_summary?.success || 0}/${data.cleanup_summary?.total || 0} deleted`);
+        setActionMessage({ type: 'success', text: `Cleanup done: ${data.cleanup_summary?.success || 0}/${data.cleanup_summary?.total || 0} deleted` });
       } else {
-        alert(`Cleanup error: ${data.error || 'Unknown'}`);
+        setActionMessage({ type: 'error', text: `Cleanup error: ${data.error || 'Unknown'}` });
       }
-    } catch (err) {
-      alert('Could not reach backend for cleanup');
+    } catch (_err) {
+      setActionMessage({ type: 'error', text: 'Could not reach backend for cleanup' });
     } finally {
       setCleaningUp(false);
     }
@@ -159,6 +181,8 @@ const SmartExecutionMonitorAI: React.FC = () => {
       'initializing': '🔧',
       'ramp_up': '⬆️',
       'maintain': '✅',
+      'sustaining': '📌',
+      'longevity_sustaining': '📌',
       'ramp_down': '⬇️',
       'fine_tune': '🎯',
       'completed': '🏁',
@@ -174,6 +198,8 @@ const SmartExecutionMonitorAI: React.FC = () => {
       'initializing': '#94a3b8',
       'ramp_up': '#3b82f6',
       'maintain': '#10b981',
+      'sustaining': '#059669',
+      'longevity_sustaining': '#059669',
       'ramp_down': '#f59e0b',
       'fine_tune': '#8b5cf6',
       'completed': '#22c55e',
@@ -183,21 +209,21 @@ const SmartExecutionMonitorAI: React.FC = () => {
     return colors[phase] || '#64748b';
   };
 
-  // Render metrics history graph (simple bar chart)
   const renderMetricsGraph = () => {
-    if (!monitorData || !monitorData.metrics_history || monitorData.metrics_history.length === 0) {
+    if (!monitorData?.metrics_history?.length) {
       return <div className="no-data">No metrics data yet</div>;
     }
     
     const maxDataPoints = 20;
     const history = monitorData.metrics_history.slice(-maxDataPoints);
-    const maxCpu = Math.max(...history.map(h => h.cpu), monitorData.target_metrics.cpu);
-    const maxMemory = Math.max(...history.map(h => h.memory), monitorData.target_metrics.memory);
+    const targetCpu = monitorData.target_metrics?.cpu ?? 0;
+    const targetMem = monitorData.target_metrics?.memory ?? 0;
+    const maxCpu = Math.max(...history.map(h => h.cpu ?? 0), targetCpu, 1);
+    const maxMemory = Math.max(...history.map(h => h.memory ?? 0), targetMem, 1);
     
     return (
       <div className="metrics-graph">
         <div className="graph-container">
-          {/* CPU Chart */}
           <div className="chart">
             <h4>CPU Usage Over Time</h4>
             <div className="chart-bars">
@@ -205,18 +231,17 @@ const SmartExecutionMonitorAI: React.FC = () => {
                 <div key={idx} className="bar-wrapper">
                   <div
                     className="bar cpu-bar"
-                    style={{ height: `${(point.cpu / maxCpu) * 100}%` }}
-                    title={`${point.cpu.toFixed(1)}%`}
+                    style={{ height: `${((point.cpu ?? 0) / maxCpu) * 100}%` }}
+                    title={`${(point.cpu ?? 0).toFixed(1)}%`}
                   />
                 </div>
               ))}
             </div>
-            <div className="chart-target" style={{ bottom: `${(monitorData.target_metrics.cpu / maxCpu) * 100}%` }}>
-              Target: {monitorData.target_metrics.cpu}%
+            <div className="chart-target" style={{ bottom: `${(targetCpu / maxCpu) * 100}%` }}>
+              Target: {targetCpu}%
             </div>
           </div>
           
-          {/* Memory Chart */}
           <div className="chart">
             <h4>Memory Usage Over Time</h4>
             <div className="chart-bars">
@@ -224,14 +249,14 @@ const SmartExecutionMonitorAI: React.FC = () => {
                 <div key={idx} className="bar-wrapper">
                   <div
                     className="bar memory-bar"
-                    style={{ height: `${(point.memory / maxMemory) * 100}%` }}
-                    title={`${point.memory.toFixed(1)}%`}
+                    style={{ height: `${((point.memory ?? 0) / maxMemory) * 100}%` }}
+                    title={`${(point.memory ?? 0).toFixed(1)}%`}
                   />
                 </div>
               ))}
             </div>
-            <div className="chart-target" style={{ bottom: `${(monitorData.target_metrics.memory / maxMemory) * 100}%` }}>
-              Target: {monitorData.target_metrics.memory}%
+            <div className="chart-target" style={{ bottom: `${(targetMem / maxMemory) * 100}%` }}>
+              Target: {targetMem}%
             </div>
           </div>
         </div>
@@ -262,13 +287,62 @@ const SmartExecutionMonitorAI: React.FC = () => {
 
   if (!monitorData) return null;
 
+  const statusUpper = (monitorData.status || '').toUpperCase();
+  const phaseNorm = (monitorData.phase || monitorData.status || '').toLowerCase();
+  const isTerminal = isTerminalStatus(monitorData.status);
+  const cpuVal = monitorData.current_metrics?.cpu ?? 0;
+  const memVal = monitorData.current_metrics?.memory ?? 0;
+  const cpuTarget = monitorData.target_metrics?.cpu ?? 0;
+  const memTarget = monitorData.target_metrics?.memory ?? 0;
+
   return (
     <div className="smart-execution-monitor-ai">
+      {/* Action Messages */}
+      {actionMessage && (
+        <div className={`action-message ${actionMessage.type}`} style={{
+          padding: '12px 20px', margin: '0 0 12px', borderRadius: 8,
+          background: actionMessage.type === 'success' ? '#f0fdf4' : '#fef2f2',
+          border: `1px solid ${actionMessage.type === 'success' ? '#22c55e' : '#ef4444'}`,
+          color: actionMessage.type === 'success' ? '#166534' : '#991b1b',
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center'
+        }}>
+          <span>{actionMessage.text}</span>
+          <button onClick={() => setActionMessage(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 18 }}>×</button>
+        </div>
+      )}
+
+      {/* Inline Confirmation Dialogs */}
+      {showStopConfirm && (
+        <div style={{ padding: '16px 20px', margin: '0 0 12px', borderRadius: 8, background: '#fef2f2', border: '2px solid #ef4444' }}>
+          <strong>⚠️ Are you sure you want to trigger EMERGENCY STOP?</strong>
+          <p style={{ margin: '8px 0', fontSize: 14, color: '#991b1b' }}>This cannot be undone. The execution will be halted immediately.</p>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={handleEmergencyStop} style={{ padding: '6px 16px', background: '#dc2626', color: 'white', border: 'none', borderRadius: 6, cursor: 'pointer' }}>Confirm Stop</button>
+            <button onClick={() => setShowStopConfirm(false)} style={{ padding: '6px 16px', background: '#e2e8f0', border: 'none', borderRadius: 6, cursor: 'pointer' }}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {showCleanupConfirm && (
+        <div style={{ padding: '16px 20px', margin: '0 0 12px', borderRadius: 8, background: '#fff7ed', border: '2px solid #f59e0b' }}>
+          <strong>Delete all entities created by this execution?</strong>
+          <p style={{ margin: '8px 0', fontSize: 14, color: '#92400e' }}>VMs, projects, blueprints, etc. will be permanently removed.</p>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={handleCleanup} style={{ padding: '6px 16px', background: '#f59e0b', color: 'white', border: 'none', borderRadius: 6, cursor: 'pointer' }}>Confirm Cleanup</button>
+            <button onClick={() => setShowCleanupConfirm(false)} style={{ padding: '6px 16px', background: '#e2e8f0', border: 'none', borderRadius: 6, cursor: 'pointer' }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="monitor-header">
         <div className="header-left">
           <h1>🤖 AI Execution Monitor</h1>
           <p className="execution-id">{monitorData.execution_id}</p>
+          {isTerminal && (
+            <span style={{ display: 'inline-block', padding: '2px 10px', borderRadius: 12, background: '#f0fdf4', color: '#166534', fontSize: 12, fontWeight: 600 }}>
+              Execution finished — auto-refresh stopped
+            </span>
+          )}
         </div>
         
         <div className="header-right">
@@ -286,18 +360,18 @@ const SmartExecutionMonitorAI: React.FC = () => {
           </button>
           
           <button
-            onClick={handleCleanup}
+            onClick={() => setShowCleanupConfirm(true)}
             className="btn-refresh"
-            disabled={cleaningUp || monitorData.status === 'RUNNING'}
+            disabled={cleaningUp || ACTIVE_STATUSES.includes(statusUpper)}
             style={{ background: '#f59e0b', color: 'white' }}
           >
             {cleaningUp ? '⏳ Cleaning...' : '🧹 Cleanup Entities'}
           </button>
           
           <button
-            onClick={handleEmergencyStop}
+            onClick={() => setShowStopConfirm(true)}
             className="btn-emergency"
-            disabled={monitorData.emergency_stop || ['completed', 'failed'].includes(monitorData.status)}
+            disabled={monitorData.emergency_stop || isTerminal}
           >
             🚨 EMERGENCY STOP
           </button>
@@ -309,15 +383,29 @@ const SmartExecutionMonitorAI: React.FC = () => {
       </div>
 
       {/* Status Banner */}
-      <div className="status-banner" style={{ backgroundColor: getPhaseColor(monitorData.phase) }}>
+      <div className="status-banner" style={{ backgroundColor: getPhaseColor(phaseNorm) }}>
         <div className="status-info">
-          <span className="status-emoji">{getPhaseEmoji(monitorData.phase)}</span>
+          <span className="status-emoji">{getPhaseEmoji(phaseNorm)}</span>
           <span className="status-text">
-            {monitorData.phase.toUpperCase().replace(/_/g, ' ')}
+            {(monitorData.phase || monitorData.status || '').toUpperCase().replace(/_/g, ' ')}
           </span>
         </div>
         <div className="status-details">
           Iteration {monitorData.iteration} | {monitorData.total_operations} operations executed
+          {(phaseNorm === 'sustaining' || phaseNorm === 'longevity_sustaining' || statusUpper === 'SUSTAINING' || statusUpper === 'LONGEVITY_SUSTAINING') && (monitorData as any).sustain && (() => {
+            const s = (monitorData as any).sustain;
+            const elapsed = s.sustain_elapsed_seconds || 0;
+            const total = (s.sustain_minutes || 5) * 60;
+            const pct = Math.min(100, Math.round((elapsed / total) * 100));
+            const stats = s.stats || {};
+            return (
+              <span style={{ marginLeft: 12, fontWeight: 600 }}>
+                | 📌 Sustaining: {Math.floor(elapsed / 60)}m{Math.floor(elapsed % 60)}s / {s.sustain_minutes}m ({pct}%)
+                {stats.ops_during_sustain > 0 && <> | {stats.ops_during_sustain} ops ({stats.sustain_ops_per_minute || 0}/min)</>}
+                {stats.reescalations > 0 && <> | {stats.reescalations} re-escalations</>}
+              </span>
+            );
+          })()}
         </div>
       </div>
 
@@ -329,24 +417,24 @@ const SmartExecutionMonitorAI: React.FC = () => {
           <div className="metrics-display">
             <div className="metric">
               <div className="metric-label">CPU Usage</div>
-              <div className="metric-value">{monitorData.current_metrics.cpu.toFixed(1)}%</div>
-              <div className="metric-target">Target: {monitorData.target_metrics.cpu}%</div>
+              <div className="metric-value">{cpuVal.toFixed(1)}%</div>
+              <div className="metric-target">Target: {cpuTarget}%</div>
               <div className="metric-bar">
                 <div
                   className="metric-fill cpu-fill"
-                  style={{ width: `${monitorData.current_metrics.cpu}%` }}
+                  style={{ width: `${Math.min(cpuVal, 100)}%` }}
                 />
               </div>
             </div>
             
             <div className="metric">
               <div className="metric-label">Memory Usage</div>
-              <div className="metric-value">{monitorData.current_metrics.memory.toFixed(1)}%</div>
-              <div className="metric-target">Target: {monitorData.target_metrics.memory}%</div>
+              <div className="metric-value">{memVal.toFixed(1)}%</div>
+              <div className="metric-target">Target: {memTarget}%</div>
               <div className="metric-bar">
                 <div
                   className="metric-fill memory-fill"
-                  style={{ width: `${monitorData.current_metrics.memory}%` }}
+                  style={{ width: `${Math.min(memVal, 100)}%` }}
                 />
               </div>
             </div>
@@ -359,7 +447,7 @@ const SmartExecutionMonitorAI: React.FC = () => {
           <div className="control-info">
             <div className="control-row">
               <span className="control-label">Operations/Minute:</span>
-              <span className="control-value">{monitorData.operations_per_minute.toFixed(1)}</span>
+              <span className="control-value">{(monitorData.operations_per_minute ?? 0).toFixed(1)}</span>
             </div>
             <div className="control-row">
               <span className="control-label">Phase:</span>

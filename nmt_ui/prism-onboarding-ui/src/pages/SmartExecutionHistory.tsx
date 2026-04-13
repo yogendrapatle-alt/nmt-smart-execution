@@ -62,15 +62,20 @@ const SmartExecutionHistory: React.FC = () => {
     try {
       setLoading(true);
       const response = await fetch(`${getApiBase()}/api/smart-execution/history`);
+      if (!response.ok) {
+        setError(`Failed to fetch execution history (HTTP ${response.status})`);
+        return;
+      }
       const data = await response.json();
       
       if (data.success) {
         setExecutions(data.executions || []);
+        setError(null);
       } else {
         setError(data.error || 'Failed to fetch execution history');
       }
     } catch (err: any) {
-      setError(err.message);
+      setError(err.message || 'Network error fetching execution history');
     } finally {
       setLoading(false);
     }
@@ -79,6 +84,10 @@ const SmartExecutionHistory: React.FC = () => {
   const downloadReport = async (executionId: string) => {
     try {
       const response = await fetch(`${getApiBase()}/api/smart-execution/report/${executionId}/enhanced`);
+      if (!response.ok) {
+        setError(`Failed to download report (HTTP ${response.status})`);
+        return;
+      }
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -89,7 +98,7 @@ const SmartExecutionHistory: React.FC = () => {
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
     } catch (err: any) {
-      alert(`Failed to download report: ${err.message}`);
+      setError(`Failed to download report: ${err.message}`);
     }
   };
 
@@ -100,21 +109,29 @@ const SmartExecutionHistory: React.FC = () => {
   const rerunExecution = async (executionId: string) => {
     try {
       const res = await fetch(`${getApiBase()}/api/smart-execution/rerun-config/${executionId}`);
+      if (!res.ok) {
+        setError(`Failed to load re-run config (HTTP ${res.status})`);
+        return;
+      }
       const data = await res.json();
       if (data.success && data.config) {
         sessionStorage.setItem('rerun_config', JSON.stringify(data.config));
         navigate('/smart-execution?rerun=true');
       } else {
-        alert(data.error || 'Could not load config for re-run');
+        setError(data.error || 'Could not load config for re-run');
       }
     } catch (err: any) {
-      alert(`Re-run error: ${err.message}`);
+      setError(`Re-run error: ${err.message}`);
     }
   };
 
   const downloadCSV = async (executionId: string) => {
     try {
       const res = await fetch(`${getApiBase()}/api/smart-execution/csv/${executionId}`);
+      if (!res.ok) {
+        setError(`CSV download failed (HTTP ${res.status})`);
+        return;
+      }
       const blob = await res.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -125,7 +142,7 @@ const SmartExecutionHistory: React.FC = () => {
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
     } catch (err: any) {
-      alert(`CSV download failed: ${err.message}`);
+      setError(`CSV download failed: ${err.message}`);
     }
   };
 
@@ -139,7 +156,7 @@ const SmartExecutionHistory: React.FC = () => {
   };
 
   const runComparison = async () => {
-    if (selectedForCompare.size < 2) { alert('Select at least 2 executions to compare'); return; }
+    if (selectedForCompare.size < 2) { setError('Select at least 2 executions to compare'); return; }
     setComparingFlag(true);
     try {
       const res = await fetch(`${getApiBase()}/api/smart-execution/compare`, {
@@ -147,33 +164,42 @@ const SmartExecutionHistory: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ execution_ids: Array.from(selectedForCompare) })
       });
+      if (!res.ok) {
+        setError(`Comparison failed (HTTP ${res.status})`);
+        return;
+      }
       const data = await res.json();
-      if (data.success) setCompareData(data);
-      else alert(data.error || 'Comparison failed');
+      if (data.success) { setCompareData(data); setError(null); }
+      else setError(data.error || 'Comparison failed');
     } catch (err: any) {
-      alert(`Compare error: ${err.message}`);
+      setError(`Compare error: ${err.message}`);
     } finally {
       setComparingFlag(false);
     }
   };
 
   const cleanupEntities = async (executionId: string) => {
-    if (!confirm('🧹 Delete all entities created by this execution?\n(VMs, projects, blueprints, etc.)')) return;
+    if (!window.confirm('Delete all entities created by this execution? (VMs, projects, blueprints, etc.)')) return;
     try {
       const response = await fetch(`${getApiBase()}/api/smart-execution/cleanup/${executionId}`, { method: 'POST' });
+      if (!response.ok) {
+        setError(`Cleanup failed (HTTP ${response.status})`);
+        return;
+      }
       const data = await response.json();
       if (data.success) {
-        alert(`Cleanup done: ${data.cleanup_summary?.success || 0}/${data.cleanup_summary?.total || 0} entities deleted`);
+        setError(null);
+        fetchExecutions();
       } else {
-        alert(data.error || 'Cleanup failed');
+        setError(data.error || 'Cleanup failed');
       }
     } catch (err: any) {
-      alert(`Cleanup error: ${err.message}`);
+      setError(`Cleanup error: ${err.message}`);
     }
   };
 
   const deleteExecution = async (executionId: string) => {
-    if (!confirm('⚠️ Are you sure you want to delete this execution record?\n\nThis action cannot be undone.')) {
+    if (!window.confirm('Are you sure you want to delete this execution record? This action cannot be undone.')) {
       return;
     }
 
@@ -182,55 +208,69 @@ const SmartExecutionHistory: React.FC = () => {
       const response = await fetch(`${getApiBase()}/api/smart-execution/${executionId}`, {
         method: 'DELETE'
       });
+      if (!response.ok) {
+        setError(`Failed to delete execution (HTTP ${response.status})`);
+        return;
+      }
       const data = await response.json();
       
       if (data.success) {
+        setError(null);
         fetchExecutions();
       } else {
-        alert(data.error || 'Failed to delete execution');
+        setError(data.error || 'Failed to delete execution');
       }
     } catch (err: any) {
-      alert(`Failed to delete execution: ${err.message}`);
+      setError(`Failed to delete execution: ${err.message}`);
     } finally {
       setDeletingId(null);
     }
   };
 
   const stopExecution = async (executionId: string) => {
-    if (!confirm('Stop this running execution?')) return;
+    if (!window.confirm('Stop this running execution?')) return;
     try {
       setStoppingId(executionId);
       const response = await fetch(`${getApiBase()}/api/smart-execution/stop/${executionId}`, {
         method: 'POST'
       });
+      if (!response.ok) {
+        setError(`Failed to stop execution (HTTP ${response.status})`);
+        return;
+      }
       const data = await response.json();
       if (data.success) {
+        setError(null);
         fetchExecutions();
       } else {
-        alert(data.error || 'Failed to stop execution');
+        setError(data.error || 'Failed to stop execution');
       }
     } catch (err: any) {
-      alert(`Failed to stop execution: ${err.message}`);
+      setError(`Failed to stop execution: ${err.message}`);
     } finally {
       setStoppingId(null);
     }
   };
 
   const stopAllRunning = async () => {
-    const runningCount = executions.filter(e => e.status === 'RUNNING').length;
-    if (runningCount === 0) { alert('No running executions found.'); return; }
-    if (!confirm(`Stop all ${runningCount} running execution(s)?`)) return;
+    const runningCount = executions.filter(e => e.status === 'RUNNING' || e.status === 'LONGEVITY_SUSTAINING').length;
+    if (runningCount === 0) { setError('No running executions found.'); return; }
+    if (!window.confirm(`Stop all ${runningCount} running execution(s)?`)) return;
     try {
       const response = await fetch(`${getApiBase()}/api/smart-execution/stop-all`, { method: 'POST' });
+      if (!response.ok) {
+        setError(`Failed to stop executions (HTTP ${response.status})`);
+        return;
+      }
       const data = await response.json();
       if (data.success) {
-        alert(data.message || 'All executions stopped');
+        setError(null);
         fetchExecutions();
       } else {
-        alert(data.error || 'Failed to stop executions');
+        setError(data.error || 'Failed to stop executions');
       }
     } catch (err: any) {
-      alert(`Error: ${err.message}`);
+      setError(`Error: ${err.message}`);
     }
   };
 
@@ -252,7 +292,7 @@ const SmartExecutionHistory: React.FC = () => {
       'STOPPED': { bg: 'bg-warning', icon: 'stop_circle' },
       'FAILED': { bg: 'bg-danger', icon: 'error' },
       'THRESHOLD_REACHED': { bg: 'bg-primary', icon: 'flag' },
-      'LONGEVITY_SUSTAINING': { bg: 'bg-purple', icon: 'repeat' },
+      'LONGEVITY_SUSTAINING': { bg: 'bg-primary', icon: 'repeat' },
       'TIMEOUT': { bg: 'bg-secondary', icon: 'timer_off' },
     };
     return badges[status] || { bg: 'bg-secondary', icon: 'help_outline' };
@@ -494,7 +534,7 @@ const SmartExecutionHistory: React.FC = () => {
                           </tr>
                         </thead>
                         <tbody>
-                          {['status', 'duration_minutes', 'total_operations', 'success_rate', 'cpu_change', 'memory_change', 'anomaly_count', 'latency_avg'].map(metric => (
+                          {['status', 'duration_minutes', 'total_operations', 'metric_iterations', 'success_rate', 'cpu_change', 'memory_change', 'anomaly_count', 'latency_avg'].map(metric => (
                             <tr key={metric}>
                               <td className="fw-bold">{metric.replace(/_/g, ' ').replace(/^\w/, c => c.toUpperCase())}</td>
                               {compareData.comparisons.map((c: any) => {

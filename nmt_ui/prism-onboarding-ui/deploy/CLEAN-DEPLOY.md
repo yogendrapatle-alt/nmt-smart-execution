@@ -52,5 +52,7 @@ CLEAN_OLD=1 bash /opt/nmt/prism-onboarding-ui/vm-clean-deploy.sh /tmp/prism-onbo
 ## Troubleshooting
 
 - `journalctl -u nmt-backend -n 50 --no-pager`
+- **`GET /api/health` returns 502 via nginx but works on `curl http://127.0.0.1:5000/api/health`** — SELinux is blocking nginx from connecting to Flask. As root: `setsebool -P httpd_can_network_connect 1` then `systemctl restart nginx`. `remote-install.sh` sets this automatically when `setsebool` succeeds.
+- **Dashboard: “Failed to fetch” / API calls to `:5000` in DevTools** — Rebuild on the Mac with `./deploy/package-for-vm.sh` (production build uses `.env.production` so the UI calls `/api` on port 80 via nginx, not port 5000). Redeploy the new tarball. Do not set `VITE_BACKEND_URL` to `http://VM:5000` in `.env` for the VM bundle.
 - `deploy/README.md` — Rocky/RHEL notes
 - DB: `deploy-artifacts/vm-fix-db-auth.sh` (as root)

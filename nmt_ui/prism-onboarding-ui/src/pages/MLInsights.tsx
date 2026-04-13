@@ -77,7 +77,7 @@ const MLInsights: React.FC = () => {
 
   // Prediction state
   const [predEntity, setPredEntity] = useState('vm');
-  const [predOperation, setPredOperation] = useState('CREATE');
+  const [predOperation, setPredOperation] = useState('create');
   const [predCpu, setPredCpu] = useState(50);
   const [predMemory, setPredMemory] = useState(45);
   const [prediction, setPrediction] = useState<PredictionResult | null>(null);
@@ -89,7 +89,9 @@ const MLInsights: React.FC = () => {
         const data = await res.json();
         setTestbeds(data.testbeds || []);
       }
-    } catch { /* ignore */ }
+    } catch (e) {
+      console.warn('Failed to fetch testbeds:', e);
+    }
   }, []);
 
   const fetchInsights = useCallback(async () => {
@@ -116,18 +118,23 @@ const MLInsights: React.FC = () => {
         const data = await res.json();
         setModels(data.models || []);
       }
-    } catch { /* ignore */ }
+    } catch (e) {
+      console.warn('Failed to fetch models:', e);
+    }
   }, [selectedTestbed]);
 
   const fetchTrainingJobs = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/ml/training-jobs`);
+      const params = selectedTestbed ? `?testbed_id=${selectedTestbed}` : '';
+      const res = await fetch(`${API_BASE}/api/ml/training-jobs${params}`);
       if (res.ok) {
         const data = await res.json();
         setTrainingJobs(data.jobs || []);
       }
-    } catch { /* ignore */ }
-  }, []);
+    } catch (e) {
+      console.warn('Failed to fetch training jobs:', e);
+    }
+  }, [selectedTestbed]);
 
   const fetchDataStats = useCallback(async () => {
     try {
@@ -137,7 +144,9 @@ const MLInsights: React.FC = () => {
         const data = await res.json();
         setDataStats(data);
       }
-    } catch { /* ignore */ }
+    } catch (e) {
+      console.warn('Failed to fetch data stats:', e);
+    }
   }, [selectedTestbed]);
 
   useEffect(() => {
@@ -218,7 +227,15 @@ const MLInsights: React.FC = () => {
   const getR2Color = (r2: number): string => {
     if (r2 >= 0.7) return '#22c55e';
     if (r2 >= 0.4) return '#f59e0b';
+    if (r2 >= 0.1) return '#fb923c';
     return '#ef4444';
+  };
+
+  const getR2Label = (r2: number): string => {
+    if (r2 >= 0.7) return 'Good';
+    if (r2 >= 0.4) return 'Fair';
+    if (r2 >= 0.1) return 'Weak';
+    return 'Poor';
   };
 
   const getStatusBadge = (status: string) => {
@@ -332,12 +349,14 @@ const MLInsights: React.FC = () => {
                   <span>CPU R²:</span>
                   <strong style={{ color: getR2Color(insights.active_model.cpu_r2 || 0) }}>
                     {(insights.active_model.cpu_r2 || 0).toFixed(3)}
+                    {' '}({getR2Label(insights.active_model.cpu_r2 || 0)})
                   </strong>
                 </div>
                 <div className="detail-row">
                   <span>Memory R²:</span>
                   <strong style={{ color: getR2Color(insights.active_model.memory_r2 || 0) }}>
                     {(insights.active_model.memory_r2 || 0).toFixed(3)}
+                    {' '}({getR2Label(insights.active_model.memory_r2 || 0)})
                   </strong>
                 </div>
                 <div className="detail-row">
@@ -395,10 +414,10 @@ const MLInsights: React.FC = () => {
                     <tr key={idx}>
                       <td>v{entry.version}</td>
                       <td style={{ color: getR2Color(entry.cpu_r2 || 0) }}>
-                        {(entry.cpu_r2 || 0).toFixed(3)}
+                        {(entry.cpu_r2 || 0).toFixed(3)} ({getR2Label(entry.cpu_r2 || 0)})
                       </td>
                       <td style={{ color: getR2Color(entry.memory_r2 || 0) }}>
-                        {(entry.memory_r2 || 0).toFixed(3)}
+                        {(entry.memory_r2 || 0).toFixed(3)} ({getR2Label(entry.memory_r2 || 0)})
                       </td>
                       <td>{entry.samples}</td>
                       <td>{formatDate(entry.trained_at)}</td>
@@ -440,10 +459,10 @@ const MLInsights: React.FC = () => {
                       <td>{m.testbed_id?.slice(0, 8) || 'Global'}</td>
                       <td>{m.samples_used}</td>
                       <td style={{ color: getR2Color(m.cpu_r2 || 0) }}>
-                        {(m.cpu_r2 || 0).toFixed(3)}
+                        {(m.cpu_r2 || 0).toFixed(3)} ({getR2Label(m.cpu_r2 || 0)})
                       </td>
                       <td style={{ color: getR2Color(m.memory_r2 || 0) }}>
-                        {(m.memory_r2 || 0).toFixed(3)}
+                        {(m.memory_r2 || 0).toFixed(3)} ({getR2Label(m.memory_r2 || 0)})
                       </td>
                       <td>{(m.validation_score || 0).toFixed(3)}</td>
                       <td>{m.is_active ? '✓' : ''}</td>
@@ -541,26 +560,19 @@ const MLInsights: React.FC = () => {
                 <label>Entity Type</label>
                 <select value={predEntity} onChange={(e) => setPredEntity(e.target.value)}>
                   <option value="vm">VM</option>
-                  <option value="blueprint_multi_vm">Blueprint (Multi VM)</option>
-                  <option value="blueprint_single_vm">Blueprint (Single VM)</option>
-                  <option value="playbook">Playbook</option>
-                  <option value="scenario">Scenario</option>
                   <option value="project">Project</option>
                   <option value="category">Category</option>
-                  <option value="rate_card">Rate Card</option>
-                  <option value="business_unit">Business Unit</option>
-                  <option value="cost_center">Cost Center</option>
+                  <option value="image">Image</option>
+                  <option value="subnet">Subnet</option>
                 </select>
               </div>
               <div className="form-row">
                 <label>Operation</label>
                 <select value={predOperation} onChange={(e) => setPredOperation(e.target.value)}>
-                  <option value="CREATE">CREATE</option>
-                  <option value="DELETE">DELETE</option>
-                  <option value="UPDATE">UPDATE</option>
-                  <option value="LIST">LIST</option>
-                  <option value="EXECUTE">EXECUTE</option>
-                  <option value="READ">READ</option>
+                  <option value="create">create</option>
+                  <option value="delete">delete</option>
+                  <option value="update">update</option>
+                  <option value="list">list</option>
                 </select>
               </div>
               <div className="form-row">
@@ -593,11 +605,15 @@ const MLInsights: React.FC = () => {
                 <div className="prediction-grid">
                   <div className="prediction-card cpu">
                     <div className="prediction-label">CPU Impact</div>
-                    <div className="prediction-value">+{prediction.cpu_impact.toFixed(2)}%</div>
+                    <div className="prediction-value">
+                      {prediction.cpu_impact >= 0 ? '+' : ''}{prediction.cpu_impact.toFixed(2)}%
+                    </div>
                   </div>
                   <div className="prediction-card memory">
                     <div className="prediction-label">Memory Impact</div>
-                    <div className="prediction-value">+{prediction.memory_impact.toFixed(2)}%</div>
+                    <div className="prediction-value">
+                      {prediction.memory_impact >= 0 ? '+' : ''}{prediction.memory_impact.toFixed(2)}%
+                    </div>
                   </div>
                   <div className="prediction-card confidence">
                     <div className="prediction-label">Confidence</div>

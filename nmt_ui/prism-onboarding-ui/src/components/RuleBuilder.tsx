@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import ntnxLogo from '../assets/ntnx_logo.png';
 import { saveAs } from 'file-saver';
 import { useOnboarding } from '../context/OnboardingContext';
-import type { RuleConfig, MetricConfig } from '../types/onboarding';
+import type { RuleConfig } from '../types/onboarding';
 import Select from 'react-select';
 import { useNavigate } from 'react-router-dom';
 
@@ -19,7 +19,7 @@ const namespaceOptions = Object.keys(nameAndPodData).map(ns => ({ value: ns, lab
 const metricOptions = Object.keys(metricAndThresholdData).map(metric => ({ value: metric, label: metric }));
 
 
-const RuleBuilder: React.FC<{ onSave: (rule: RuleConfig) => void }> = ({ onSave }) => {
+const RuleBuilder: React.FC<{ onSave: (rule: RuleConfig) => void }> = ({ onSave: _onSave }) => {
   const { onboardingForm } = useOnboarding();
   const navigate = useNavigate();
   const [namespaces, setNamespaces] = useState<string[]>([]);

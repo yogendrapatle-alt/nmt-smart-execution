@@ -2,6 +2,47 @@ import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { getApiBase } from '../utils/backendUrl';
 
+/** Actionable copy when cluster health cannot be loaded (Phase 1 empty states). */
+function clusterHealthUnavailableCopy(
+  collectionStatus: string | undefined,
+  collectionReason: string | undefined
+): { headline: string; detail: string } {
+  const reason = (collectionReason || '').trim();
+  const legacyErr = collectionStatus?.startsWith('error:')
+    ? collectionStatus.slice('error:'.length).trim()
+    : '';
+  const r = (reason || legacyErr).toLowerCase();
+  if (collectionStatus === 'unavailable' || r.includes('prometheus_url_not_configured')) {
+    return {
+      headline: 'Cluster health was not collected',
+      detail:
+        'No Prometheus base URL was configured for this execution. Ensure the smart execution controller has prometheus_url set, or open the report while the testbed API can reach the cluster Prometheus (typically port 9090).',
+    };
+  }
+  if (
+    r.includes('connection refused') ||
+    r.includes('timed out') ||
+    r.includes('timeout') ||
+    r.includes('name or service not known') ||
+    r.includes('http_') ||
+    r.includes('prometheus_unreachable')
+  ) {
+    return {
+      headline: 'Prometheus could not be reached',
+      detail:
+        reason || legacyErr
+          ? `Last error: ${reason || legacyErr}. If the cluster is offline, a snapshot taken when the run finished may still appear after reload.`
+          : 'The report service could not complete a live query to Prometheus. Check network access to the testbed metrics endpoint.',
+    };
+  }
+  return {
+    headline: 'Cluster health snapshot unavailable',
+    detail:
+      reason || legacyErr ||
+      'Live Prometheus queries did not return usable data. Exporters (kube-state-metrics, cAdvisor) must expose the expected metric names.',
+  };
+}
+
 interface AIInsights {
   ai_enabled?: boolean;
   pid_performance?: {
@@ -49,6 +90,7 @@ interface EnhancedReport {
     node_conditions: any[];
     pvc_health: any[];
     collection_status: string;
+    collection_reason?: string;
   };
   failure_analysis: {
     groups: any[];
@@ -61,21 +103,82 @@ interface EnhancedReport {
     data: any;
   };
   pod_stability: any[];
+  node_stability: any[];
+  restart_timestamps: any[];
   historical_comparison: {
     available: boolean;
     previous_executions?: any[];
     count?: number;
     reason?: string;
+    trend_vs_last_run?: {
+      duration_delta_minutes: number;
+      success_rate_delta_pct: number;
+      duration_vs_last: 'faster' | 'slower' | 'same';
+    };
+  };
+  report_metadata?: {
+    execution_id?: string;
+    generated_at_utc?: string;
+    metrics_samples?: number;
+    operations_recorded?: number;
+    metrics_time_range?: { first_timestamp: string; last_timestamp: string } | null;
+    cluster_health_source?: string;
+    prometheus_configured?: boolean;
+    baseline_final_resolution?: string;
   };
   capacity_planning: {
     available: boolean;
     total_ops_executed?: number;
+    real_ops?: number;
+    simulated_ops?: number;
     cpu_per_operation?: number;
     memory_per_operation?: number;
+    cpu_delta_direction?: string;
+    memory_delta_direction?: string;
     estimated_total_capacity_ops?: number;
     bottleneck?: string;
     recommendation?: string;
     entities_created?: Record<string, number>;
+    simulation_warning?: string;
+  };
+  entity_latency_breakdown?: {
+    available: boolean;
+    entity_latencies?: Array<{
+      entity_operation: string;
+      count: number;
+      avg_seconds: number;
+      p50_seconds: number;
+      p95_seconds: number;
+      min_seconds: number;
+      max_seconds: number;
+      degradation_detected: boolean;
+    }>;
+  };
+  error_code_breakdown?: {
+    available: boolean;
+    total_failures?: number;
+    http_code_distribution?: Array<{ code: string; count: number; category: string }>;
+    error_type_distribution?: Array<{ error_type: string; count: number }>;
+    sample_errors?: any[];
+  };
+  dependency_cascade?: {
+    available: boolean;
+    cascades?: Array<{
+      entity_type: string;
+      failure_count: number;
+      failed_dependencies: Array<{ entity_type: string; failure_count: number }>;
+      hint: string;
+    }>;
+    total_cascade_patterns?: number;
+  };
+  execution_mode_summary?: {
+    available: boolean;
+    total_operations?: number;
+    real_operations?: number;
+    simulated_operations?: number;
+    real_percentage?: number;
+    trust_level?: string;
+    warning?: string | null;
   };
   iteration_timeline?: {
     iterations: any[];
@@ -88,6 +191,32 @@ interface EnhancedReport {
     final?: { cpu_percent?: number; memory_percent?: number };
     resolution_note?: string;
   };
+}
+
+function csvEscapeCell(val: string): string {
+  if (/[",\n\r]/.test(val)) return `"${val.replace(/"/g, '""')}"`;
+  return val;
+}
+
+function downloadRowsAsCsv(rows: Record<string, unknown>[], filename: string): void {
+  if (!rows.length) {
+    window.alert('No rows to export.');
+    return;
+  }
+  const keys = Object.keys(rows[0]);
+  const header = keys.map((k) => csvEscapeCell(k)).join(',');
+  const lines = rows.map((row) =>
+    keys.map((k) => csvEscapeCell(String(row[k] ?? ''))).join(',')
+  );
+  const blob = new Blob([header + '\n' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
 }
 
 interface ReportData {
@@ -145,7 +274,8 @@ const SmartExecutionReport: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [downloadingEnhanced, setDownloadingEnhanced] = useState(false);
-  const [activeTab, setActiveTab] = useState<'overview' | 'spikes' | 'health' | 'failures' | 'capacity' | 'iterations' | 'heatmap'>('overview');
+  const [enhancedUnavailable, setEnhancedUnavailable] = useState(false);
+  const [activeTab, setActiveTab] = useState<'overview' | 'spikes' | 'health' | 'failures' | 'capacity' | 'iterations' | 'heatmap' | 'latency' | 'errors'>('overview');
   const [expandedIterations, setExpandedIterations] = useState<Set<number>>(new Set());
   const [expandedEffectiveOps, setExpandedEffectiveOps] = useState<Set<string>>(new Set());
 
@@ -158,6 +288,10 @@ const SmartExecutionReport: React.FC = () => {
     try {
       setLoading(true);
       const response = await fetch(`${getApiBase()}/api/smart-execution/report/${executionId}`);
+      if (!response.ok) {
+        setError(`Failed to fetch report (HTTP ${response.status})`);
+        return;
+      }
       const data = await response.json();
       
       if (data.success) {
@@ -166,7 +300,7 @@ const SmartExecutionReport: React.FC = () => {
         setError(data.error || 'Failed to fetch report');
       }
     } catch (err: any) {
-      setError(err.message);
+      setError(err.message || 'Network error fetching report');
     } finally {
       setLoading(false);
     }
@@ -175,12 +309,20 @@ const SmartExecutionReport: React.FC = () => {
   const fetchEnhancedReport = async () => {
     try {
       const response = await fetch(`${getApiBase()}/api/smart-execution/report/${executionId}/enhanced?format=json`);
+      if (!response.ok) {
+        console.warn(`Enhanced report unavailable (HTTP ${response.status})`);
+        setEnhancedUnavailable(true);
+        return;
+      }
       const data = await response.json();
       if (data.success && data.enhanced_report) {
         setEnhanced(data.enhanced_report);
+      } else {
+        setEnhancedUnavailable(true);
       }
-    } catch {
-      // Enhanced report is optional
+    } catch (err) {
+      console.warn('Enhanced report fetch failed:', err);
+      setEnhancedUnavailable(true);
     }
   };
 
@@ -188,6 +330,10 @@ const SmartExecutionReport: React.FC = () => {
     try {
       setDownloading(true);
       const response = await fetch(`${getApiBase()}/api/smart-execution/report/${executionId}/download`);
+      if (!response.ok) {
+        setError(`Failed to download report (HTTP ${response.status})`);
+        return;
+      }
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -198,7 +344,7 @@ const SmartExecutionReport: React.FC = () => {
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
     } catch (err: any) {
-      alert(`Failed to download report: ${err.message}`);
+      setError(`Failed to download report: ${err.message}`);
     } finally {
       setDownloading(false);
     }
@@ -208,6 +354,10 @@ const SmartExecutionReport: React.FC = () => {
     try {
       setDownloadingEnhanced(true);
       const response = await fetch(`${getApiBase()}/api/smart-execution/report/${executionId}/enhanced`);
+      if (!response.ok) {
+        setError(`Failed to download enhanced report (HTTP ${response.status})`);
+        return;
+      }
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -218,10 +368,44 @@ const SmartExecutionReport: React.FC = () => {
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
     } catch (err: any) {
-      alert(`Failed to download enhanced report: ${err.message}`);
+      setError(`Failed to download enhanced report: ${err.message}`);
     } finally {
       setDownloadingEnhanced(false);
     }
+  };
+
+  const exportOperationsCsv = () => {
+    const ops = report?.operations_history as Record<string, unknown>[] | undefined;
+    if (!ops?.length) {
+      window.alert('No operations history to export.');
+      return;
+    }
+    const rows = ops.map((o) => {
+      const r: Record<string, unknown> = {};
+      Object.keys(o).forEach((k) => {
+        const v = o[k];
+        r[k] = v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
+      });
+      return r;
+    });
+    downloadRowsAsCsv(rows, `smart-execution-${executionId?.substring(0, 10)}-operations.csv`);
+  };
+
+  const exportMetricsCsv = () => {
+    const mh = report?.metrics_history as Record<string, unknown>[] | undefined;
+    if (!mh?.length) {
+      window.alert('No metrics history to export.');
+      return;
+    }
+    const rows = mh.map((o) => {
+      const r: Record<string, unknown> = {};
+      Object.keys(o).forEach((k) => {
+        const v = o[k];
+        r[k] = v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
+      });
+      return r;
+    });
+    downloadRowsAsCsv(rows, `smart-execution-${executionId?.substring(0, 10)}-metrics.csv`);
   };
 
   const getVerdictStyle = (result: string) => {
@@ -372,6 +556,24 @@ const SmartExecutionReport: React.FC = () => {
                   </>
                 )}
               </button>
+              <button
+                type="button"
+                className="btn btn-outline-success btn-lg rounded-4 d-flex align-items-center gap-2"
+                onClick={exportOperationsCsv}
+                title="Download operations_history as CSV"
+              >
+                <i className="material-icons-outlined" style={{ fontSize: 20 }}>table_chart</i>
+                Ops CSV
+              </button>
+              <button
+                type="button"
+                className="btn btn-outline-success btn-lg rounded-4 d-flex align-items-center gap-2"
+                onClick={exportMetricsCsv}
+                title="Download metrics_history as CSV"
+              >
+                <i className="material-icons-outlined" style={{ fontSize: 20 }}>show_chart</i>
+                Metrics CSV
+              </button>
               <button 
                 className="btn btn-outline-secondary btn-lg rounded-4 d-flex align-items-center gap-2"
                 onClick={() => navigate('/smart-execution/history')}
@@ -504,7 +706,7 @@ const SmartExecutionReport: React.FC = () => {
               <p className="mb-2" style={{ color: getVerdictStyle(enhanced.verdict.result).color, opacity: 0.8 }}>
                 {enhanced.verdict.summary}
               </p>
-              {enhanced.verdict.issues.length > 0 && (
+              {enhanced.verdict.issues && enhanced.verdict.issues.length > 0 && (
                 <ul className="mb-0 ps-3" style={{ color: getVerdictStyle(enhanced.verdict.result).color, opacity: 0.7 }}>
                   {enhanced.verdict.issues.map((issue, idx) => (
                     <li key={idx} className="small">{issue}</li>
@@ -520,6 +722,14 @@ const SmartExecutionReport: React.FC = () => {
           </div>
         )}
 
+        {/* Enhanced Report Unavailable Notice */}
+        {!enhanced && enhancedUnavailable && (
+          <div className="alert alert-warning rounded-4 d-flex align-items-center gap-2 mb-3">
+            <i className="material-icons-outlined" style={{ fontSize: 20 }}>info</i>
+            <span>Enhanced analysis (spikes, heatmap, cluster health, iterations) is not available for this execution. Only basic report data is shown below.</span>
+          </div>
+        )}
+
         {/* Enhanced Report Tabs */}
         {enhanced && (
           <div className="card rounded-4 shadow-none border mb-3">
@@ -532,6 +742,8 @@ const SmartExecutionReport: React.FC = () => {
                   { key: 'heatmap', label: 'Heatmap', icon: 'grid_on' },
                   { key: 'health', label: 'Cluster Health', icon: 'health_and_safety' },
                   { key: 'failures', label: `Failures (${enhanced.failure_analysis?.total_failures || 0})`, icon: 'bug_report' },
+                  { key: 'latency', label: 'Latency', icon: 'timer' },
+                  { key: 'errors', label: 'Error Codes', icon: 'error_outline' },
                   { key: 'capacity', label: 'Capacity', icon: 'speed' },
                 ].map((tab) => (
                   <li key={tab.key} className="nav-item">
@@ -552,6 +764,26 @@ const SmartExecutionReport: React.FC = () => {
               {/* OVERVIEW TAB */}
               {activeTab === 'overview' && (
                 <div>
+                  {/* Simulation Mode Warning Banner */}
+                  {enhanced.execution_mode_summary?.available && (enhanced.execution_mode_summary.simulated_operations ?? 0) > 0 && (
+                    <div className={`alert ${enhanced.execution_mode_summary.trust_level === 'LOW' ? 'alert-danger' : 'alert-warning'} rounded-3 mb-3 d-flex align-items-start gap-2`}>
+                      <i className="material-icons-outlined mt-1" style={{ fontSize: 20 }}>science</i>
+                      <div>
+                        <strong>Execution Mode: {enhanced.execution_mode_summary.real_percentage}% Real Operations</strong>
+                        <div className="small mt-1">
+                          {enhanced.execution_mode_summary.real_operations} real, {enhanced.execution_mode_summary.simulated_operations} simulated out of {enhanced.execution_mode_summary.total_operations} total.
+                          {enhanced.execution_mode_summary.trust_level === 'LOW' && ' NCM client was unavailable — report data reflects random simulation, not real cluster behavior.'}
+                          {enhanced.execution_mode_summary.trust_level === 'MEDIUM' && ' Some operations fell back to simulation. Check individual operation statuses.'}
+                        </div>
+                        <div className="mt-1">
+                          <span className={`badge ${enhanced.execution_mode_summary.trust_level === 'HIGH' ? 'bg-success' : enhanced.execution_mode_summary.trust_level === 'MEDIUM' ? 'bg-warning text-dark' : 'bg-danger'}`}>
+                            Trust Level: {enhanced.execution_mode_summary.trust_level}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   {/* Execution Summary Counts */}
                   <div className="mb-4">
                     <h6 className="fw-bold mb-3 d-flex align-items-center gap-2">
@@ -581,6 +813,66 @@ const SmartExecutionReport: React.FC = () => {
                       ))}
                     </div>
                   </div>
+
+                  {/* Sustain Phase Summary */}
+                  {(report as any).sustain_stats?.entered_at && (
+                    <div className="mb-4 p-3 rounded-3 border" style={{ background: '#f0fdf4' }}>
+                      <h6 className="fw-bold mb-2 d-flex align-items-center gap-2">
+                        <i className="material-icons-outlined text-success" style={{ fontSize: 20 }}>trending_flat</i>
+                        Sustained Load Phase
+                      </h6>
+                      <div className="row g-2 small">
+                        <div className="col-md-3"><span className="text-muted">Duration:</span>{' '}
+                          <strong>{((report as any).sustain_stats.duration_seconds / 60).toFixed(1)} min</strong></div>
+                        <div className="col-md-3"><span className="text-muted">CPU Range:</span>{' '}
+                          <strong>{(report as any).sustain_stats.min_cpu?.toFixed(1)}% – {(report as any).sustain_stats.max_cpu?.toFixed(1)}%</strong></div>
+                        <div className="col-md-3"><span className="text-muted">Memory Range:</span>{' '}
+                          <strong>{(report as any).sustain_stats.min_memory?.toFixed(1)}% – {(report as any).sustain_stats.max_memory?.toFixed(1)}%</strong></div>
+                        <div className="col-md-3"><span className="text-muted">Re-escalations:</span>{' '}
+                          <strong className={((report as any).sustain_stats.reescalations || 0) > 0 ? 'text-warning' : ''}>{(report as any).sustain_stats.reescalations || 0}</strong></div>
+                        <div className="col-md-3"><span className="text-muted">Ops during sustain:</span>{' '}
+                          <strong>{(report as any).sustain_stats.ops_during_sustain || 0}</strong>
+                          {(report as any).sustain_stats.sustain_ops_per_minute > 0 && (
+                            <span className="text-muted ms-1">({(report as any).sustain_stats.sustain_ops_per_minute}/min)</span>
+                          )}</div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Report data quality / provenance */}
+                  {enhanced.report_metadata && (
+                    <div className="mb-4 p-3 rounded-3 border bg-light">
+                      <h6 className="fw-bold mb-2 d-flex align-items-center gap-2">
+                        <i className="material-icons-outlined text-info" style={{ fontSize: 20 }}>fact_check</i>
+                        Report data quality
+                      </h6>
+                      <p className="small text-muted mb-2">
+                        Sample counts, metric time span, and how cluster health was sourced (live Prometheus vs persisted snapshot).
+                      </p>
+                      <div className="row g-2 small">
+                        <div className="col-md-4"><span className="text-muted">Generated (UTC):</span>{' '}
+                          <code>{enhanced.report_metadata.generated_at_utc || '—'}</code></div>
+                        <div className="col-md-4"><span className="text-muted">Metrics samples:</span>{' '}
+                          <strong>{enhanced.report_metadata.metrics_samples ?? 0}</strong></div>
+                        <div className="col-md-4"><span className="text-muted">Operations recorded:</span>{' '}
+                          <strong>{enhanced.report_metadata.operations_recorded ?? 0}</strong></div>
+                        {enhanced.report_metadata.metrics_time_range && (
+                          <div className="col-12">
+                            <span className="text-muted">Metric time range:</span>{' '}
+                            <code className="small">
+                              {enhanced.report_metadata.metrics_time_range.first_timestamp} → {enhanced.report_metadata.metrics_time_range.last_timestamp}
+                            </code>
+                          </div>
+                        )}
+                        <div className="col-md-4"><span className="text-muted">Cluster health source:</span>{' '}
+                          <span className="badge bg-info text-dark">{enhanced.report_metadata.cluster_health_source}</span></div>
+                        <div className="col-md-4"><span className="text-muted">Prometheus configured:</span>{' '}
+                          {enhanced.report_metadata.prometheus_configured ? 'Yes' : 'No'}</div>
+                        <div className="col-md-4"><span className="text-muted">Baseline/final resolution:</span>{' '}
+                          <code className="small">{enhanced.report_metadata.baseline_final_resolution}</code></div>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Most Effective Operations */}
                   {(report as any).operation_effectiveness?.length > 0 && (
@@ -700,6 +992,25 @@ const SmartExecutionReport: React.FC = () => {
                         <i className="material-icons-outlined text-warning" style={{ fontSize: 20 }}>history</i>
                         Previous Executions on This Testbed
                       </h6>
+                      {enhanced.historical_comparison.trend_vs_last_run && (
+                        <div className="alert alert-light border mb-3 small" role="status">
+                          <strong className="me-1">vs last run on this testbed:</strong>
+                          duration Δ{' '}
+                          <span className={enhanced.historical_comparison.trend_vs_last_run.duration_delta_minutes <= 0 ? 'text-success' : 'text-warning'}>
+                            {enhanced.historical_comparison.trend_vs_last_run.duration_delta_minutes > 0 ? '+' : ''}
+                            {enhanced.historical_comparison.trend_vs_last_run.duration_delta_minutes} min
+                          </span>
+                          {' · '}success rate Δ{' '}
+                          <span className={enhanced.historical_comparison.trend_vs_last_run.success_rate_delta_pct >= 0 ? 'text-success' : 'text-danger'}>
+                            {enhanced.historical_comparison.trend_vs_last_run.success_rate_delta_pct > 0 ? '+' : ''}
+                            {enhanced.historical_comparison.trend_vs_last_run.success_rate_delta_pct}%
+                          </span>
+                          {' · '}
+                          <span className="text-muted">
+                            ({enhanced.historical_comparison.trend_vs_last_run.duration_vs_last} than previous duration)
+                          </span>
+                        </div>
+                      )}
                       <div className="table-responsive">
                         <table className="table table-hover table-sm align-middle mb-0">
                           <thead className="table-light">
@@ -845,6 +1156,57 @@ const SmartExecutionReport: React.FC = () => {
               {/* CLUSTER HEALTH TAB */}
               {activeTab === 'health' && (
                 <div>
+                  {/* QA Health Assessment */}
+                  {enhanced.health_assessment?.findings?.length > 0 && (
+                    <div className="mb-4">
+                      <div className="d-flex align-items-center gap-3 mb-3">
+                        <h6 className="fw-bold mb-0">QA Health Assessment</h6>
+                        <span className={`badge ${
+                          enhanced.health_assessment.overall_status === 'CRITICAL' ? 'bg-danger' :
+                          enhanced.health_assessment.overall_status === 'DEGRADED' ? 'bg-warning text-dark' :
+                          enhanced.health_assessment.overall_status === 'ATTENTION' ? 'bg-warning text-dark' :
+                          'bg-success'
+                        } fs-6`}>
+                          {enhanced.health_assessment.overall_status}
+                        </span>
+                        {enhanced.health_assessment.critical_count > 0 && <span className="badge bg-danger">{enhanced.health_assessment.critical_count} Critical</span>}
+                        {enhanced.health_assessment.warning_count > 0 && <span className="badge bg-warning text-dark">{enhanced.health_assessment.warning_count} Warning</span>}
+                      </div>
+                      <div className="table-responsive">
+                        <table className="table table-sm table-bordered">
+                          <thead className="table-light"><tr><th style={{width: 90}}>Severity</th><th style={{width: 120}}>Category</th><th>Finding</th><th>Recommendation</th></tr></thead>
+                          <tbody>
+                            {enhanced.health_assessment.findings.map((f: any, i: number) => (
+                              <tr key={i}>
+                                <td>
+                                  <span className={`badge ${f.severity === 'critical' ? 'bg-danger' : f.severity === 'warning' ? 'bg-warning text-dark' : 'bg-info'}`}>
+                                    {f.severity.toUpperCase()}
+                                  </span>
+                                </td>
+                                <td className="fw-semibold">{f.category}</td>
+                                <td>{f.finding}</td>
+                                <td className="text-muted small">{f.recommendation}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  {enhanced.report_metadata?.cluster_health_source && (
+                    <div className={`alert ${enhanced.report_metadata.cluster_health_source === 'live_prometheus' ? 'alert-success' : 'alert-info'} rounded-3 mb-3 d-flex align-items-center gap-2`}>
+                      <i className="material-icons-outlined" style={{ fontSize: 18 }}>
+                        {enhanced.report_metadata.cluster_health_source === 'live_prometheus' ? 'cloud_done' : 'inventory_2'}
+                      </i>
+                      <span>
+                        Data source: <strong>{enhanced.report_metadata.cluster_health_source === 'live_prometheus' ? 'Live Prometheus' : 'Persisted Snapshot (captured at execution end)'}</strong>
+                        {enhanced.report_metadata.cluster_health_source === 'persisted_snapshot' && (
+                          <span className="text-muted ms-2">— values reflect cluster state when execution finished, not current state</span>
+                        )}
+                      </span>
+                    </div>
+                  )}
                   {enhanced.cluster_health?.collection_status === 'success' ? (
                     <>
                       {/* Node Conditions */}
@@ -927,17 +1289,195 @@ const SmartExecutionReport: React.FC = () => {
                         </div>
                       )}
 
+                      {/* Unhealthy Pods */}
+                      {enhanced.cluster_health.unhealthy_pods?.length > 0 && (
+                        <div className="mb-4">
+                          <h6 className="fw-bold mb-3 text-danger">Unhealthy Pods — Waiting State ({enhanced.cluster_health.unhealthy_pods.length})</h6>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-bordered">
+                              <thead className="table-light"><tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Reason</th></tr></thead>
+                              <tbody>
+                                {enhanced.cluster_health.unhealthy_pods.map((u: any, i: number) => (
+                                  <tr key={i}>
+                                    <td><code>{u.pod}</code></td><td>{u.namespace}</td><td>{u.container}</td>
+                                    <td><span className="badge bg-danger">{u.reason}</span></td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Terminated Containers */}
+                      {enhanced.cluster_health.terminated_containers?.length > 0 && (
+                        <div className="mb-4">
+                          <h6 className="fw-bold mb-3">Terminated Containers — Last Reason</h6>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-bordered">
+                              <thead className="table-light"><tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Reason</th></tr></thead>
+                              <tbody>
+                                {enhanced.cluster_health.terminated_containers.map((tc: any, i: number) => (
+                                  <tr key={i}>
+                                    <td><code>{tc.pod}</code></td><td>{tc.namespace}</td><td>{tc.container}</td>
+                                    <td><span className={`badge ${tc.reason === 'OOMKilled' ? 'bg-danger' : tc.reason === 'Error' ? 'bg-warning text-dark' : 'bg-info'}`}>{tc.reason}</span></td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Cumulative Restarts */}
+                      {enhanced.cluster_health.total_restarts?.length > 0 && (
+                        <div className="mb-4">
+                          <h6 className="fw-bold mb-3">Cumulative Container Restarts (All-Time)</h6>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-bordered">
+                              <thead className="table-light"><tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Total Restarts</th></tr></thead>
+                              <tbody>
+                                {enhanced.cluster_health.total_restarts.slice(0, 15).map((tr: any, i: number) => (
+                                  <tr key={i}>
+                                    <td><code>{tr.pod}</code></td><td>{tr.namespace}</td><td>{tr.container}</td>
+                                    <td><span className={`badge ${tr.total_restarts > 5 ? 'bg-danger' : tr.total_restarts > 2 ? 'bg-warning text-dark' : 'bg-info'}`}>{tr.total_restarts}</span></td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Pod Phase Distribution */}
+                      {enhanced.cluster_health.pod_phase_summary && Object.keys(enhanced.cluster_health.pod_phase_summary).length > 0 && (
+                        <div className="mb-4">
+                          <h6 className="fw-bold mb-3">Pod Phase Distribution</h6>
+                          <div className="d-flex gap-3 flex-wrap">
+                            {Object.entries(enhanced.cluster_health.pod_phase_summary).map(([phase, count]: [string, any]) => (
+                              <div key={phase} className={`text-center p-3 rounded-3 ${phase === 'Running' ? 'bg-success bg-opacity-10' : phase === 'Pending' ? 'bg-warning bg-opacity-10' : phase === 'Failed' ? 'bg-danger bg-opacity-10' : 'bg-light'}`}>
+                                <div className="fs-4 fw-bold">{count}</div>
+                                <div className="small text-muted fw-semibold">{phase}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Problem Pods */}
+                      {enhanced.cluster_health.problem_pods?.length > 0 && (
+                        <div className="mb-4">
+                          <h6 className="fw-bold mb-3 text-warning">Problem Pods — Pending/Failed/Unknown</h6>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-bordered">
+                              <thead className="table-light"><tr><th>Pod</th><th>Namespace</th><th>Phase</th></tr></thead>
+                              <tbody>
+                                {enhanced.cluster_health.problem_pods.map((pp: any, i: number) => (
+                                  <tr key={i}>
+                                    <td><code>{pp.pod}</code></td><td>{pp.namespace}</td>
+                                    <td><span className={`badge ${pp.phase === 'Failed' ? 'bg-danger' : 'bg-warning text-dark'}`}>{pp.phase}</span></td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Pods Not Ready */}
+                      {enhanced.cluster_health.pods_not_ready?.length > 0 && (
+                        <div className="mb-4">
+                          <h6 className="fw-bold mb-3 text-warning">Pods Not Ready — Readiness Probe Failing ({enhanced.cluster_health.pods_not_ready.length})</h6>
+                          <div className="d-flex flex-wrap gap-2">
+                            {enhanced.cluster_health.pods_not_ready.map((nr: any, i: number) => (
+                              <span key={i} className="badge bg-warning text-dark"><code>{nr.pod}</code> ({nr.namespace})</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* API Server Latency */}
+                      {enhanced.cluster_health.api_server_latency?.length > 0 && (
+                        <div className="mb-4">
+                          <h6 className="fw-bold mb-3">API Server Latency (P99 &gt; 1s)</h6>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-bordered">
+                              <thead className="table-light"><tr><th>Verb</th><th>Resource</th><th>P99 Latency</th></tr></thead>
+                              <tbody>
+                                {enhanced.cluster_health.api_server_latency.slice(0, 10).map((a: any, i: number) => (
+                                  <tr key={i}>
+                                    <td><strong>{a.verb}</strong></td><td>{a.resource}</td>
+                                    <td><span className={`badge ${a.p99_seconds > 10 ? 'bg-danger' : a.p99_seconds > 5 ? 'bg-warning text-dark' : 'bg-info'}`}>{a.p99_seconds}s</span></td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* etcd + Infrastructure Health */}
+                      {enhanced.cluster_health.etcd_healthy !== undefined && (
+                        <div className="mb-4">
+                          <h6 className="fw-bold mb-3">Infrastructure Health</h6>
+                          <div className="d-flex gap-3">
+                            <div className={`p-3 rounded-3 ${enhanced.cluster_health.etcd_healthy ? 'bg-success bg-opacity-10' : 'bg-danger bg-opacity-10'}`}>
+                              <strong>etcd: </strong>
+                              {enhanced.cluster_health.etcd_healthy
+                                ? <span className="badge bg-success">Healthy (has leader)</span>
+                                : <span className="badge bg-danger">NO LEADER</span>}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Pod Resource Usage */}
+                      {enhanced.cluster_health.pod_cpu?.length > 0 && (
+                        <div className="mb-4">
+                          <h6 className="fw-bold mb-3">Top Pod Resource Usage</h6>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-bordered">
+                              <thead className="table-light"><tr><th>Pod</th><th>Namespace</th><th>CPU %</th><th>CPU Cores</th><th>CPU Limit</th><th>Memory</th></tr></thead>
+                              <tbody>
+                                {enhanced.cluster_health.pod_cpu.slice(0, 15).map((c: any, i: number) => {
+                                  const memEntry = enhanced.cluster_health.pod_memory?.find((m: any) => m.pod === c.pod);
+                                  const memMb = memEntry?.memory_mb || 0;
+                                  return (
+                                    <tr key={i}>
+                                      <td><code className="small">{c.pod?.substring(0, 40)}</code></td>
+                                      <td>{c.namespace}</td>
+                                      <td>
+                                        <span className={c.cpu_pct > 90 ? 'text-danger fw-bold' : c.cpu_pct > 70 ? 'text-warning' : ''}>
+                                          {c.cpu_pct}%
+                                        </span>
+                                      </td>
+                                      <td>{c.cpu_cores}</td>
+                                      <td>{c.cpu_limit_cores != null ? `${c.cpu_limit_cores}` : <span className="text-muted">unlimited</span>}</td>
+                                      <td>
+                                        <span className={memMb > 2048 ? 'text-danger fw-bold' : memMb > 1024 ? 'text-warning' : ''}>
+                                          {memMb >= 1024 ? `${(memMb / 1024).toFixed(1)} GB` : `${memMb} MB`}
+                                        </span>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
                       {/* Pod Stability Scores */}
                       {enhanced.pod_stability?.length > 0 && (
                         <div>
                           <h6 className="fw-bold mb-3">Pod Stability Scores</h6>
                           <div className="table-responsive">
                             <table className="table table-sm table-bordered">
-                              <thead className="table-light"><tr><th>Pod</th><th>Score</th><th>Restarts</th><th>Throttle</th><th>OOM</th><th>Max CPU</th></tr></thead>
+                              <thead className="table-light"><tr><th>Pod</th><th>Score</th><th>Restarts (1h/Total)</th><th>Throttle %</th><th>OOM</th><th>State</th><th>Max CPU</th><th>Max Mem</th></tr></thead>
                               <tbody>
-                                {enhanced.pod_stability.slice(0, 15).map((p: any, i: number) => (
+                                {enhanced.pod_stability.slice(0, 20).map((p: any, i: number) => (
                                   <tr key={i}>
-                                    <td><code className="small">{p.pod_name?.substring(0, 30)}</code></td>
+                                    <td><code className="small">{p.pod_name?.substring(0, 40)}</code></td>
                                     <td>
                                       <div className="d-flex align-items-center gap-2">
                                         <div className="progress" style={{ width: 60, height: 6 }}>
@@ -947,10 +1487,44 @@ const SmartExecutionReport: React.FC = () => {
                                         <strong>{p.stability_score}</strong>
                                       </div>
                                     </td>
-                                    <td>{p.restarts > 0 ? <span className="badge bg-danger">{p.restarts}</span> : '0'}</td>
+                                    <td>
+                                      {p.restarts > 0 ? <span className="badge bg-danger">{p.restarts}</span> : '0'}
+                                      <span className="text-muted mx-1">/</span>
+                                      {p.total_restarts > 0 ? <span className="text-warning fw-bold">{p.total_restarts}</span> : '0'}
+                                    </td>
                                     <td>{p.cpu_throttle_pct > 10 ? <span className="badge bg-warning text-dark">{p.cpu_throttle_pct}%</span> : `${p.cpu_throttle_pct}%`}</td>
                                     <td>{p.oom_killed ? <span className="badge bg-danger">YES</span> : <span className="badge bg-success">No</span>}</td>
-                                    <td>{p.max_cpu_pct}%</td>
+                                    <td>
+                                      {p.unhealthy_reason
+                                        ? <span className="badge bg-danger">{p.unhealthy_reason}</span>
+                                        : p.pod_phase
+                                          ? <span className="badge bg-warning text-dark">{p.pod_phase}</span>
+                                          : p.not_ready
+                                            ? <span className="badge bg-warning text-dark">NotReady</span>
+                                            : p.termination_reasons?.length > 0
+                                              ? <span className="text-warning small">{p.termination_reasons.join(', ')}</span>
+                                              : <span className="badge bg-success">Healthy</span>
+                                      }
+                                    </td>
+                                    <td>
+                                      {p.max_cpu_pct === 0 && p.impact_events === 0
+                                        ? <span className="text-muted">N/A</span>
+                                        : <>
+                                            <span className={p.max_cpu_pct > 90 ? 'text-danger fw-bold' : p.max_cpu_pct > 70 ? 'text-warning' : ''}>
+                                              {p.max_cpu_pct}%
+                                            </span>
+                                            {p.cpu_cores > 0 && <span className="text-muted small ms-1">({p.cpu_cores}c)</span>}
+                                          </>
+                                      }
+                                    </td>
+                                    <td>
+                                      {p.max_memory_mb === 0 && p.impact_events === 0
+                                        ? <span className="text-muted">N/A</span>
+                                        : <span className={p.max_memory_mb > 2048 ? 'text-danger fw-bold' : p.max_memory_mb > 1024 ? 'text-warning' : ''}>
+                                            {p.max_memory_mb >= 1024 ? `${(p.max_memory_mb / 1024).toFixed(1)} GB` : `${p.max_memory_mb} MB`}
+                                          </span>
+                                      }
+                                    </td>
                                   </tr>
                                 ))}
                               </tbody>
@@ -958,14 +1532,113 @@ const SmartExecutionReport: React.FC = () => {
                           </div>
                         </div>
                       )}
+
+                      {/* Node Stability Scores */}
+                      {enhanced.node_stability?.length > 0 && (
+                        <div>
+                          <h6 className="fw-bold mb-3">Node Stability Scores</h6>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-bordered">
+                              <thead className="table-light"><tr><th>Node</th><th>Score</th><th>Ready</th><th>CPU %</th><th>Memory %</th><th>Disk %</th><th>Pressures</th></tr></thead>
+                              <tbody>
+                                {enhanced.node_stability.map((n: any, i: number) => (
+                                  <tr key={i}>
+                                    <td><strong>{n.node_name}</strong></td>
+                                    <td>
+                                      <div className="d-flex align-items-center gap-2">
+                                        <div className="progress" style={{ width: 60, height: 6 }}>
+                                          <div className={`progress-bar ${n.stability_score >= 80 ? 'bg-success' : n.stability_score >= 50 ? 'bg-warning' : 'bg-danger'}`}
+                                            style={{ width: `${n.stability_score}%` }} />
+                                        </div>
+                                        <strong>{n.stability_score}</strong>
+                                      </div>
+                                    </td>
+                                    <td>{n.ready ? <span className="badge bg-success">Ready</span> : <span className="badge bg-danger">NotReady</span>}</td>
+                                    <td><span className={n.cpu_percent > 85 ? 'text-danger fw-bold' : n.cpu_percent > 70 ? 'text-warning' : ''}>{n.cpu_percent}%</span></td>
+                                    <td><span className={n.memory_percent > 85 ? 'text-danger fw-bold' : n.memory_percent > 70 ? 'text-warning' : ''}>{n.memory_percent}%</span></td>
+                                    <td><span className={n.disk_percent > 85 ? 'text-danger fw-bold' : n.disk_percent > 70 ? 'text-warning' : ''}>{n.disk_percent}%</span></td>
+                                    <td>{n.pressures?.length > 0 ? <span className="badge bg-warning text-dark">{n.pressure_summary}</span> : <span className="badge bg-success">None</span>}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Pod Restart Timeline */}
+                      {enhanced.restart_timestamps?.length > 0 && (
+                        <div>
+                          <h6 className="fw-bold mb-3">Pod Restart Timeline</h6>
+                          <p className="text-muted small mb-2">Most recent container terminations (last terminated timestamp from Prometheus).</p>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-bordered">
+                              <thead className="table-light"><tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Last Terminated At</th></tr></thead>
+                              <tbody>
+                                {enhanced.restart_timestamps.slice(0, 20).map((rt: any, i: number) => {
+                                  const ts = rt.last_terminated_at;
+                                  let display = ts;
+                                  try {
+                                    const d = new Date(ts);
+                                    if (!isNaN(d.getTime())) display = d.toLocaleString();
+                                  } catch { /* keep raw */ }
+                                  return (
+                                    <tr key={i}>
+                                      <td><code className="small">{rt.pod?.substring(0, 40)}</code></td>
+                                      <td>{rt.namespace}</td>
+                                      <td>{rt.container}</td>
+                                      <td>{display}</td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {(() => {
+                        const ch = enhanced.cluster_health;
+                        if (!ch) return null;
+                        const hasPromRows =
+                          (ch.node_conditions?.length || 0) +
+                          (ch.oom_killed?.length || 0) +
+                          (ch.cpu_throttling?.length || 0) +
+                          (ch.container_restarts?.length || 0) +
+                          (ch.pvc_health?.length || 0) > 0;
+                        if (hasPromRows || (enhanced.pod_stability?.length || 0) > 0 || (enhanced.node_stability?.length || 0) > 0) return null;
+                        return (
+                          <div className="alert alert-success border-0 rounded-3 mb-0">
+                            Live snapshot succeeded: no rows matched reporting thresholds (throttling, restarts, OOM, node pressure, or PVC usage). Your cluster may still be healthy—thresholds filter noise.
+                          </div>
+                        );
+                      })()}
                     </>
                   ) : (
-                    <div className="text-center py-4 text-muted">
-                      <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>cloud_off</i>
-                      <div>Cluster health data unavailable (Prometheus not reachable during report generation)</div>
-                      <div className="small mt-1">Status: {enhanced.cluster_health?.collection_status || 'N/A'}</div>
-                      <div className="small mt-1 text-info">Tip: Health data is collected during execution. Run a new execution to get fresh data.</div>
-                    </div>
+                    (() => {
+                      const healthCopy = clusterHealthUnavailableCopy(
+                        enhanced.cluster_health?.collection_status,
+                        enhanced.cluster_health?.collection_reason
+                      );
+                      return (
+                        <div className="text-center py-4 text-muted">
+                          <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>cloud_off</i>
+                          <div className="fw-semibold text-dark">{healthCopy.headline}</div>
+                          <div className="small mt-2 px-2" style={{ maxWidth: 520, margin: '0 auto' }}>
+                            {healthCopy.detail}
+                          </div>
+                          <div className="small mt-2 font-monospace">
+                            status={enhanced.cluster_health?.collection_status || 'N/A'}
+                            {enhanced.cluster_health?.collection_reason
+                              ? ` · reason=${enhanced.cluster_health.collection_reason}`
+                              : ''}
+                          </div>
+                          <div className="small mt-2 text-info">
+                            A snapshot is taken when the run completes; reopen the report or ensure the testbed Prometheus URL is reachable from the app server.
+                          </div>
+                        </div>
+                      );
+                    })()
                   )}
                 </div>
               )}
@@ -997,6 +1670,185 @@ const SmartExecutionReport: React.FC = () => {
                     <div className="text-center py-4 text-muted">
                       <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>check_circle</i>
                       <div>No failures detected</div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* LATENCY TAB */}
+              {activeTab === 'latency' && (
+                <div>
+                  {/* Execution Mode Trust Banner */}
+                  {enhanced.execution_mode_summary?.available && enhanced.execution_mode_summary.warning && (
+                    <div className="alert alert-warning rounded-3 mb-3 d-flex align-items-center gap-2">
+                      <i className="material-icons-outlined">warning</i>
+                      <div>
+                        <strong>Trust Level: {enhanced.execution_mode_summary.trust_level}</strong> — {enhanced.execution_mode_summary.warning}
+                      </div>
+                    </div>
+                  )}
+
+                  {enhanced.entity_latency_breakdown?.available && enhanced.entity_latency_breakdown.entity_latencies?.length ? (
+                    <>
+                      <h6 className="fw-bold mb-3">Per-Entity Latency Breakdown</h6>
+                      <div className="table-responsive">
+                        <table className="table table-sm table-hover align-middle">
+                          <thead className="table-light">
+                            <tr>
+                              <th>Entity.Operation</th>
+                              <th className="text-end">Count</th>
+                              <th className="text-end">Avg (s)</th>
+                              <th className="text-end">P50 (s)</th>
+                              <th className="text-end">P95 (s)</th>
+                              <th className="text-end">Min (s)</th>
+                              <th className="text-end">Max (s)</th>
+                              <th className="text-center">Degraded?</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {enhanced.entity_latency_breakdown.entity_latencies.map((row, idx) => (
+                              <tr key={idx} className={row.degradation_detected ? 'table-warning' : ''}>
+                                <td><code className="small">{row.entity_operation}</code></td>
+                                <td className="text-end">{row.count}</td>
+                                <td className="text-end">{row.avg_seconds}</td>
+                                <td className="text-end">{row.p50_seconds}</td>
+                                <td className="text-end fw-bold">{row.p95_seconds}</td>
+                                <td className="text-end text-muted">{row.min_seconds}</td>
+                                <td className="text-end text-muted">{row.max_seconds}</td>
+                                <td className="text-center">
+                                  {row.degradation_detected
+                                    ? <span className="badge bg-danger">Yes</span>
+                                    : <span className="badge bg-success">No</span>}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      {/* Dependency Cascade Warnings */}
+                      {enhanced.dependency_cascade?.available && enhanced.dependency_cascade.cascades?.length ? (
+                        <div className="mt-4">
+                          <h6 className="fw-bold mb-3 text-warning">
+                            <i className="material-icons-outlined align-middle me-1" style={{ fontSize: 18 }}>link_off</i>
+                            Dependency Cascade Failures ({enhanced.dependency_cascade.total_cascade_patterns})
+                          </h6>
+                          {enhanced.dependency_cascade.cascades.map((cascade, idx) => (
+                            <div key={idx} className="alert alert-warning rounded-3 py-2 mb-2">
+                              <strong>{cascade.entity_type}</strong> ({cascade.failure_count} failures) — likely caused by upstream failures in{' '}
+                              {cascade.failed_dependencies.map((dep, di) => (
+                                <span key={di}>
+                                  <strong>{dep.entity_type}</strong> ({dep.failure_count}){di < cascade.failed_dependencies.length - 1 ? ', ' : ''}
+                                </span>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <div className="text-center py-4 text-muted">
+                      <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>timer</i>
+                      <div>No latency data available</div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* ERROR CODES TAB */}
+              {activeTab === 'errors' && (
+                <div>
+                  {enhanced.error_code_breakdown?.available ? (
+                    <>
+                      <div className="alert alert-danger rounded-3 mb-3">
+                        <strong>{enhanced.error_code_breakdown.total_failures}</strong> total failures analyzed
+                      </div>
+
+                      <div className="row g-3 mb-4">
+                        <div className="col-md-6">
+                          <h6 className="fw-bold mb-2">HTTP Status Code Distribution</h6>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-hover">
+                              <thead className="table-light">
+                                <tr>
+                                  <th>HTTP Code</th>
+                                  <th>Category</th>
+                                  <th className="text-end">Count</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {enhanced.error_code_breakdown.http_code_distribution?.map((row, idx) => (
+                                  <tr key={idx}>
+                                    <td>
+                                      <span className={`badge ${row.category === 'server_error' ? 'bg-danger' : row.category === 'client_error' ? 'bg-warning text-dark' : 'bg-secondary'}`}>
+                                        {row.code}
+                                      </span>
+                                    </td>
+                                    <td className="small text-muted">{row.category.replace('_', ' ')}</td>
+                                    <td className="text-end fw-bold">{row.count}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                        <div className="col-md-6">
+                          <h6 className="fw-bold mb-2">Error Type Distribution</h6>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-hover">
+                              <thead className="table-light">
+                                <tr>
+                                  <th>Error Type</th>
+                                  <th className="text-end">Count</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {enhanced.error_code_breakdown.error_type_distribution?.map((row, idx) => (
+                                  <tr key={idx}>
+                                    <td><code className="small">{row.error_type}</code></td>
+                                    <td className="text-end fw-bold">{row.count}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      </div>
+
+                      {enhanced.error_code_breakdown.sample_errors && enhanced.error_code_breakdown.sample_errors.length > 0 && (
+                        <div className="mt-3">
+                          <h6 className="fw-bold mb-2">Sample Errors (first 20)</h6>
+                          <div className="table-responsive" style={{ maxHeight: 400, overflowY: 'auto' }}>
+                            <table className="table table-sm table-hover align-middle" style={{ fontSize: '0.8rem' }}>
+                              <thead className="table-light sticky-top">
+                                <tr>
+                                  <th>Iter</th>
+                                  <th>Entity.Op</th>
+                                  <th>HTTP</th>
+                                  <th>Type</th>
+                                  <th>Error</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {enhanced.error_code_breakdown.sample_errors.map((err: any, idx: number) => (
+                                  <tr key={idx}>
+                                    <td>{err.iteration ?? '—'}</td>
+                                    <td><code>{err.entity_type}.{err.operation}</code></td>
+                                    <td><span className="badge bg-secondary">{err.http_code}</span></td>
+                                    <td className="text-muted">{err.error_type}</td>
+                                    <td className="text-truncate" style={{ maxWidth: 300 }} title={err.error_snippet}>{err.error_snippet}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="text-center py-4 text-muted">
+                      <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>check_circle</i>
+                      <div>No failures detected — no error codes to analyze</div>
                     </div>
                   )}
                 </div>
@@ -1046,6 +1898,12 @@ const SmartExecutionReport: React.FC = () => {
                           <strong>Estimated Maximum Capacity:</strong> ~{enhanced.capacity_planning.estimated_total_capacity_ops} operations before reaching target threshold
                         </div>
                       )}
+                      {enhanced.capacity_planning.simulation_warning && (
+                        <div className="alert alert-warning rounded-3 mb-3">
+                          <i className="material-icons-outlined align-middle me-1" style={{ fontSize: 18 }}>science</i>
+                          {enhanced.capacity_planning.simulation_warning}
+                        </div>
+                      )}
                       <div className="alert alert-light rounded-3 border">
                         <i className="material-icons-outlined align-middle me-1" style={{ fontSize: 18 }}>tips_and_updates</i>
                         {enhanced.capacity_planning.recommendation}
@@ -1075,7 +1933,9 @@ const SmartExecutionReport: React.FC = () => {
               {/* ITERATIONS TIMELINE TAB */}
               {activeTab === 'iterations' && (
                 <div>
-                  {enhanced.iteration_timeline?.iterations?.length > 0 ? (
+                  {enhanced.iteration_timeline?.iterations?.length ? (() => {
+                    const itl = enhanced.iteration_timeline;
+                    return (
                     <>
                       <p className="text-muted small mb-3">
                         Each row is one controller <strong>iteration</strong> (metrics sample). <strong>Ops</strong> = operations attributed to that iteration
@@ -1083,12 +1943,12 @@ const SmartExecutionReport: React.FC = () => {
                         <strong> counts by entity × operation</strong>.
                       </p>
                       <div className="d-flex gap-3 mb-3 flex-wrap">
-                        <span className="badge bg-primary bg-opacity-10 text-primary border px-3 py-2">Total Iterations: <strong>{enhanced.iteration_timeline.total_iterations}</strong></span>
-                        <span className="badge bg-danger bg-opacity-10 text-danger border px-3 py-2">Spike Iterations: <strong>{enhanced.iteration_timeline.total_spikes}</strong></span>
-                        <span className="badge bg-info bg-opacity-10 text-info border px-3 py-2">Total Ops: <strong>{enhanced.iteration_timeline.summary?.total_ops || 0}</strong></span>
-                        <span className="badge bg-success bg-opacity-10 text-success border px-3 py-2">Creates: <strong>{enhanced.iteration_timeline.summary?.total_creates || 0}</strong></span>
-                        <span className="badge bg-warning bg-opacity-10 text-dark border px-3 py-2">Deletes: <strong>{enhanced.iteration_timeline.summary?.total_deletes || 0}</strong></span>
-                        <span className="badge bg-secondary bg-opacity-10 text-dark border px-3 py-2">Avg Ops/Iter: <strong>{enhanced.iteration_timeline.summary?.avg_ops_per_iteration || 0}</strong></span>
+                        <span className="badge bg-primary bg-opacity-10 text-primary border px-3 py-2">Total Iterations: <strong>{itl.total_iterations}</strong></span>
+                        <span className="badge bg-danger bg-opacity-10 text-danger border px-3 py-2">Spike Iterations: <strong>{itl.total_spikes}</strong></span>
+                        <span className="badge bg-info bg-opacity-10 text-info border px-3 py-2">Total Ops: <strong>{itl.summary?.total_ops || 0}</strong></span>
+                        <span className="badge bg-success bg-opacity-10 text-success border px-3 py-2">Creates: <strong>{itl.summary?.total_creates || 0}</strong></span>
+                        <span className="badge bg-warning bg-opacity-10 text-dark border px-3 py-2">Deletes: <strong>{itl.summary?.total_deletes || 0}</strong></span>
+                        <span className="badge bg-secondary bg-opacity-10 text-dark border px-3 py-2">Avg Ops/Iter: <strong>{itl.summary?.avg_ops_per_iteration || 0}</strong></span>
                       </div>
                       <div className="table-responsive" style={{ maxHeight: 600, overflowY: 'auto' }}>
                         <table className="table table-sm table-hover align-middle mb-0">
@@ -1109,7 +1969,7 @@ const SmartExecutionReport: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody>
-                            {enhanced.iteration_timeline.iterations.map((iter: any, idx: number) => (
+                            {itl.iterations.map((iter: any, idx: number) => (
                               <React.Fragment key={idx}>
                                 <tr
                                   style={{
@@ -1183,7 +2043,7 @@ const SmartExecutionReport: React.FC = () => {
                                           <>
                                             <strong>Operation instances (up to 20):</strong>
                                             <table className="table table-sm table-bordered mt-1 mb-0" style={{ fontSize: 12 }}>
-                                              <thead className="table-light"><tr><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Duration</th></tr></thead>
+                                              <thead className="table-light"><tr><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
                                               <tbody>
                                                 {iter.operations.map((op: any, oi: number) => (
                                                   <tr key={oi}>
@@ -1192,6 +2052,7 @@ const SmartExecutionReport: React.FC = () => {
                                                     <td><code>{op.entity_name?.substring(0, 30)}</code></td>
                                                     <td><span className={`badge ${op.status === 'SUCCESS' ? 'bg-success' : op.status === 'FAILED' ? 'bg-danger' : 'bg-secondary'} rounded-pill`}>{op.status}</span></td>
                                                     <td>{op.duration}s</td>
+                                                    <td className="text-danger text-truncate" style={{ maxWidth: 200 }} title={op.error || ''}>{op.status === 'FAILED' ? (op.error || op.error_type || 'Unknown error') : ''}</td>
                                                   </tr>
                                                 ))}
                                               </tbody>
@@ -1208,7 +2069,8 @@ const SmartExecutionReport: React.FC = () => {
                         </table>
                       </div>
                     </>
-                  ) : (
+                    );
+                  })() : (
                     <div className="text-center py-4 text-muted">
                       <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>format_list_numbered</i>
                       <div>No iteration data available</div>

@@ -125,6 +125,33 @@
         </div>
     </div>
 
+    <!-- REPORT DATA QUALITY / PROVENANCE -->
+    {% if report_metadata %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #0ea5e9, #0369a1);">📋</div>
+            <h2>Report data quality</h2>
+        </div>
+        <div class="card-body">
+            <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">
+                Sample counts, metric time span, and how cluster health was sourced (live Prometheus vs persisted snapshot).
+            </p>
+            <table>
+                <tr><td style="width:220px;font-weight:600;">Execution</td><td><code>{{ report_metadata.get('execution_id', execution_id) }}</code></td></tr>
+                <tr><td style="font-weight:600;">Generated (UTC)</td><td>{{ report_metadata.get('generated_at_utc', '—') }}</td></tr>
+                <tr><td style="font-weight:600;">Metrics samples</td><td>{{ report_metadata.get('metrics_samples', 0) }}</td></tr>
+                <tr><td style="font-weight:600;">Operations recorded</td><td>{{ report_metadata.get('operations_recorded', 0) }}</td></tr>
+                {% if report_metadata.get('metrics_time_range') %}
+                <tr><td style="font-weight:600;">Metric time range</td><td>{{ report_metadata.metrics_time_range.first_timestamp }} → {{ report_metadata.metrics_time_range.last_timestamp }}</td></tr>
+                {% endif %}
+                <tr><td style="font-weight:600;">Cluster health source</td><td><span class="badge badge-info">{{ report_metadata.get('cluster_health_source', 'unknown') }}</span></td></tr>
+                <tr><td style="font-weight:600;">Prometheus configured</td><td>{{ 'Yes' if report_metadata.get('prometheus_configured') else 'No' }}</td></tr>
+                <tr><td style="font-weight:600;">Baseline / final resolution</td><td>{{ report_metadata.get('baseline_final_resolution', metrics_resolution_note) }}</td></tr>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
     <!-- EXECUTIVE SUMMARY -->
     <div class="stat-grid">
         <div class="stat-card">
@@ -393,6 +420,52 @@
     </div>
     {% endif %}
 
+    <!-- QA HEALTH ASSESSMENT -->
+    {% if health_assessment and health_assessment.findings %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, {% if health_assessment.overall_status == 'CRITICAL' %}#ef4444, #dc2626{% elif health_assessment.overall_status == 'DEGRADED' %}#f59e0b, #d97706{% elif health_assessment.overall_status == 'ATTENTION' %}#f59e0b, #eab308{% else %}#22c55e, #16a34a{% endif %});">🔍</div>
+            <h2>QA Health Assessment</h2>
+        </div>
+        <div class="card-body">
+            <div style="display:flex; gap:16px; margin-bottom:20px; align-items:center; flex-wrap:wrap;">
+                <div style="padding:10px 24px; border-radius:8px; font-weight:700; font-size:18px;
+                    background:{% if health_assessment.overall_status == 'CRITICAL' %}#fecaca; color:#991b1b{% elif health_assessment.overall_status == 'DEGRADED' %}#fef3c7; color:#92400e{% elif health_assessment.overall_status == 'ATTENTION' %}#fef9c3; color:#854d0e{% else %}#dcfce7; color:#166534{% endif %};">
+                    {{ health_assessment.overall_status }}
+                </div>
+                {% if health_assessment.critical_count > 0 %}
+                <span class="badge badge-fail">{{ health_assessment.critical_count }} Critical</span>
+                {% endif %}
+                {% if health_assessment.warning_count > 0 %}
+                <span class="badge badge-warn">{{ health_assessment.warning_count }} Warning</span>
+                {% endif %}
+                {% if health_assessment.info_count > 0 %}
+                <span class="badge badge-info">{{ health_assessment.info_count }} Info</span>
+                {% endif %}
+            </div>
+            <table>
+                <thead>
+                    <tr><th style="width:90px;">Severity</th><th style="width:120px;">Category</th><th>Finding</th><th>Recommendation</th></tr>
+                </thead>
+                <tbody>
+                    {% for f in health_assessment.findings %}
+                    <tr>
+                        <td>
+                            {% if f.severity == 'critical' %}<span class="badge badge-fail">CRITICAL</span>
+                            {% elif f.severity == 'warning' %}<span class="badge badge-warn">WARNING</span>
+                            {% else %}<span class="badge badge-info">INFO</span>{% endif %}
+                        </td>
+                        <td><strong>{{ f.category }}</strong></td>
+                        <td>{{ f.finding }}</td>
+                        <td style="font-size:0.9em; color:var(--muted);">{{ f.recommendation }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
     <!-- POD STABILITY SCORES -->
     {% if pod_stability %}
     <div class="card">
@@ -404,8 +477,8 @@
             <table>
                 <thead>
                     <tr>
-                        <th>Pod</th><th>Namespace</th><th>Score</th><th>Restarts</th>
-                        <th>Throttle %</th><th>OOMKill</th><th>Max CPU</th><th>Max Mem</th>
+                        <th>Pod</th><th>Namespace</th><th>Score</th><th>Restarts (1h / Total)</th>
+                        <th>Throttle %</th><th>OOMKill</th><th>State</th><th>Max CPU</th><th>Max Mem</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -421,11 +494,124 @@
                                 <strong>{{ pod.stability_score }}/100</strong>
                             </div>
                         </td>
-                        <td>{% if pod.restarts > 0 %}<span class="badge badge-fail">{{ pod.restarts }}</span>{% else %}0{% endif %}</td>
+                        <td>
+                            {% if pod.restarts > 0 %}<span class="badge badge-fail">{{ pod.restarts }}</span>{% else %}0{% endif %}
+                            / {% if pod.total_restarts > 0 %}<span style="color:#f59e0b;font-weight:600">{{ pod.total_restarts }}</span>{% else %}0{% endif %}
+                        </td>
                         <td>{% if pod.cpu_throttle_pct > 10 %}<span class="badge badge-warn">{{ pod.cpu_throttle_pct }}%</span>{% else %}{{ pod.cpu_throttle_pct }}%{% endif %}</td>
                         <td>{% if pod.oom_killed %}<span class="badge badge-fail">YES</span>{% else %}<span class="badge badge-pass">No</span>{% endif %}</td>
-                        <td>{{ pod.max_cpu_pct }}%</td>
-                        <td>{{ pod.max_memory_mb }}MB</td>
+                        <td>
+                            {% if pod.unhealthy_reason %}
+                                <span class="badge badge-fail">{{ pod.unhealthy_reason }}</span>
+                            {% elif pod.pod_phase %}
+                                <span class="badge badge-warn">{{ pod.pod_phase }}</span>
+                            {% elif pod.not_ready %}
+                                <span class="badge badge-warn">NotReady</span>
+                            {% elif pod.termination_reasons %}
+                                <span style="color:#f59e0b;font-size:0.85em">{{ pod.termination_reasons|join(', ') }}</span>
+                            {% else %}
+                                <span class="badge badge-pass">Healthy</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if pod.max_cpu_pct == 0 and pod.impact_events == 0 %}
+                                <span style="color:#999">N/A</span>
+                            {% else %}
+                                {% if pod.max_cpu_pct > 90 %}<span style="color:#ef4444;font-weight:bold">{{ pod.max_cpu_pct }}%</span>
+                                {% elif pod.max_cpu_pct > 70 %}<span style="color:#f59e0b">{{ pod.max_cpu_pct }}%</span>
+                                {% else %}{{ pod.max_cpu_pct }}%{% endif %}
+                                {% if pod.cpu_cores and pod.cpu_cores > 0 %}<span style="color:#999;font-size:0.85em"> ({{ pod.cpu_cores }}c)</span>{% endif %}
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if pod.max_memory_mb == 0 and pod.impact_events == 0 %}
+                                <span style="color:#999">N/A</span>
+                            {% elif pod.max_memory_mb >= 1024 %}
+                                <span{% if pod.max_memory_mb > 2048 %} style="color:#ef4444;font-weight:bold"{% endif %}>{{ "%.1f"|format(pod.max_memory_mb / 1024) }} GB</span>
+                            {% else %}
+                                {{ pod.max_memory_mb }} MB
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- NODE STABILITY SCORES -->
+    {% if node_stability %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #8b5cf6, #6d28d9);">🖥️</div>
+            <h2>Node Stability Scores</h2>
+        </div>
+        <div class="card-body">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Node</th><th>Score</th><th>Ready</th><th>CPU %</th>
+                        <th>Memory %</th><th>Disk %</th><th>Pressures</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for node in node_stability %}
+                    <tr>
+                        <td><strong>{{ node.node_name }}</strong></td>
+                        <td>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                                <div class="stability-bar" style="width:80px;">
+                                    <div class="stability-fill" style="width:{{ node.stability_score }}%; background: {% if node.stability_score >= 80 %}var(--pass){% elif node.stability_score >= 50 %}var(--warn){% else %}var(--fail){% endif %};"></div>
+                                </div>
+                                <strong>{{ node.stability_score }}/100</strong>
+                            </div>
+                        </td>
+                        <td>{% if node.ready %}<span class="badge badge-pass">Ready</span>{% else %}<span class="badge badge-fail">NotReady</span>{% endif %}</td>
+                        <td>
+                            {% if node.cpu_percent > 85 %}<span style="color:#ef4444;font-weight:bold">{{ node.cpu_percent }}%</span>
+                            {% elif node.cpu_percent > 70 %}<span style="color:#f59e0b">{{ node.cpu_percent }}%</span>
+                            {% else %}{{ node.cpu_percent }}%{% endif %}
+                        </td>
+                        <td>
+                            {% if node.memory_percent > 85 %}<span style="color:#ef4444;font-weight:bold">{{ node.memory_percent }}%</span>
+                            {% elif node.memory_percent > 70 %}<span style="color:#f59e0b">{{ node.memory_percent }}%</span>
+                            {% else %}{{ node.memory_percent }}%{% endif %}
+                        </td>
+                        <td>
+                            {% if node.disk_percent > 85 %}<span style="color:#ef4444;font-weight:bold">{{ node.disk_percent }}%</span>
+                            {% elif node.disk_percent > 70 %}<span style="color:#f59e0b">{{ node.disk_percent }}%</span>
+                            {% else %}{{ node.disk_percent }}%{% endif %}
+                        </td>
+                        <td>{% if node.pressures %}<span class="badge badge-warn">{{ node.pressure_summary }}</span>{% else %}<span class="badge badge-pass">None</span>{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- POD RESTART TIMELINE -->
+    {% if restart_timestamps %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">🔄</div>
+            <h2>Pod Restart Timeline</h2>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--muted);margin-bottom:16px;">Most recent container terminations (last terminated timestamp from Prometheus).</p>
+            <table>
+                <thead>
+                    <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Last Terminated At</th></tr>
+                </thead>
+                <tbody>
+                    {% for rt in restart_timestamps[:20] %}
+                    <tr>
+                        <td><code>{{ rt.pod[:40] }}</code></td>
+                        <td>{{ rt.namespace }}</td>
+                        <td>{{ rt.container }}</td>
+                        <td>{{ rt.last_terminated_at }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -517,6 +703,134 @@
                 {% endfor %}
             </table>
             {% endif %}
+
+            {% if cluster_health.unhealthy_pods %}
+            <div class="section-title">⚠️ Unhealthy Pods (Waiting State)</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Reason</th></tr>
+                {% for u in cluster_health.unhealthy_pods %}
+                <tr>
+                    <td><code>{{ u.pod }}</code></td>
+                    <td>{{ u.namespace }}</td>
+                    <td>{{ u.container }}</td>
+                    <td><span class="badge badge-fail">{{ u.reason }}</span></td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.terminated_containers %}
+            <div class="section-title">Terminated Containers (Last Termination Reason)</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Reason</th></tr>
+                {% for tc in cluster_health.terminated_containers %}
+                <tr>
+                    <td><code>{{ tc.pod }}</code></td>
+                    <td>{{ tc.namespace }}</td>
+                    <td>{{ tc.container }}</td>
+                    <td><span class="badge {% if tc.reason == 'OOMKilled' %}badge-fail{% elif tc.reason == 'Error' %}badge-warn{% else %}badge-info{% endif %}">{{ tc.reason }}</span></td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.total_restarts %}
+            <div class="section-title">Cumulative Container Restarts (All-Time)</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Total Restarts</th></tr>
+                {% for tr in cluster_health.total_restarts[:15] %}
+                <tr>
+                    <td><code>{{ tr.pod }}</code></td>
+                    <td>{{ tr.namespace }}</td>
+                    <td>{{ tr.container }}</td>
+                    <td><span class="badge {% if tr.total_restarts > 5 %}badge-fail{% elif tr.total_restarts > 2 %}badge-warn{% else %}badge-info{% endif %}">{{ tr.total_restarts }}</span></td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.pod_phase_summary %}
+            <div class="section-title">Pod Phase Distribution</div>
+            <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:24px;">
+                {% for phase, count in cluster_health.pod_phase_summary.items() %}
+                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:{% if phase == 'Running' %}#dcfce7{% elif phase == 'Pending' %}#fef9c3{% elif phase == 'Failed' %}#fecaca{% elif phase == 'Succeeded' %}#dbeafe{% else %}#f1f5f9{% endif %};">
+                    <div style="font-size:24px;font-weight:700;">{{ count }}</div>
+                    <div style="font-size:12px;color:#64748b;font-weight:600;">{{ phase }}</div>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+
+            {% if cluster_health.problem_pods %}
+            <div class="section-title">Problem Pods (Pending / Failed / Unknown)</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Pod</th><th>Namespace</th><th>Phase</th></tr>
+                {% for pp in cluster_health.problem_pods %}
+                <tr>
+                    <td><code>{{ pp.pod }}</code></td>
+                    <td>{{ pp.namespace }}</td>
+                    <td><span class="badge {% if pp.phase == 'Failed' %}badge-fail{% else %}badge-warn{% endif %}">{{ pp.phase }}</span></td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.pods_not_ready %}
+            <div class="section-title">Pods Not Ready (Readiness Probe Failing)</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Pod</th><th>Namespace</th></tr>
+                {% for nr in cluster_health.pods_not_ready %}
+                <tr>
+                    <td><code>{{ nr.pod }}</code></td>
+                    <td>{{ nr.namespace }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.api_server_latency %}
+            <div class="section-title">API Server Latency (P99 &gt; 1s)</div>
+            <table style="margin-bottom:24px;">
+                <tr><th>Verb</th><th>Resource</th><th>P99 Latency</th></tr>
+                {% for a in cluster_health.api_server_latency[:10] %}
+                <tr>
+                    <td><strong>{{ a.verb }}</strong></td>
+                    <td>{{ a.resource }}</td>
+                    <td><span class="badge {% if a.p99_seconds > 10 %}badge-fail{% elif a.p99_seconds > 5 %}badge-warn{% else %}badge-info{% endif %}">{{ a.p99_seconds }}s</span></td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
+
+            {% if cluster_health.etcd_healthy is defined %}
+            <div class="section-title">Infrastructure Health</div>
+            <div style="display:flex; gap:16px; margin-bottom:24px;">
+                <div style="padding:12px 24px; border-radius:8px; background:{% if cluster_health.etcd_healthy %}#dcfce7{% else %}#fecaca{% endif %};">
+                    <strong>etcd:</strong>
+                    {% if cluster_health.etcd_healthy %}<span class="badge badge-pass">Healthy (has leader)</span>{% else %}<span class="badge badge-fail">NO LEADER</span>{% endif %}
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% else %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #64748b, #475569);">🏥</div>
+            <h2>Cluster Health Snapshot</h2>
+        </div>
+        <div class="card-body">
+            <p style="color: var(--muted); margin-bottom: 12px;">
+                Live Prometheus metrics were not available for this export.
+                {% if cluster_health.collection_reason %}
+                <strong>Reason:</strong> {{ cluster_health.collection_reason }}
+                {% elif cluster_health.collection_status %}
+                <strong>Status:</strong> {{ cluster_health.collection_status }}
+                {% endif %}
+            </p>
+            <p style="font-size: 0.9rem; color: var(--muted);">
+                Ensure the backend can reach the testbed Prometheus (port 9090) or use a report generated right after a completed run so an end-of-run snapshot can be merged.
+            </p>
         </div>
     </div>
     {% endif %}

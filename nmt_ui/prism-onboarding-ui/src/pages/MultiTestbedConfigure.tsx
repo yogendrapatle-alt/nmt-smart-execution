@@ -40,7 +40,7 @@ const MultiTestbedConfigure: React.FC = () => {
   const [aiEnabled, setAiEnabled] = useState(true);
   
   // Entity configuration
-  const [selectedEntities, setSelectedEntities] = useState<Record<string, string[]>>({
+  const [selectedEntities] = useState<Record<string, string[]>>({
     'vm': ['CREATE', 'DELETE'],
     'blueprint_multi_vm': ['CREATE', 'EXECUTE']
   });

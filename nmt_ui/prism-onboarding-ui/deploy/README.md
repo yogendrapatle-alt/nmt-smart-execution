@@ -45,6 +45,10 @@ Then open **http://10.117.66.44/** in a browser.
 
 **“Welcome to nginx on Rocky Linux” instead of the app:** the stock `server { ... default_server; root /usr/share/nginx/html; }` in **`/etc/nginx/nginx.conf`** wins over `conf.d/nmt.conf`. Current `remote-install.sh` strips `default_server` from that block and installs **`nmt.conf` with `listen 80 default_server`** so the SPA is served. Re-run the installer from an updated bundle, or comment out that `server` block by hand.
 
+**HTTP 502 on `/api/...` while the SPA loads:** nginx cannot reach Flask on `127.0.0.1:5000`. If `curl http://127.0.0.1:5000/api/health` works but `curl http://127.0.0.1/api/health` returns 502, enable **`setsebool -P httpd_can_network_connect 1`** and restart nginx. `remote-install.sh` runs this when `setsebool` is available.
+
+**`ModuleNotFoundError: routes.test_routes` on the VM:** the bundle excludes `**/test_*.py` (pytest-style files). Production routes live in `routes/qa_routes.py` so they are included; rebuild and redeploy.
+
 **Verify on the VM (after install):**
 
 ```bash

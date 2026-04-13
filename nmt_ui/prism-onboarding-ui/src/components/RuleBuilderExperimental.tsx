@@ -60,7 +60,7 @@ import ntnxLogo from '../assets/new_nutanix_logo.png';
 import { saveAs } from 'file-saver';
 import { useNavigate } from 'react-router-dom';
 import { useOnboarding } from '../context/OnboardingContext';
-import type { RuleConfig, MetricConfig } from '../types/onboarding';
+import type { RuleConfig } from '../types/onboarding';
 import Select from 'react-select';
 
 
@@ -81,7 +81,6 @@ const namespaceOptions = Object.keys(nameAndPodData).map(ns => ({ value: ns, lab
 
 
 import ConfigUploader from './ConfigUploader';
-import { parseConfigJson } from './configUtils';
 import { useConfigLoader } from '../hooks/useConfigLoader';
 import CustomScriptNavButton from './CustomScriptNavButton';
 import CustomScriptUploader from './CustomScriptUploader';
@@ -260,7 +259,7 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
       }
       // Optionally set testbed label, username, password, etc. if you want to display them
       // (not shown in UI currently)
-    } catch (err) {
+    } catch (_err) {
       alert('Invalid config file!');
     }
   };
@@ -290,13 +289,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
   const [pods, setPods] = useState<string[]>([]);
   const [groupedPodOptions, setGroupedPodOptions] = useState<any[]>([]);
   const [selectedQuerys, setSelectedQuerys] = useState<string[]>([]);
-  const [onboarding, setOnboarding] = useState(false);
-
-  const handleNext = () => {
-    // Logic to go to the next step/page
-    console.log("Next button clicked");
-  };
-
   // Pod queries come from pod-queries.json (use all values in arrays)
   const filteredQueryOptions = React.useMemo(() => {
     if (Array.isArray(podQueriesRaw)) {
@@ -309,8 +301,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
   }, [podQueriesRaw]);
   const [showSuccess, setShowSuccess] = useState(false);
   const [duplicateError, setDuplicateError] = useState<string | null>(null);
-  const [connectionStatus, setConnectionStatus] = useState<string>('');
-  const [isTestingConnection, setIsTestingConnection] = useState(false);
   // Alert destination state (must be inside component)
   const [alertDestinationType, setAlertDestinationType] = useState<'slack' | 'email'>('slack');
   const [alertDestinationValue, setAlertDestinationValue] = useState('');
@@ -332,9 +322,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
     customQueryText?: string;
     collectLogs?: boolean;
     logDurationHours?: number;
-  };
-  const handleOverrideConditionChange = (ruleIdx: number, value: string) => {
-    setRuleBook(prev => prev.map((rule, idx) => idx === ruleIdx ? { ...rule, overrideCondition: value } : rule));
   };
   const [ruleBook, setRuleBook] = useState<RuleBookEntry[]>([]);
 
@@ -833,7 +820,7 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
 
   // Custom script upload state
   const [useCustomScript, setUseCustomScript] = useState(false);
-  const [uploadedScript, setUploadedScript] = useState<any>(null);
+  const [, setUploadedScript] = useState<any>(null);
 
   // VM Type select state (now sourced from vm-types.json)
   const vmTypeOptions = Object.keys(vmTypesDataRaw).map(type => ({ value: type, label: type }));

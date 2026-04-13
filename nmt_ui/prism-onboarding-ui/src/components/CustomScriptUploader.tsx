@@ -29,7 +29,7 @@ const CustomScriptUploader: React.FC<CustomScriptUploaderProps> = ({
         };
         setUploadedScript(scriptData);
         onScriptUploaded(json);
-      } catch (err) {
+      } catch (_err) {
         alert('Invalid JSON file. Please upload a valid JSON script.');
       }
       // Reset input so the same file can be uploaded again if needed

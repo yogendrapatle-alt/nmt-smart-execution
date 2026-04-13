@@ -37,7 +37,7 @@ install_packages_debian() {
 
 install_packages_rhel() {
   local pm="$1"
-  $pm install -y nginx python3 python3-pip postgresql-server postgresql-contrib
+  $pm install -y nginx python3 python3-pip postgresql-server postgresql-contrib policycoreutils
   if [[ -x /usr/bin/postgresql-setup ]]; then
     if [[ ! -f /var/lib/pgsql/data/PG_VERSION ]]; then
       /usr/bin/postgresql-setup --initdb
@@ -158,9 +158,18 @@ case "$PKG" in
     ;;
 esac
 
-# SELinux: allow nginx to proxy to Flask
-if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
-  setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+# SELinux: allow nginx to proxy to Flask on 127.0.0.1 (otherwise GET /api/* → 502).
+# Run whenever setsebool exists — do not gate on getenforce (avoids silent skip if tools disagree).
+echo "==> SELinux (nginx → backend proxy)..."
+if command -v setsebool >/dev/null 2>&1; then
+  if setsebool -P httpd_can_network_connect 1; then
+    echo "    httpd_can_network_connect=on"
+  else
+    echo "WARN: setsebool failed — if GET /api/health via nginx returns 502, run as root:"
+    echo "      setsebool -P httpd_can_network_connect 1 && systemctl restart nginx"
+  fi
+else
+  echo "WARN: setsebool not found (install policycoreutils)"
 fi
 
 echo "==> PostgreSQL user and database..."
@@ -190,14 +199,18 @@ else
 fi
 normalize_database_url_in_env
 
-echo "==> Initialize DB tables..."
+echo "==> Initialize DB tables + run migrations..."
 INIT_DB_URL='postgresql://alertuser:alertpass@127.0.0.1:5432/alerts'
 if [[ -f "${BACKEND}/.env" ]] && grep -q '^DATABASE_URL=' "${BACKEND}/.env"; then
   INIT_DB_URL="$(grep '^DATABASE_URL=' "${BACKEND}/.env" | head -1 | sed "s/^DATABASE_URL=//;s/^[\"']//;s/[\"']$//")"
 fi
 (
   cd "$BACKEND"
-  DATABASE_URL="${INIT_DB_URL}" "$VENV/bin/python" -c "from database import init_db; init_db()"
+  if [[ -f "apply_all_migrations.py" ]]; then
+    DATABASE_URL="${INIT_DB_URL}" "$VENV/bin/python" apply_all_migrations.py
+  else
+    DATABASE_URL="${INIT_DB_URL}" "$VENV/bin/python" -c "from database import init_db; init_db()"
+  fi
 )
 
 NGINX_SRC=""

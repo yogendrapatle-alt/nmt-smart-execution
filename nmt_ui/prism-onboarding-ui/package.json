@@ -8,7 +8,14 @@
     "build": "tsc -b && vite build",
     "build:deploy": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:smoke-api": "python3 scripts/smoke_api.py",
+    "test:smoke-api:full": "SMOKE_INCLUDE_ENHANCED=1 python3 scripts/smoke_api.py",
+    "test:e2e": "playwright test --config=playwright.config.3000.ts",
+    "test:e2e:real": "playwright test tests/e2e/real-testbed-smoke.spec.ts --config=playwright.config.3000.ts",
+    "test:integration:testbed": "python3 scripts/integration_real_testbed_smart_execution.py",
+    "test:e2e:smart-execution-full": "bash scripts/run_e2e_smart_execution_full.sh",
+    "test:all:local": "bash scripts/full_verify.sh"
   },
   "dependencies": {
     "@okta/okta-auth-js": "^7.12.1",

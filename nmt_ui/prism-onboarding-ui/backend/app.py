@@ -161,7 +161,7 @@ app.register_blueprint(email_routes)
 app.register_blueprint(environment_routes)
 
 # Register test routes for debugging
-from routes.test_routes import test_routes
+from routes.qa_routes import test_routes
 app.register_blueprint(test_routes)
 
 # Register AI Smart Execution routes
@@ -1457,9 +1457,11 @@ def get_testbeds():
 
 @app.route('/api/get-testbed/<uuid>', methods=['GET'])
 def get_testbed_by_uuid(uuid):
-    """Get a specific testbed by UUID"""
+    """Get a specific testbed by Prism UUID or unique_testbed_id (onboarding id)."""
     try:
         testbed = fetch_testbed_by_uuid(g.db, uuid)
+        if not testbed:
+            testbed = fetch_testbed_by_unique_id(g.db, uuid)
         if testbed:
             return jsonify({'success': True, 'testbed': testbed.to_dict()})
         else:
@@ -3858,40 +3860,44 @@ def update_slack_webhook():
 
 @app.route('/api/execution-history', methods=['GET'])
 def get_execution_history():
-    """Get execution history, optionally filtered by testbed_id"""
+    """Get execution history, optionally filtered by testbed_id.
+    
+    Uses the SmartExecution model (the actual SQLAlchemy table) and maps
+    fields to the legacy format expected by older consumers.
+    """
     try:
         testbed_id = request.args.get('testbed_id', None)
         
-        # Import here to avoid circular dependencies
         from database import SessionLocal
-        from models.execution import ExecutionRecord
+        from models.smart_execution import SmartExecution
         
         session = SessionLocal()
         
         try:
-            query = session.query(ExecutionRecord)
+            query = session.query(SmartExecution)
             
             if testbed_id:
-                query = query.filter(ExecutionRecord.testbed_id == testbed_id)
+                query = query.filter(
+                    (SmartExecution.testbed_id == testbed_id) |
+                    (SmartExecution.unique_testbed_id == testbed_id)
+                )
             
-            # Order by most recent first
-            query = query.order_by(ExecutionRecord.started_at.desc())
+            query = query.order_by(SmartExecution.start_time.desc())
             
             executions = query.all()
             
-            # Convert to dict
             history = []
-            for exec_record in executions:
+            for rec in executions:
                 history.append({
-                    'execution_id': exec_record.execution_id,
-                    'testbed_id': exec_record.testbed_id,
-                    'status': exec_record.status,
-                    'started_at': exec_record.started_at.isoformat() if exec_record.started_at else None,
-                    'completed_at': exec_record.completed_at.isoformat() if exec_record.completed_at else None,
-                    'duration_minutes': exec_record.duration_minutes,
-                    'total_operations': exec_record.total_operations,
-                    'successful_operations': exec_record.successful_operations,
-                    'failed_operations': exec_record.failed_operations
+                    'execution_id': rec.execution_id,
+                    'testbed_id': rec.testbed_id,
+                    'status': rec.status,
+                    'started_at': rec.start_time.isoformat() if rec.start_time else None,
+                    'completed_at': rec.end_time.isoformat() if rec.end_time else None,
+                    'duration_minutes': rec.duration_minutes,
+                    'total_operations': rec.total_operations,
+                    'successful_operations': rec.successful_operations,
+                    'failed_operations': rec.failed_operations
                 })
             
             return jsonify({
@@ -4707,6 +4713,7 @@ def compare_smart_executions():
             entry = None
             if controller:
                 status = controller.get_status()
+                mh = getattr(controller, 'metrics_history', None) or []
                 entry = {
                     'execution_id': exec_id,
                     'testbed_label': status.get('execution_context', {}).get('testbed_label', 'Unknown'),
@@ -4715,6 +4722,7 @@ def compare_smart_executions():
                     'success_rate': status.get('success_rate', 0),
                     'operations_per_minute': status.get('operations_per_minute', 0),
                     'total_operations': status.get('total_operations', 0),
+                    'metric_iterations': len(mh) if isinstance(mh, list) else 0,
                     'baseline_cpu': status.get('baseline_metrics', {}).get('cpu_percent', 0),
                     'final_cpu': status.get('current_metrics', {}).get('cpu_percent', 0),
                     'baseline_memory': status.get('baseline_metrics', {}).get('memory_percent', 0),
@@ -4733,6 +4741,7 @@ def compare_smart_executions():
                 if db_data:
                     bl = db_data.get('baseline_metrics') or {}
                     fm = db_data.get('final_metrics') or {}
+                    mh = db_data.get('metrics_history') or []
                     entry = {
                         'execution_id': exec_id,
                         'testbed_label': db_data.get('testbed_label', 'Unknown'),
@@ -4741,6 +4750,7 @@ def compare_smart_executions():
                         'success_rate': db_data.get('success_rate', 0),
                         'operations_per_minute': db_data.get('operations_per_minute', 0),
                         'total_operations': db_data.get('total_operations', 0),
+                        'metric_iterations': len(mh) if isinstance(mh, list) else 0,
                         'baseline_cpu': bl.get('cpu_percent', 0),
                         'final_cpu': fm.get('cpu_percent', 0),
                         'baseline_memory': bl.get('memory_percent', 0),
@@ -4957,12 +4967,38 @@ def get_enhanced_smart_execution_report(execution_id):
                 'detected_anomalies': full_execution_data.get('detected_anomalies', []),
                 'operation_effectiveness': full_execution_data.get('operation_effectiveness', []),
                 'pod_operation_correlation': full_execution_data.get('pod_operation_correlation', {}),
+                'cluster_health_snapshot': full_execution_data.get('cluster_health_snapshot') or {},
             }
             report_data = status
 
-            testbed_ip = db_data.get('testbed_id', '')
-            if testbed_ip:
-                prometheus_url = f'http://{testbed_ip}:9090'
+            prometheus_url = None
+            tid = (db_data.get('testbed_id') or '').strip()
+            if tid:
+                try:
+                    tb = fetch_testbed_by_unique_id(g.db, tid)
+                    if not tb:
+                        tb = fetch_testbed_by_uuid(g.db, tid)
+                    if tb:
+                        tj = tb.testbed_json or {}
+                        if isinstance(tj, str):
+                            import json as _json
+                            try:
+                                tj = _json.loads(tj) if tj else {}
+                            except Exception:
+                                tj = {}
+                        prometheus_url = (tj.get('prometheus_url') or tj.get('prometheus_endpoint') or '').strip() or None
+                        ncm_ip = tj.get('ncm_ip') or getattr(tb, 'ncm_ip', None)
+                        node_port = tj.get('node_port') or 30560
+                        if not prometheus_url and ncm_ip:
+                            prometheus_url = f'https://{ncm_ip}:{node_port}'
+                except Exception as ex:
+                    logging.debug('Enhanced report: could not resolve Prometheus from testbed %s: %s', tid, ex)
+            if not prometheus_url:
+                testbed_ip = str(db_data.get('testbed_id') or '').strip()
+                if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', testbed_ip):
+                    prometheus_url = f'http://{testbed_ip}:9090'
+            from services.prometheus_url import resolve_working_prometheus_url
+            prometheus_url = resolve_working_prometheus_url(prometheus_url)
 
         if report_data is None:
             report_data = status or {}
@@ -5050,11 +5086,15 @@ def get_enhanced_smart_execution_report(execution_id):
             failure_analysis=enhanced_data['failure_analysis'],
             operation_heatmap=enhanced_data['operation_heatmap'],
             pod_stability=enhanced_data['pod_stability'],
+            node_stability=enhanced_data.get('node_stability') or [],
+            restart_timestamps=enhanced_data.get('restart_timestamps') or [],
+            health_assessment=enhanced_data.get('health_assessment') or {},
             cluster_health=enhanced_data['cluster_health'],
             capacity_planning=enhanced_data['capacity_planning'],
             historical_comparison=enhanced_data['historical_comparison'],
             iteration_timeline=enhanced_data.get('iteration_timeline') or {},
             entity_operation_counts=enhanced_data.get('entity_operation_counts') or [],
+            report_metadata=enhanced_data.get('report_metadata') or {},
             metrics_resolution_note=effm.get('resolution_note') or 'stored',
             # JSON for charts
             metrics_history_json=json_mod.dumps(metrics_history),
@@ -5721,6 +5761,8 @@ def get_smart_execution_report(execution_id):
                 longevity = full_data.get('longevity', {})
                 if longevity:
                     report['longevity'] = longevity
+            fd = db_data.get('full_execution_data')
+            report['cluster_health_snapshot'] = (fd.get('cluster_health_snapshot') or {}) if isinstance(fd, dict) else {}
             return jsonify(report), 200
         
         return jsonify({'success': False, 'error': 'Execution not found'}), 404

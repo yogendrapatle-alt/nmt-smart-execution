@@ -40,7 +40,7 @@ const AlertConfiguration: React.FC = () => {
   const [testbeds, setTestbeds] = useState<Testbed[]>([]);
   const [selectedTestbed, setSelectedTestbed] = useState<string>('');
   const [config, setConfig] = useState<AlertConfig | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
+  const [, setLoading] = useState<boolean>(false);
   const [saving, setSaving] = useState<boolean>(false);
   const [testing, setTesting] = useState<Record<string, boolean>>({});
   const [message, setMessage] = useState<{type: 'success' | 'error', text: string} | null>(null);
@@ -73,7 +73,7 @@ const AlertConfiguration: React.FC = () => {
   const fetchConfig = async () => {
     setLoading(true);
     try {
-      const response = await fetch(`/api/alerts/config/${selectedTestbed}`);
+      const response = await fetch(`${getApiBase()}/api/alerts/config/${selectedTestbed}`);
       const data = await response.json();
       if (data.success) {
         setConfig(data.config);
@@ -92,7 +92,7 @@ const AlertConfiguration: React.FC = () => {
     setMessage(null);
     
     try {
-      const response = await fetch(`/api/alerts/config/${selectedTestbed}`, {
+      const response = await fetch(`${getApiBase()}/api/alerts/config/${selectedTestbed}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config)
@@ -117,7 +117,7 @@ const AlertConfiguration: React.FC = () => {
     setMessage(null);
     
     try {
-      const response = await fetch('/api/alerts/test', {
+      const response = await fetch(`${getApiBase()}/api/alerts/test`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

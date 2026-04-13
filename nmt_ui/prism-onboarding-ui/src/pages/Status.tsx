@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getAutoBackendUrl } from '../utils/backendUrl';
+import { getApiBase } from '../utils/backendUrl';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeAlertsByTestbed, getFakeExecutionsByTestbed } from '../fake-data';
 
@@ -13,6 +13,10 @@ interface Testbed {
   username: string;
   password: string;
   timestamp: string;
+  testbed_json?: {
+    prometheus_endpoint?: string;
+    [key: string]: any;
+  };
 }
 
 interface Alert {
@@ -29,13 +33,25 @@ interface ExecutionRecord {
   execution_id: string;
   testbed_id: string;
   status: string;
-  started_at: string;
+  start_time?: string;
+  started_at?: string;
+  end_time?: string;
   completed_at?: string;
   duration_minutes?: number;
   total_operations?: number;
   successful_operations?: number;
   failed_operations?: number;
+  success_rate?: number;
+  testbed_label?: string;
 }
+
+const AUTO_REFRESH_INTERVALS = [
+  { label: 'Off', value: 0 },
+  { label: '15s', value: 15000 },
+  { label: '30s', value: 30000 },
+  { label: '1m', value: 60000 },
+  { label: '5m', value: 300000 },
+];
 
 const Status: React.FC = () => {
   const navigate = useNavigate();
@@ -47,6 +63,9 @@ const Status: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [prometheusStatus, setPrometheusStatus] = useState<'checking' | 'online' | 'offline'>('checking');
+  const [autoRefreshInterval, setAutoRefreshInterval] = useState<number>(30000);
+  const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
+  const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     fetchTestbeds();
@@ -58,13 +77,42 @@ const Status: React.FC = () => {
       setSelectedTestbedDetails(testbed || null);
       fetchAlerts(selectedTestbed);
       fetchExecutions(selectedTestbed);
-      checkPrometheusStatus(testbed?.prometheus_url);
+      const promUrl = getPrometheusUrl(testbed);
+      checkPrometheusStatus(promUrl);
     }
   }, [selectedTestbed, testbeds]);
 
+  const refreshAll = useCallback(() => {
+    if (!selectedTestbed) return;
+    fetchAlerts(selectedTestbed);
+    fetchExecutions(selectedTestbed);
+    const testbed = testbeds.find(t => t.unique_testbed_id === selectedTestbed);
+    checkPrometheusStatus(getPrometheusUrl(testbed));
+    setLastRefreshed(new Date());
+  }, [selectedTestbed, testbeds]);
+
+  useEffect(() => {
+    if (refreshTimerRef.current) {
+      clearInterval(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+    }
+    if (autoRefreshInterval > 0 && selectedTestbed) {
+      refreshTimerRef.current = setInterval(refreshAll, autoRefreshInterval);
+    }
+    return () => {
+      if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
+    };
+  }, [autoRefreshInterval, refreshAll, selectedTestbed]);
+
+  const getPrometheusUrl = (testbed?: Testbed | null): string | undefined => {
+    if (!testbed) return undefined;
+    if (testbed.prometheus_url) return testbed.prometheus_url;
+    if (testbed.testbed_json?.prometheus_endpoint) return testbed.testbed_json.prometheus_endpoint;
+    return undefined;
+  };
+
   const fetchTestbeds = async () => {
     try {
-      // FAKE DATA MODE
       if (IS_FAKE_MODE) {
         await new Promise(resolve => setTimeout(resolve, 300));
         const data = getFakeTestbeds();
@@ -78,8 +126,8 @@ const Status: React.FC = () => {
         return;
       }
 
-      const backendUrl = getAutoBackendUrl();
-      const response = await fetch(`${backendUrl}/api/get-testbeds`);
+      const base = getApiBase();
+      const response = await fetch(`${base}/api/get-testbeds`);
       const data = await response.json();
       
       if (data.success && data.testbeds) {
@@ -98,7 +146,6 @@ const Status: React.FC = () => {
 
   const fetchAlerts = async (testbedId: string) => {
     try {
-      // FAKE DATA MODE
       if (IS_FAKE_MODE) {
         await new Promise(resolve => setTimeout(resolve, 300));
         const data = getFakeAlertsByTestbed(testbedId);
@@ -106,21 +153,20 @@ const Status: React.FC = () => {
         return;
       }
 
-      const backendUrl = getAutoBackendUrl();
-      const response = await fetch(`${backendUrl}/api/alerts/${testbedId}`);
+      const base = getApiBase();
+      const response = await fetch(`${base}/api/alerts/${testbedId}`);
       const data = await response.json();
       
       if (data.success) {
         setAlerts(data.alerts || []);
       }
     } catch (err) {
-      console.error('Error fetching alerts:', err);
+      console.warn('Error fetching alerts:', err);
     }
   };
 
   const fetchExecutions = async (testbedId: string) => {
     try {
-      // FAKE DATA MODE
       if (IS_FAKE_MODE) {
         await new Promise(resolve => setTimeout(resolve, 300));
         const data = getFakeExecutionsByTestbed(testbedId);
@@ -128,15 +174,15 @@ const Status: React.FC = () => {
         return;
       }
 
-      const backendUrl = getAutoBackendUrl();
-      const response = await fetch(`${backendUrl}/api/execution-history?testbed_id=${testbedId}`);
+      const base = getApiBase();
+      const response = await fetch(`${base}/api/smart-execution/history?testbed_id=${testbedId}`);
       const data = await response.json();
       
       if (data.success) {
-        setExecutions(data.history || []);
+        setExecutions(data.executions || []);
       }
     } catch (err) {
-      console.error('Error fetching executions:', err);
+      console.warn('Error fetching executions:', err);
     }
   };
 
@@ -148,15 +194,19 @@ const Status: React.FC = () => {
 
     try {
       setPrometheusStatus('checking');
-      const backendUrl = getAutoBackendUrl();
-      const response = await fetch(`${backendUrl}/api/check-prometheus?url=${encodeURIComponent(url)}`);
+      const base = getApiBase();
+      const response = await fetch(`${base}/api/check-prometheus?url=${encodeURIComponent(url)}`);
       const data = await response.json();
       
       setPrometheusStatus(data.status === 'online' ? 'online' : 'offline');
     } catch (err) {
-      console.error('Error checking Prometheus status:', err);
+      console.warn('Error checking Prometheus status:', err);
       setPrometheusStatus('offline');
     }
+  };
+
+  const getExecStartTime = (exec: ExecutionRecord): string | undefined => {
+    return exec.start_time || exec.started_at;
   };
 
   const getSeverityColor = (severity: string) => {
@@ -178,13 +228,23 @@ const Status: React.FC = () => {
   };
 
   const getExecutionStatusColor = (status: string) => {
-    switch (status.toLowerCase()) {
-      case 'completed': return '#28a745';
-      case 'failed': return '#dc3545';
-      case 'running': return '#ffc107';
+    switch (status.toUpperCase()) {
+      case 'COMPLETED': return '#28a745';
+      case 'FAILED': return '#dc3545';
+      case 'RUNNING': return '#007bff';
+      case 'TIMEOUT': return '#fd7e14';
+      case 'STOPPED': return '#6c757d';
       default: return '#6c757d';
     }
   };
+
+  const totalExecs = executions.length;
+  const completedExecs = executions.filter(e => e.status?.toUpperCase() === 'COMPLETED').length;
+  const failedExecs = executions.filter(e => ['FAILED', 'TIMEOUT'].includes(e.status?.toUpperCase())).length;
+  const runningExecs = executions.filter(e => e.status?.toUpperCase() === 'RUNNING').length;
+  const avgSuccessRate = executions.length > 0
+    ? executions.reduce((sum, e) => sum + (e.success_rate || 0), 0) / executions.length
+    : 0;
 
   return (
     <div className="main-content">
@@ -202,7 +262,7 @@ const Status: React.FC = () => {
         </nav>
       </div>
 
-      {/* Page Title */}
+      {/* Page Title + Auto-Refresh */}
       <div className="d-flex justify-content-between align-items-center mb-4">
         <h1 className="h3 mb-0 text-gray-800">
           <i className="material-icons-outlined" style={{ fontSize: 32, verticalAlign: 'middle', marginRight: 12 }}>
@@ -210,6 +270,28 @@ const Status: React.FC = () => {
           </i>
           Status & Monitoring
         </h1>
+        <div className="d-flex align-items-center gap-3">
+          <span className="text-muted" style={{ fontSize: '0.8rem' }}>
+            Last refreshed: {lastRefreshed.toLocaleTimeString()}
+          </span>
+          <select
+            className="form-select form-select-sm"
+            value={autoRefreshInterval}
+            onChange={(e) => setAutoRefreshInterval(Number(e.target.value))}
+            style={{ width: 100 }}
+          >
+            {AUTO_REFRESH_INTERVALS.map(opt => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </select>
+          <button
+            className="btn btn-sm btn-outline-primary"
+            onClick={refreshAll}
+            title="Refresh now"
+          >
+            <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle' }}>refresh</i>
+          </button>
+        </div>
       </div>
 
       {/* Testbed Selector */}
@@ -245,6 +327,50 @@ const Status: React.FC = () => {
 
       {selectedTestbedDetails && (
         <>
+          {/* Summary Stats Cards */}
+          <div className="row mb-4">
+            <div className="col-md-3 col-sm-6 mb-3">
+              <div className="card rounded-4 border-0 shadow-sm h-100">
+                <div className="card-body text-center">
+                  <i className="material-icons-outlined" style={{ fontSize: 28, color: '#6f42c1' }}>history</i>
+                  <h3 className="mt-2 mb-0">{totalExecs}</h3>
+                  <small className="text-muted">Total Executions</small>
+                </div>
+              </div>
+            </div>
+            <div className="col-md-3 col-sm-6 mb-3">
+              <div className="card rounded-4 border-0 shadow-sm h-100">
+                <div className="card-body text-center">
+                  <i className="material-icons-outlined" style={{ fontSize: 28, color: '#28a745' }}>check_circle</i>
+                  <h3 className="mt-2 mb-0">{completedExecs}</h3>
+                  <small className="text-muted">Completed</small>
+                </div>
+              </div>
+            </div>
+            <div className="col-md-3 col-sm-6 mb-3">
+              <div className="card rounded-4 border-0 shadow-sm h-100">
+                <div className="card-body text-center">
+                  <i className="material-icons-outlined" style={{ fontSize: 28, color: '#dc3545' }}>error</i>
+                  <h3 className="mt-2 mb-0">{failedExecs}</h3>
+                  <small className="text-muted">Failed / Timeout</small>
+                </div>
+              </div>
+            </div>
+            <div className="col-md-3 col-sm-6 mb-3">
+              <div className="card rounded-4 border-0 shadow-sm h-100">
+                <div className="card-body text-center">
+                  <i className="material-icons-outlined" style={{ fontSize: 28, color: '#007bff' }}>
+                    {runningExecs > 0 ? 'play_circle' : 'trending_up'}
+                  </i>
+                  <h3 className="mt-2 mb-0">
+                    {runningExecs > 0 ? runningExecs : `${avgSuccessRate.toFixed(1)}%`}
+                  </h3>
+                  <small className="text-muted">{runningExecs > 0 ? 'Running Now' : 'Avg Success Rate'}</small>
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* Testbed Info & Prometheus Status */}
           <div className="row mb-4">
             {/* Testbed Info */}
@@ -275,7 +401,7 @@ const Status: React.FC = () => {
                       )}
                       <tr>
                         <td><strong>Testbed ID:</strong></td>
-                        <td><code style={{ fontSize: '0.75rem' }}>{selectedTestbedDetails.unique_testbed_id.substring(0, 20)}...</code></td>
+                        <td><code style={{ fontSize: '0.75rem' }}>{selectedTestbedDetails.unique_testbed_id}</code></td>
                       </tr>
                       <tr>
                         <td><strong>Onboarded:</strong></td>
@@ -311,14 +437,18 @@ const Status: React.FC = () => {
                       {prometheusStatus === 'online' ? 'Online' : prometheusStatus === 'offline' ? 'Offline' : 'Checking...'}
                     </span>
                   </div>
-                  {selectedTestbedDetails.prometheus_url && (
+                  {getPrometheusUrl(selectedTestbedDetails) ? (
                     <p className="mb-2">
-                      <strong>URL:</strong> <code>{selectedTestbedDetails.prometheus_url}</code>
+                      <strong>URL:</strong> <code>{getPrometheusUrl(selectedTestbedDetails)}</code>
+                    </p>
+                  ) : (
+                    <p className="mb-2 text-muted">
+                      No Prometheus endpoint configured for this testbed.
                     </p>
                   )}
                   <button
                     className="btn btn-sm btn-outline-primary"
-                    onClick={() => checkPrometheusStatus(selectedTestbedDetails.prometheus_url)}
+                    onClick={() => checkPrometheusStatus(getPrometheusUrl(selectedTestbedDetails))}
                   >
                     <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', marginRight: 4 }}>
                       refresh
@@ -333,12 +463,20 @@ const Status: React.FC = () => {
           {/* Alerts */}
           <div className="card rounded-4 border-0 shadow-sm mb-4">
             <div className="card-body">
-              <h5 className="card-title mb-3">
-                <i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle', marginRight: 8 }}>
-                  warning
-                </i>
-                Active Alerts ({alerts.length})
-              </h5>
+              <div className="d-flex justify-content-between align-items-center mb-3">
+                <h5 className="card-title mb-0">
+                  <i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle', marginRight: 8 }}>
+                    warning
+                  </i>
+                  Active Alerts ({alerts.length})
+                </h5>
+                <button
+                  className="btn btn-sm btn-outline-secondary"
+                  onClick={() => navigate('/alert-summary')}
+                >
+                  View All Alerts
+                </button>
+              </div>
               {alerts.length === 0 ? (
                 <div className="alert alert-success mb-0">
                   <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle', marginRight: 8 }}>
@@ -397,11 +535,11 @@ const Status: React.FC = () => {
                   <i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle', marginRight: 8 }}>
                     history
                   </i>
-                  Recent Executions (Last 10)
+                  Recent Executions ({Math.min(executions.length, 10)} of {executions.length})
                 </h5>
                 <button
                   className="btn btn-sm btn-primary"
-                  onClick={() => navigate('/execution-workload-manager')}
+                  onClick={() => navigate('/smart-execution/history')}
                 >
                   View All
                 </button>
@@ -423,37 +561,70 @@ const Status: React.FC = () => {
                         <th>Started</th>
                         <th>Duration</th>
                         <th>Operations</th>
+                        <th>Success Rate</th>
+                        <th></th>
                       </tr>
                     </thead>
                     <tbody>
-                      {executions.slice(0, 10).map(exec => (
-                        <tr key={exec.execution_id}>
-                          <td>
-                            <code style={{ fontSize: '0.75rem' }}>
-                              {exec.execution_id.substring(0, 20)}...
-                            </code>
-                          </td>
-                          <td>
-                            <span
-                              className="badge"
-                              style={{ backgroundColor: getExecutionStatusColor(exec.status), color: '#fff' }}
-                            >
-                              {exec.status}
-                            </span>
-                          </td>
-                          <td>{new Date(exec.started_at).toLocaleString()}</td>
-                          <td>
-                            {exec.duration_minutes !== undefined && exec.duration_minutes !== null
-                              ? `${exec.duration_minutes.toFixed(2)} min`
-                              : 'N/A'}
-                          </td>
-                          <td>
-                            {exec.successful_operations !== undefined && exec.total_operations !== undefined
-                              ? `${exec.successful_operations}/${exec.total_operations}`
-                              : 'N/A'}
-                          </td>
-                        </tr>
-                      ))}
+                      {executions.slice(0, 10).map(exec => {
+                        const startTime = getExecStartTime(exec);
+                        const isRunning = exec.status?.toUpperCase() === 'RUNNING';
+                        return (
+                          <tr
+                            key={exec.execution_id}
+                            style={{ cursor: 'pointer' }}
+                            onClick={() => {
+                              if (isRunning) {
+                                navigate(`/smart-execution/monitor/${exec.execution_id}`);
+                              } else {
+                                navigate(`/smart-execution/report/${exec.execution_id}`);
+                              }
+                            }}
+                          >
+                            <td>
+                              <code style={{ fontSize: '0.75rem' }}>
+                                {exec.execution_id.length > 24
+                                  ? exec.execution_id.substring(0, 24) + '...'
+                                  : exec.execution_id}
+                              </code>
+                            </td>
+                            <td>
+                              <span
+                                className="badge"
+                                style={{ backgroundColor: getExecutionStatusColor(exec.status), color: '#fff' }}
+                              >
+                                {exec.status}
+                              </span>
+                            </td>
+                            <td>{startTime ? new Date(startTime).toLocaleString() : 'N/A'}</td>
+                            <td>
+                              {exec.duration_minutes != null
+                                ? `${exec.duration_minutes.toFixed(1)} min`
+                                : 'N/A'}
+                            </td>
+                            <td>
+                              {exec.successful_operations != null && exec.total_operations != null
+                                ? `${exec.successful_operations}/${exec.total_operations}`
+                                : 'N/A'}
+                            </td>
+                            <td>
+                              {exec.success_rate != null
+                                ? <span style={{
+                                    color: exec.success_rate >= 90 ? '#28a745' : exec.success_rate >= 70 ? '#ffc107' : '#dc3545',
+                                    fontWeight: 600
+                                  }}>
+                                    {exec.success_rate.toFixed(1)}%
+                                  </span>
+                                : 'N/A'}
+                            </td>
+                            <td>
+                              <i className="material-icons-outlined" style={{ fontSize: 18, color: '#6c757d' }}>
+                                {isRunning ? 'visibility' : 'description'}
+                              </i>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

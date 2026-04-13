@@ -24,11 +24,6 @@ interface Testbed {
   status?: string;
 }
 
-interface EntityOperation {
-  entity: string;
-  operations: string[];
-}
-
 interface AISettings {
   enable_ai: boolean;
   enable_ml: boolean;
@@ -49,7 +44,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
   // State
   const [testbeds, setTestbeds] = useState<Testbed[]>([]);
   const [selectedTestbed, setSelectedTestbed] = useState<string>('');
-  const [availableEntities, setAvailableEntities] = useState<string[]>([
+  const [availableEntities] = useState<string[]>([
     'vm', 'project', 'category', 'image', 'subnet', 'cluster', 'alert',
     'endpoint', 'library_variable', 'runbook',
     'blueprint_single_vm', 'blueprint_multi_vm', 'playbook',
@@ -72,7 +67,6 @@ const SmartExecutionConfigureAI: React.FC = () => {
   const [availablePods, setAvailablePods] = useState<string[]>([]);
   const [selectedNamespaces, setSelectedNamespaces] = useState<string[]>([]);
   const [selectedPods, setSelectedPods] = useState<string[]>([]);
-  const [customQueries, setCustomQueries] = useState<string>('');
   const [loadingPods, setLoadingPods] = useState<boolean>(false);
   
   // AI Settings
@@ -101,6 +95,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
   const [parallelExecution, setParallelExecution] = useState<boolean>(true);
   const [autoCleanup, setAutoCleanup] = useState<boolean>(false);
   const [timeoutMinutes, setTimeoutMinutes] = useState<number>(0);
+  const [sustainMinutes, setSustainMinutes] = useState<number>(5);
   
   // Pre-check
   const [preCheckResult, setPreCheckResult] = useState<any>(null);
@@ -168,7 +163,9 @@ const SmartExecutionConfigureAI: React.FC = () => {
         }
         if (cfg.entities_config) setSelectedEntities(cfg.entities_config);
         if (cfg.tags) setTags(cfg.tags);
-      } catch {}
+      } catch (err) {
+        console.warn('Failed to parse rerun config:', err);
+      }
     }
   }, []);
 
@@ -182,14 +179,19 @@ const SmartExecutionConfigureAI: React.FC = () => {
   const fetchTestbeds = async () => {
     try {
       const response = await fetch(`${getApiBase()}/api/get-testbeds`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success && data.testbeds) {
-          setTestbeds(data.testbeds);
-        }
+      if (!response.ok) {
+        setError(`Failed to load testbeds (HTTP ${response.status})`);
+        return;
+      }
+      const data = await response.json();
+      if (data.success && data.testbeds) {
+        setTestbeds(data.testbeds);
+      } else {
+        setError(data.error || 'Failed to load testbeds');
       }
     } catch (err) {
       console.error('Error fetching testbeds:', err);
+      setError('Could not connect to backend to load testbeds');
     }
   };
 
@@ -198,8 +200,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
     
     setLoadingPods(true);
     try {
-      // FAKE DATA MODE or provide sensible defaults
-      if (IS_FAKE_MODE || true) {  // Always use defaults for now
+      if (IS_FAKE_MODE) {
         await new Promise(resolve => setTimeout(resolve, 500));
         
         // Default namespaces commonly used in Kubernetes/Nutanix
@@ -420,7 +421,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
       });
       const data = await res.json();
       setPreCheckResult(data.success ? data.checks : { passed: false, warnings: [data.error || 'Pre-check failed'] });
-    } catch (err) {
+    } catch (_err) {
       setPreCheckResult({ passed: false, warnings: ['Could not reach backend'] });
     } finally {
       setRunningPreCheck(false);
@@ -441,14 +442,17 @@ const SmartExecutionConfigureAI: React.FC = () => {
     setLoading(true);
     setError('');
     
+    const useAiEndpoint = aiSettings.enable_ai;
+    
     try {
-      const config: any = {
+      const config: Record<string, unknown> = {
         testbed_id: selectedTestbed,
         target_config: {
           cpu_threshold: cpuThreshold,
           memory_threshold: memoryThreshold,
           stop_condition: stopCondition,
           timeout_minutes: timeoutMinutes > 0 ? timeoutMinutes : undefined,
+          sustain_minutes: sustainMinutes,
           longevity: longevityEnabled ? {
             enabled: true,
             duration_hours: longevityDuration,
@@ -463,7 +467,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
         rule_config: {
           namespaces: selectedNamespaces,
           pod_names: selectedPods,
-          custom_queries: customQueries ? JSON.parse(customQueries) : []
+          custom_queries: []
         },
         ai_settings: aiSettings,
         advanced: {
@@ -483,7 +487,11 @@ const SmartExecutionConfigureAI: React.FC = () => {
         }
       };
       
-      const response = await fetch(`${getApiBase()}/api/smart-execution/start`, {
+      const endpoint = useAiEndpoint
+        ? `${getApiBase()}/api/smart-execution/start-ai`
+        : `${getApiBase()}/api/smart-execution/start`;
+      
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config)
@@ -492,9 +500,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
       if (response.ok) {
         const data = await response.json();
         if (data.success && data.execution_id) {
-          // Navigate to monitoring page or history
-          // The standard endpoint returns execution_id
-          navigate(`/smart-execution/history`);
+          navigate(`/smart-execution/monitor/${data.execution_id}`);
         } else {
           setError(data.error || 'Failed to start execution');
         }
@@ -504,7 +510,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
       }
     } catch (err) {
       console.error('Error starting execution:', err);
-      setError('Error starting execution');
+      setError('Error starting execution. Make sure backend is running.');
     } finally {
       setLoading(false);
     }
@@ -964,6 +970,17 @@ const SmartExecutionConfigureAI: React.FC = () => {
                     onChange={(e) => setTimeoutMinutes(Number(e.target.value))} />
                 </label>
               </div>
+
+              <div className="threshold-input">
+                <label>
+                  Sustain at threshold (minutes)
+                  <input type="number" min="0" max="60" value={sustainMinutes}
+                    onChange={(e) => setSustainMinutes(Number(e.target.value))} />
+                  <small style={{ display: 'block', color: '#64748b', marginTop: 4, fontSize: '0.8em' }}>
+                    Hold load at target CPU/memory for this duration before stopping. 0 = stop immediately.
+                  </small>
+                </label>
+              </div>
             </div>
 
             <div className="ai-toggles" style={{ marginTop: 16 }}>
@@ -1086,7 +1103,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
               <label>Duration (hours)</label>
               <input type="number" min={1} max={720} value={longevityDuration}
                 onChange={(e) => setLongevityDuration(Number(e.target.value))} />
-              <small style={{ color: '#64748b' }}>0 = run indefinitely until stopped</small>
+              <small style={{ color: '#64748b' }}>Minimum 1 hour, max 720 hours (30 days)</small>
             </div>
             <div>
               <label>Churn Interval (min)</label>
@@ -1152,7 +1169,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
           disabled={loading || !selectedTestbed || Object.keys(selectedEntities).length === 0}
           className="btn-primary"
         >
-          {loading ? '⏳ Starting...' : '🚀 Start AI Execution'}
+          {loading ? '⏳ Starting...' : aiSettings.enable_ai ? '🚀 Start AI Execution' : '🚀 Start Execution'}
         </button>
         
         <button

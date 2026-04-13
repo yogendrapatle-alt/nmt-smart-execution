@@ -21,7 +21,7 @@ export const SMTPConfiguration: React.FC<SMTPConfigurationProps> = ({
       } else {
         setConnectionStatus(`❌ Connection failed: ${result.message}`);
       }
-    } catch (error) {
+    } catch (_error) {
       setConnectionStatus('❌ Connection test failed');
     }
   };

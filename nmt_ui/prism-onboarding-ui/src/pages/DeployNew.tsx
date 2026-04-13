@@ -1,5 +1,4 @@
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
 
 // Import the component directly - it already has its own layout
 import TestbedConfiguration from './TestbedConfiguration';

@@ -103,8 +103,8 @@ const TestbedActivity: React.FC = () => {
     }
   };
   
-  const getSuccessRate = (exec: Execution) => {
-    if (exec.total_operations === 0) return 0;
+  const getSuccessRate = (exec: Execution): string => {
+    if (exec.total_operations === 0) return '0.0';
     return ((exec.successful_operations / exec.total_operations) * 100).toFixed(1);
   };
   

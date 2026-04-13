@@ -73,7 +73,7 @@ const DynamicWorkload: React.FC = () => {
 			if (!res.ok) throw new Error('Failed to fetch workload');
 			const json = await res.json();
 			handleWorkloadLoaded(json);
-		} catch (err) {
+		} catch (_err) {
 			alert('Failed to fetch workload from backend.');
 		}
 	};
@@ -225,35 +225,6 @@ const DynamicWorkload: React.FC = () => {
 			setSuccessMsg('Workload upload failed: ' + err);
 			setShowSuccess(true);
 			setTimeout(() => setShowSuccess(false), 10000);
-		}
-	};
-
-	const handleRunDynamicJobs = async () => {
-		setWorkloadExecuting(true);
-		setWorkloadStatus('Executing dynamic workload jobs...');
-		try {
-			// Always use localhost:5000 for backend in development
-			const backendUrl = getApiBase();
-			const res = await fetch(`${backendUrl}/api/run-dynamic-workload`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' }
-			});
-			const result = await res.json();
-			if (res.ok && result.success) {
-				setWorkloadStatus('Dynamic workload is created successfully, jobs will be executed after deployment and prometheus configuration is successful');
-				console.log('Dynamic workload execution output:', result.output);
-				return true;
-			} else {
-				setWorkloadStatus(`Dynamic workload execution failed: ${result.error || 'Unknown error'}`);
-				console.error('Dynamic workload execution failed:', result);
-				return false;
-			}
-		} catch (err) {
-			setWorkloadStatus(`Error running dynamic workload jobs: ${err}`);
-			console.error('Error running dynamic workload jobs:', err);
-			return false;
-		} finally {
-			setWorkloadExecuting(false);
 		}
 	};
 

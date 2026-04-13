@@ -417,7 +417,7 @@ const TestbedConfiguration: React.FC = () => {
                                     const text = await file.text();
                                     const json = JSON.parse(text);
                                     setSelectedEnv({ label: file.name.replace(/\.json$/i, ''), value: 'uploaded', json });
-                                  } catch (err) {
+                                  } catch (_err) {
                                     alert('Invalid JSON file.');
                                   }
                                   e.target.value = '';

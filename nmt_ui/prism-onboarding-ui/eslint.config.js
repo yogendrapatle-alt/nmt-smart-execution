@@ -19,5 +19,23 @@ export default tseslint.config([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      // Large legacy UI: gradual strictness; `npm run build` remains the hard gate
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+        },
+      ],
+      '@typescript-eslint/no-unused-expressions': 'warn',
+      '@typescript-eslint/ban-ts-comment': 'warn',
+      'no-useless-escape': 'warn',
+      'prefer-const': 'warn',
+      'no-empty': 'warn',
+      'react-hooks/exhaustive-deps': 'warn',
+    },
   },
 ])

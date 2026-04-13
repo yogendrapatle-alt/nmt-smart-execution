@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import ntnxLogo from '../assets/new_nutanix_logo.png';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeExecutions, getFakeExecutionById } from '../fake-data';
 import { getApiBase } from '../utils/backendUrl';
@@ -73,7 +72,7 @@ interface ExecutionHistoryItem {
 
 const ExecutionWorkloadManager: React.FC = () => {
   const navigate = useNavigate();
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   
   // State
   const [testbeds, setTestbeds] = useState<Testbed[]>([]);
@@ -302,9 +301,13 @@ const ExecutionWorkloadManager: React.FC = () => {
     try {
       if (IS_FAKE_MODE) {
         const statusData = getFakeExecutionById(execId);
-        setExecutionStatus(statusData as ExecutionStatus);
+        if (!statusData.success) {
+          return;
+        }
+        const live = statusData as ExecutionStatus;
+        setExecutionStatus(live);
         
-        if (statusData.status && ['COMPLETED', 'FAILED', 'STOPPED', 'ERROR'].includes(statusData.status)) {
+        if (live.status && ['COMPLETED', 'FAILED', 'STOPPED', 'ERROR'].includes(live.status)) {
           if (pollIntervalRef.current) {
             clearInterval(pollIntervalRef.current);
             pollIntervalRef.current = null;

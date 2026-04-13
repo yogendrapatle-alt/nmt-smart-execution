@@ -40,7 +40,7 @@ const MultiTestbedMonitor: React.FC = () => {
     fetchStatus();
     
     // Auto-refresh every 3 seconds if enabled and not completed
-    let interval: NodeJS.Timeout | null = null;
+    let interval: ReturnType<typeof setInterval> | null = null;
     
     if (autoRefresh && status?.status === 'running') {
       interval = setInterval(fetchStatus, 3000);

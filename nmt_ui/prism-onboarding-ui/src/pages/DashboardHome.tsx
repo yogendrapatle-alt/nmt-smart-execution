@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { IS_FAKE_MODE } from '../config/fakeMode';
-import { getFakeTestbeds, getFakeAlerts, getFakeExecutions } from '../fake-data';
+import { getFakeTestbeds, getFakeAlerts } from '../fake-data';
 import { getApiBase } from '../utils/backendUrl';
 
 interface DashboardStats {
@@ -50,7 +50,6 @@ const DashboardHome: React.FC = () => {
         await new Promise(resolve => setTimeout(resolve, 600));
         const testbedsData = getFakeTestbeds();
         const alertsData = getFakeAlerts();
-        const executionsData = getFakeExecutions();
         
         const today = new Date().toISOString().split('T')[0];
         const allAlerts = alertsData.alerts || [];
@@ -614,19 +613,5 @@ const DashboardHome: React.FC = () => {
     </div>
   );
 };
-
-// Helper function outside component
-function formatTimestamp(date: Date): string {
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-  const diffHours = Math.floor(diffMs / 3600000);
-  const diffDays = Math.floor(diffMs / 86400000);
-
-  if (diffMins < 1) return 'Just now';
-  if (diffMins < 60) return `${diffMins} min${diffMins > 1 ? 's' : ''} ago`;
-  if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
-  return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
-}
 
 export default DashboardHome;

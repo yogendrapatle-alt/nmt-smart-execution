@@ -54,8 +54,26 @@ fi
 
 rm -f /tmp/nmt-verify-body.html
 
-code_api="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/api/" 2>/dev/null || echo 000)"
-[[ "$code_api" =~ ^(200|401|404|405)$ ]] && ok "GET /api/ → HTTP $code_api (backend reachable)" || warn "GET /api/ → HTTP $code_api"
+# Health through nginx (needs SELinux httpd_can_network_connect on RHEL/Rocky)
+code_api="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/api/health" 2>/dev/null || echo 000)"
+# Same path, direct to Flask (isolates nginx/SELinux vs backend down)
+code_direct="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:5000/api/health" 2>/dev/null || echo 000)"
+
+if [[ "$code_direct" == "200" ]]; then
+  ok "GET http://127.0.0.1:5000/api/health → HTTP $code_direct (Flask listening)"
+else
+  bad "direct backend GET /api/health → HTTP $code_direct — check: journalctl -u nmt-backend -n 80 --no-pager"
+fi
+
+if [[ "$code_api" == "200" ]]; then
+  ok "GET /api/health (via nginx) → HTTP $code_api"
+elif [[ "$code_api" == "502" ]] && [[ "$code_direct" == "200" ]]; then
+  bad "nginx returns 502 but Flask responds on :5000 — usually SELinux: setsebool -P httpd_can_network_connect 1 && systemctl restart nginx"
+elif [[ "$code_api" =~ ^(401|404|405)$ ]]; then
+  warn "GET /api/health (via nginx) → HTTP $code_api"
+else
+  bad "GET /api/health (via nginx) → HTTP $code_api"
+fi
 
 echo "==> Summary"
 if [[ "$fail" -eq 0 ]]; then

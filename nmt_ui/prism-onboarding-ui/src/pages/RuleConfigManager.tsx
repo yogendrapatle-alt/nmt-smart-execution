@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import RuleBuilderExperimental from '../components/RuleBuilderExperimental';
-import ntnxLogo from '../assets/new_nutanix_logo.png';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeRulesByTestbed } from '../fake-data';
 import { getApiBase } from '../utils/backendUrl';
@@ -91,7 +90,7 @@ const RuleConfigManager: React.FC = () => {
       if (IS_FAKE_MODE) {
         await new Promise(resolve => setTimeout(resolve, 400));
         const data = getFakeRulesByTestbed(testbedId);
-        setRules(data.rules || []);
+        setRules((data.rules || []) as unknown as Rule[]);
         setLoading(false);
         return;
       }

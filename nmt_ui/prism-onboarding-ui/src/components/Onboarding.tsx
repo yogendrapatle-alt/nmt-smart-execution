@@ -120,7 +120,7 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
       } else {
         setError(data.error || 'Unknown error');
       }
-    } catch (err) {
+    } catch (_err) {
       setError('Failed to connect to backend');
     }
 

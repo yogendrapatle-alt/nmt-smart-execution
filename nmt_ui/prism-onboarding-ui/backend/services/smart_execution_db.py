@@ -29,8 +29,10 @@ def save_smart_execution(execution_data: Dict) -> bool:
                     setattr(existing, key, value)
             logger.debug(f"Updated smart execution: {execution_id}")
         else:
-            # Create new
-            execution = SmartExecution(**execution_data)
+            # Create new — filter to only known model columns
+            valid_cols = {c.name for c in SmartExecution.__table__.columns}
+            filtered = {k: v for k, v in execution_data.items() if k in valid_cols}
+            execution = SmartExecution(**filtered)
             session.add(execution)
             logger.info(f"Created new smart execution: {execution_id}")
         

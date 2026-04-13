@@ -121,9 +121,22 @@ class SmartExecutionEngineAI:
         # Performance tracking
         self.phase_durations = {}
         self.recommendations_used = []
+
+        # Sustain mode: hold load at threshold for N minutes before stopping
+        self._sustain_minutes = target_config.get('sustain_minutes',
+                                                   target_config.get('advanced', {}).get('sustain_minutes', 5))
+        self._sustain_start_time: Optional[datetime] = None
+        self._sustain_hysteresis_pct = 5.0
+        self._sustain_stats: Dict[str, Any] = {
+            'entered_at': None, 'duration_seconds': 0,
+            'reescalations': 0, 'min_cpu': 999, 'max_cpu': 0,
+            'min_memory': 999, 'max_memory': 0, 'ops_during_sustain': 0,
+            'sustain_ops_per_minute': 0, 'stress_pod_restarts': 0,
+        }
         
         logger.info(f"🤖 AI Smart Execution Engine initialized for {execution_id}")
         logger.info(f"   Target: {self.target_cpu}% CPU, {self.target_memory}% Memory")
+        logger.info(f"   Sustain: {self._sustain_minutes} minutes after threshold")
         logger.info(f"   ML Enabled: {self.enable_ml}, PID Enabled: {self.adaptive_controller is not None}")
     
     def _try_load_existing_model(self):
@@ -191,8 +204,44 @@ class SmartExecutionEngineAI:
                     action['recommended_operations']
                 )
             
-            # Add stop condition
-            action['should_stop'] = threshold_reached and self.phase == 'maintain'
+            # Sustain logic: hold at threshold instead of immediate stop
+            should_stop = False
+            is_in_sustain = self.phase == 'sustaining'
+            if threshold_reached and self.phase == 'maintain':
+                now = datetime.now(timezone.utc)
+                if self._sustain_start_time is None:
+                    self._sustain_start_time = now
+                    self._sustain_stats['entered_at'] = now.isoformat()
+                    self.phase = 'sustaining'
+                    is_in_sustain = True
+                    logger.info(f"🎯 Threshold reached! Sustaining for {self._sustain_minutes}m. CPU={current_cpu:.1f}%, Mem={current_memory:.1f}%")
+
+            if is_in_sustain or (threshold_reached and self.phase == 'sustaining'):
+                now = datetime.now(timezone.utc)
+                elapsed_min = (now - self._sustain_start_time).total_seconds() / 60 if self._sustain_start_time else 0
+                self._sustain_stats['duration_seconds'] = elapsed_min * 60
+                self._sustain_stats['min_cpu'] = min(self._sustain_stats['min_cpu'], current_cpu)
+                self._sustain_stats['max_cpu'] = max(self._sustain_stats['max_cpu'], current_cpu)
+                self._sustain_stats['min_memory'] = min(self._sustain_stats['min_memory'], current_memory)
+                self._sustain_stats['max_memory'] = max(self._sustain_stats['max_memory'], current_memory)
+                sustain_ops = self._sustain_stats.get('ops_during_sustain', 0)
+                self._sustain_stats['sustain_ops_per_minute'] = round(sustain_ops / max(elapsed_min, 0.1), 1)
+
+                cpu_floor = self.target_cpu - self._sustain_hysteresis_pct
+                mem_floor = self.target_memory - self._sustain_hysteresis_pct
+                if current_cpu < cpu_floor or current_memory < mem_floor:
+                    self._sustain_stats['reescalations'] = self._sustain_stats.get('reescalations', 0) + 1
+                    action['operations_per_minute'] = max(action['operations_per_minute'], 30.0)
+                    logger.info(f"📉 Load dropped during sustain, increasing ops. CPU={current_cpu:.1f}%, Mem={current_memory:.1f}%")
+                else:
+                    action['operations_per_minute'] = max(action['operations_per_minute'], 15.0)
+
+                if elapsed_min >= self._sustain_minutes:
+                    logger.info(f"✅ Sustain complete ({self._sustain_minutes}m). CPU={current_cpu:.1f}%, Mem={current_memory:.1f}%. "
+                               f"Ops during sustain: {sustain_ops} ({self._sustain_stats['sustain_ops_per_minute']}/min)")
+                    should_stop = True
+
+            action['should_stop'] = should_stop
             
             # Track metrics
             self.metrics_history.append({

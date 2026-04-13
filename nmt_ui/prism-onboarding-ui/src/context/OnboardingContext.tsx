@@ -44,6 +44,8 @@ export const OnboardingProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   );
 };
 
+// Hook is intentionally co-located with provider; fast-refresh wants components-only files.
+// eslint-disable-next-line react-refresh/only-export-components
 export const useOnboarding = () => {
   const ctx = useContext(OnboardingContext);
   if (!ctx) throw new Error('useOnboarding must be used within OnboardingProvider');
