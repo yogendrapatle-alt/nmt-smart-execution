@@ -141,7 +141,11 @@ class SmartExecutionController:
         
         # Configurable parallelism from target_config (UI-driven)
         adv = target_config.get('advanced', {})
-        self.operations_per_iteration = adv.get('operations_per_iteration', 5)
+        self.operations_per_iteration = (
+            target_config.get('operations_per_iteration')
+            or adv.get('operations_per_iteration')
+            or 5
+        )
         self.iteration_delay_seconds = adv.get('iteration_delay_seconds', 5)
         self.backoff_on_failure = True
         self.current_backoff_multiplier = 1.0
@@ -1686,6 +1690,8 @@ class SmartExecutionController:
         
         is_sustaining = self.status in ("SUSTAINING", "LONGEVITY_SUSTAINING")
 
+        user_target = self.operations_per_iteration
+
         if min_delta > 40:
             operations = int(self.max_operations_per_cycle * 2.0 * combined_mult)
         elif min_delta > 20:
@@ -1693,27 +1699,22 @@ class SmartExecutionController:
         elif min_delta > 10:
             operations = int(self.max_operations_per_cycle * 0.8 * combined_mult)
         elif min_delta > 5:
-            operations = int(self.max_operations_per_cycle * 0.4 * combined_mult)
+            operations = max(int(self.max_operations_per_cycle * 0.4 * combined_mult), user_target)
         elif min_delta > 0:
-            operations = max(int(self.min_operations_per_cycle * combined_mult), 1)
+            operations = max(int(user_target * 0.8 * combined_mult), self.min_operations_per_cycle)
         elif is_sustaining:
-            # At or above threshold during sustain: keep real NCM API pressure
-            # to genuinely stress the cluster — not just fire-and-forget
             cpu_target = self.target_config.get('cpu_threshold', 80)
             cpu_margin = cpu - cpu_target
             if cpu_margin < 0:
-                # Below target during sustain — push harder
-                operations = max(self._sustain_min_ops + 3, self.operations_per_iteration)
+                operations = max(self._sustain_min_ops + 3, user_target)
             elif cpu_margin < 5:
-                # Near threshold — maintain steady pressure
-                operations = self._sustain_min_ops + 2
+                operations = max(self._sustain_min_ops + 2, int(user_target * 0.7))
             else:
-                # Well above threshold — keep minimum real ops flowing
-                operations = self._sustain_min_ops
+                operations = max(self._sustain_min_ops, int(user_target * 0.5))
         else:
-            operations = 0
+            operations = max(int(user_target * 0.5), self.min_operations_per_cycle)
         
-        return max(operations, 0)
+        return max(operations, self.min_operations_per_cycle)
     
     async def _track_operation_impact(self, operations_batch: List[Dict], metrics_before: Dict, metrics_after: Dict):
         """Track which operations caused metric changes using duration-weighted attribution."""

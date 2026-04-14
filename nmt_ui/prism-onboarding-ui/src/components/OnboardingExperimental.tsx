@@ -41,8 +41,6 @@ const OnboardingExperimental: React.FC<Props> = ({ onSubmit }) => {
     try {
       // Always use localhost:5000 for backend in development
       const backendUrl = getApiBase();
-      console.log('Backend URL:', backendUrl);
-      console.log('Full URL:', `${backendUrl}/api/expose-prometheus`);
       
       const res = await fetch(`${backendUrl}/api/expose-prometheus`, {
         method: 'POST',

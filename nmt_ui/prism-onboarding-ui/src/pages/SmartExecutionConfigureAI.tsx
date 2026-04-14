@@ -134,6 +134,20 @@ const SmartExecutionConfigureAI: React.FC = () => {
   });
   const [showLongevitySettings, setShowLongevitySettings] = useState<boolean>(false);
 
+  // Execution Identity
+  const [executionName, setExecutionName] = useState<string>('');
+  const [executionDescription, setExecutionDescription] = useState<string>('');
+
+  // Wizard step
+  const [currentStep, setCurrentStep] = useState<number>(0);
+  const STEPS = [
+    { label: 'Identity', icon: 'badge' },
+    { label: 'Entities', icon: 'apps' },
+    { label: 'Thresholds', icon: 'tune' },
+    { label: 'Advanced', icon: 'settings' },
+    { label: 'Review', icon: 'checklist' },
+  ];
+
   // UI State
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
@@ -447,6 +461,8 @@ const SmartExecutionConfigureAI: React.FC = () => {
     try {
       const config: Record<string, unknown> = {
         testbed_id: selectedTestbed,
+        execution_name: executionName || undefined,
+        execution_description: executionDescription || undefined,
         target_config: {
           cpu_threshold: cpuThreshold,
           memory_threshold: memoryThreshold,
@@ -516,18 +532,54 @@ const SmartExecutionConfigureAI: React.FC = () => {
     }
   };
 
+  const canProceed = (step: number): boolean => {
+    if (step === 0) return !!selectedTestbed;
+    if (step === 1) return Object.keys(selectedEntities).length > 0;
+    return true;
+  };
+
   return (
     <div className="smart-execution-configure-ai">
       <div className="page-header">
-        <h1>🤖 AI-Powered Smart Execution</h1>
+        <h1><i className="material-icons-outlined" style={{ fontSize: 28, verticalAlign: 'middle' }}>smart_toy</i> AI-Powered Smart Execution</h1>
         <p>Configure intelligent threshold-based execution with PID control and ML optimization</p>
       </div>
 
       {error && <div className="error-banner">{error}</div>}
 
-      {/* Testbed Selection */}
+      {/* Step Progress Indicator */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 0, marginBottom: 24, padding: '16px 0', overflowX: 'auto' }}>
+        {STEPS.map((step, idx) => (
+          <React.Fragment key={idx}>
+            {idx > 0 && <div style={{ width: 40, height: 2, background: idx <= currentStep ? '#3b82f6' : '#e2e8f0', flexShrink: 0 }} />}
+            <button
+              onClick={() => setCurrentStep(idx)}
+              style={{
+                display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4,
+                background: 'none', border: 'none', cursor: 'pointer', padding: '4px 12px', minWidth: 80
+              }}
+            >
+              <div style={{
+                width: 36, height: 36, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: idx === currentStep ? '#3b82f6' : idx < currentStep ? '#22c55e' : '#e2e8f0',
+                color: idx <= currentStep ? 'white' : '#94a3b8', transition: 'all 0.2s'
+              }}>
+                <i className="material-icons-outlined" style={{ fontSize: 18 }}>
+                  {idx < currentStep ? 'check' : step.icon}
+                </i>
+              </div>
+              <span style={{ fontSize: 11, fontWeight: idx === currentStep ? 600 : 400, color: idx === currentStep ? '#3b82f6' : '#64748b' }}>
+                {step.label}
+              </span>
+            </button>
+          </React.Fragment>
+        ))}
+      </div>
+
+      {/* Step 0: Identity - Testbed + Name */}
+      {currentStep === 0 && <>
       <section className="config-section">
-        <h2>1️⃣ Select Testbed</h2>
+        <h2><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>dns</i> Select Testbed</h2>
         <select
           value={selectedTestbed}
           onChange={(e) => setSelectedTestbed(e.target.value)}
@@ -542,9 +594,46 @@ const SmartExecutionConfigureAI: React.FC = () => {
         </select>
       </section>
 
-      {/* Target Configuration */}
+      {/* Execution Identity */}
       <section className="config-section">
-        <h2>2️⃣ Target Thresholds</h2>
+        <h2>Execution Identity</h2>
+        <div className="threshold-grid">
+          <div className="threshold-input" style={{ flex: 2 }}>
+            <label>
+              Execution Name (optional)
+              <input
+                type="text"
+                value={executionName}
+                onChange={(e) => setExecutionName(e.target.value.slice(0, 60))}
+                placeholder={selectedTestbed ? `${testbeds.find(t => t.unique_testbed_id === selectedTestbed)?.testbed_label || 'Run'} - ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}` : 'e.g. PE-173 Soak Run'}
+                maxLength={60}
+                style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #ddd', fontSize: '14px' }}
+              />
+            </label>
+            <small style={{ color: '#888', fontSize: '12px' }}>{executionName.length}/60 characters</small>
+          </div>
+        </div>
+        <div style={{ marginTop: '12px' }}>
+          <label>
+            Description / Notes (optional)
+            <textarea
+              value={executionDescription}
+              onChange={(e) => setExecutionDescription(e.target.value.slice(0, 500))}
+              placeholder="Purpose of this run, e.g. Pre-upgrade soak test for AOS 6.8"
+              maxLength={500}
+              rows={2}
+              style={{ width: '100%', padding: '8px 12px', borderRadius: '8px', border: '1px solid #ddd', fontSize: '14px', resize: 'vertical' }}
+            />
+          </label>
+          <small style={{ color: '#888', fontSize: '12px' }}>{executionDescription.length}/500 characters</small>
+        </div>
+      </section>
+      </>}
+
+      {/* Step 2: Thresholds + AI */}
+      {currentStep === 2 && <>
+      <section className="config-section">
+        <h2><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>tune</i> Target Thresholds</h2>
         <div className="threshold-grid">
           <div className="threshold-input">
             <label>
@@ -597,7 +686,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
 
       {/* AI/ML Settings */}
       <section className="config-section ai-settings">
-        <h2>🤖 AI/ML Settings</h2>
+        <h2><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>psychology</i> AI/ML Settings</h2>
         <div className="ai-toggles">
           <label className="toggle-switch">
             <input
@@ -644,7 +733,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
               disabled={loadingRecommendations || !selectedTestbed}
               className="btn-secondary"
             >
-              {loadingRecommendations ? '⏳ Loading...' : '💡 Get ML Recommendations'}
+              {loadingRecommendations ? 'Loading...' : 'Get ML Recommendations'}
             </button>
             
             {mlRecommendations.length > 0 && (
@@ -672,9 +761,12 @@ const SmartExecutionConfigureAI: React.FC = () => {
         )}
       </section>
 
-      {/* Entity/Operation Selection */}
+      </>}
+
+      {/* Step 1: Entity/Operation Selection */}
+      {currentStep === 1 && <>
       <section className="config-section">
-        <h2>3️⃣ Select Entities & Operations</h2>
+        <h2><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>apps</i> Select Entities & Operations</h2>
         <div style={{ marginBottom: '12px', display: 'flex', gap: '8px' }}>
           <button
             type="button"
@@ -747,20 +839,21 @@ const SmartExecutionConfigureAI: React.FC = () => {
             : 'None'}
         </div>
       </section>
+      </>}
 
-      {/* Advanced Settings */}
+      {/* Step 3: Advanced Settings */}
+      {currentStep === 3 && <>
       <section className="config-section">
-        <h2 onClick={() => setShowAdvanced(!showAdvanced)} style={{ cursor: 'pointer' }}>
-          ⚙️ Advanced Settings {showAdvanced ? '▼' : '▶'}
+        <h2>
+          <i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>settings</i> Advanced Settings
         </h2>
         
-        {showAdvanced && (
-          <div className="advanced-settings">
+        <div className="advanced-settings">
             <div className="advanced-group">
               <h3>Monitoring Rules</h3>
               
               {loadingPods ? (
-                <div className="loading-pods">⏳ Loading available namespaces and pods...</div>
+                <div className="loading-pods">Loading available namespaces and pods...</div>
               ) : (
                 <>
                   <label>
@@ -917,7 +1010,6 @@ const SmartExecutionConfigureAI: React.FC = () => {
               </div>
             )}
           </div>
-        )}
       </section>
 
       {/* Advanced Execution Settings */}
@@ -1154,14 +1246,35 @@ const SmartExecutionConfigureAI: React.FC = () => {
         )}
       </section>
 
-      {/* Pre-Check & Action Buttons */}
+      </>}
+
+      {/* Step 4: Review & Launch */}
+      {currentStep === 4 && <>
+      <section className="config-section" style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 12, padding: 20 }}>
+        <h2><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>checklist</i> Review Configuration</h2>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, fontSize: 14 }}>
+          <div><strong>Testbed:</strong> {testbeds.find(t => t.unique_testbed_id === selectedTestbed)?.testbed_label || '-'}</div>
+          <div><strong>Name:</strong> {executionName || <span className="text-muted">Auto-generated</span>}</div>
+          <div><strong>CPU Target:</strong> {cpuThreshold}%</div>
+          <div><strong>Memory Target:</strong> {memoryThreshold}%</div>
+          <div><strong>Stop Condition:</strong> {stopCondition}</div>
+          <div><strong>AI Enabled:</strong> {aiSettings.enable_ai ? 'Yes' : 'No'}</div>
+          <div><strong>ML Enabled:</strong> {aiSettings.enable_ml ? 'Yes' : 'No'}</div>
+          <div><strong>Profile:</strong> {workloadProfile}</div>
+          <div><strong>Max Parallel Ops:</strong> {maxParallelOps}</div>
+          <div><strong>Entities:</strong> {Object.keys(selectedEntities).length} types, {Object.values(selectedEntities).flat().length} operations</div>
+          {longevityEnabled && <div><strong>Longevity:</strong> {longevityDuration}h</div>}
+          {tags.length > 0 && <div><strong>Tags:</strong> {tags.join(', ')}</div>}
+        </div>
+      </section>
+
       <section className="action-buttons">
         <button
           onClick={runPreCheck}
           disabled={runningPreCheck || !selectedTestbed}
           className="btn-secondary"
         >
-          {runningPreCheck ? '⏳ Checking...' : '🔍 Pre-flight Check'}
+          {runningPreCheck ? 'Checking...' : 'Pre-flight Check'}
         </button>
 
         <button
@@ -1169,7 +1282,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
           disabled={loading || !selectedTestbed || Object.keys(selectedEntities).length === 0}
           className="btn-primary"
         >
-          {loading ? '⏳ Starting...' : aiSettings.enable_ai ? '🚀 Start AI Execution' : '🚀 Start Execution'}
+          {loading ? 'Starting...' : aiSettings.enable_ai ? 'Start AI Execution' : 'Start Execution'}
         </button>
         
         <button
@@ -1182,10 +1295,10 @@ const SmartExecutionConfigureAI: React.FC = () => {
 
       {preCheckResult && (
         <section className="config-section" style={{ marginTop: 16, border: preCheckResult.passed ? '2px solid #22c55e' : '2px solid #ef4444' }}>
-          <h2>{preCheckResult.passed ? '✅ Pre-check Passed' : '❌ Pre-check Issues Found'}</h2>
+          <h2>{preCheckResult.passed ? <><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle', color: '#22c55e' }}>check_circle</i> Pre-check Passed</> : <><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle', color: '#dc3545' }}>error</i> Pre-check Issues Found</>}</h2>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
             <div style={{ padding: 8, borderRadius: 8, background: preCheckResult.prometheus ? '#f0fdf4' : '#fef2f2' }}>
-              <strong>{preCheckResult.prometheus ? '✅' : '❌'} Prometheus</strong>
+              <strong><i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', color: preCheckResult.prometheus ? '#22c55e' : '#dc3545' }}>{preCheckResult.prometheus ? 'check_circle' : 'cancel'}</i> Prometheus</strong>
               {preCheckResult.baseline_cpu !== undefined && (
                 <div style={{ fontSize: 13, color: '#64748b' }}>
                   CPU: {preCheckResult.baseline_cpu?.toFixed(1)}% | Mem: {preCheckResult.baseline_memory?.toFixed(1)}%
@@ -1193,10 +1306,10 @@ const SmartExecutionConfigureAI: React.FC = () => {
               )}
             </div>
             <div style={{ padding: 8, borderRadius: 8, background: preCheckResult.ncm_api ? '#f0fdf4' : '#fef2f2' }}>
-              <strong>{preCheckResult.ncm_api ? '✅' : '⚠️'} NCM API</strong>
+              <strong><i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', color: preCheckResult.ncm_api ? '#22c55e' : '#f59e0b' }}>{preCheckResult.ncm_api ? 'check_circle' : 'warning'}</i> NCM API</strong>
             </div>
             <div style={{ padding: 8, borderRadius: 8, background: preCheckResult.resources ? '#f0fdf4' : '#fef2f2' }}>
-              <strong>{preCheckResult.resources ? '✅' : '⚠️'} Resources</strong>
+              <strong><i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', color: preCheckResult.resources ? '#22c55e' : '#f59e0b' }}>{preCheckResult.resources ? 'check_circle' : 'warning'}</i> Resources</strong>
               {preCheckResult.image && <div style={{ fontSize: 13, color: '#64748b' }}>Image: {preCheckResult.image}</div>}
               {preCheckResult.cluster && <div style={{ fontSize: 13, color: '#64748b' }}>Cluster: {preCheckResult.cluster}</div>}
             </div>
@@ -1205,13 +1318,41 @@ const SmartExecutionConfigureAI: React.FC = () => {
             <div style={{ marginTop: 12 }}>
               {preCheckResult.warnings.map((w: string, i: number) => (
                 <div key={i} style={{ padding: '6px 10px', background: '#fff7ed', border: '1px solid #fdba74', borderRadius: 6, marginBottom: 4, fontSize: 13 }}>
-                  ⚠️ {w}
+                  <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle' }}>warning</i> {w}
                 </div>
               ))}
             </div>
           )}
         </section>
       )}
+      </>}
+
+      {/* Step Navigation Buttons */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 24, padding: '16px 0', borderTop: '1px solid #e2e8f0' }}>
+        <button
+          onClick={() => setCurrentStep(Math.max(0, currentStep - 1))}
+          disabled={currentStep === 0}
+          className="btn-secondary"
+          style={{ opacity: currentStep === 0 ? 0.5 : 1 }}
+        >
+          <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle' }}>arrow_back</i> Previous
+        </button>
+        <span style={{ color: '#64748b', fontSize: 13, alignSelf: 'center' }}>
+          Step {currentStep + 1} of {STEPS.length}
+        </span>
+        {currentStep < STEPS.length - 1 ? (
+          <button
+            onClick={() => setCurrentStep(Math.min(STEPS.length - 1, currentStep + 1))}
+            disabled={!canProceed(currentStep)}
+            className="btn-primary"
+            style={{ opacity: !canProceed(currentStep) ? 0.5 : 1 }}
+          >
+            Next <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle' }}>arrow_forward</i>
+          </button>
+        ) : (
+          <div />
+        )}
+      </div>
     </div>
   );
 };

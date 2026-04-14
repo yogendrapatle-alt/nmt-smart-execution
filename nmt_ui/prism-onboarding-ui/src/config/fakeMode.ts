@@ -21,11 +21,8 @@
 export const IS_FAKE_MODE = import.meta.env.VITE_FAKE_DATA_MODE === 'true';
 
 // Log mode on startup (helps debugging)
-if (IS_FAKE_MODE) {
-  console.log('%c🎬 FAKE DATA MODE ENABLED', 'color: #ff9800; font-size: 16px; font-weight: bold;');
-  console.log('%cApp is displaying DEMO data. No real backend calls.', 'color: #ff9800;');
-} else {
-  console.log('✅ REAL DATA MODE - Connected to backend');
+if (IS_FAKE_MODE && import.meta.env.DEV) {
+  console.log('%cFAKE DATA MODE ENABLED', 'color: #ff9800; font-size: 14px; font-weight: bold;');
 }
 
 export default IS_FAKE_MODE;

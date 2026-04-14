@@ -24,6 +24,17 @@ interface RecentActivity {
   color: string;
 }
 
+interface ExecutionSummary {
+  execution_id: string;
+  execution_name?: string;
+  testbed_label: string;
+  status: string;
+  start_time: string;
+  duration_minutes?: number;
+  success_rate?: number;
+  total_operations?: number;
+}
+
 const DashboardHome: React.FC = () => {
   const navigate = useNavigate();
   const [stats, setStats] = useState<DashboardStats>({
@@ -33,6 +44,8 @@ const DashboardHome: React.FC = () => {
     alertsBySeverity: { Critical: 0, Moderate: 0, Low: 0 }
   });
   const [recentActivity, setRecentActivity] = useState<RecentActivity[]>([]);
+  const [recentExecutions, setRecentExecutions] = useState<ExecutionSummary[]>([]);
+  const [executionStats, setExecutionStats] = useState({ running: 0, last24h: 0, avgSuccessRate: 0, total: 0 });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -101,29 +114,21 @@ const DashboardHome: React.FC = () => {
       // Always use localhost:5000 for backend in development
       const backendUrl = getApiBase();
       
-      console.log('Fetching dashboard data from:', backendUrl);
-
-      // Fetch testbeds
       const testbedsRes = await fetch(`${backendUrl}/api/get-testbeds`);
-      console.log('Testbeds response status:', testbedsRes.status);
       
       if (!testbedsRes.ok) {
         throw new Error(`Testbeds API returned ${testbedsRes.status}`);
       }
       
       const testbedsData = await testbedsRes.json();
-      console.log('Testbeds data:', testbedsData);
       
-      // Fetch alerts
       const alertsRes = await fetch(`${backendUrl}/api/alerts`);
-      console.log('Alerts response status:', alertsRes.status);
       
       if (!alertsRes.ok) {
         throw new Error(`Alerts API returned ${alertsRes.status}`);
       }
       
       const alertsData = await alertsRes.json();
-      console.log('Alerts data:', alertsData);
 
       // Calculate today's date in UTC
       const today = new Date().toISOString().split('T')[0];
@@ -150,12 +155,6 @@ const DashboardHome: React.FC = () => {
       const allTestbeds = testbedsData.testbeds || [];
       const uniqueRuleCount = allTestbeds.length;
 
-      console.log('Setting stats:', {
-        totalTestbeds: allTestbeds.length,
-        savedRules: uniqueRuleCount,
-        alertsToday: alertsToday.length,
-        alertsBySeverity: severityCounts
-      });
 
       setStats({
         totalTestbeds: allTestbeds.length,
@@ -203,7 +202,24 @@ const DashboardHome: React.FC = () => {
       activities.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
       setRecentActivity(activities.slice(0, 5));
 
-      console.log('Dashboard data loaded successfully');
+      // Fetch smart execution data
+      try {
+        const execRes = await fetch(`${backendUrl}/api/smart-execution/history`);
+        if (execRes.ok) {
+          const execData = await execRes.json();
+          const allExecs: ExecutionSummary[] = execData.executions || [];
+          const now = Date.now();
+          const h24 = 24 * 60 * 60 * 1000;
+          const running = allExecs.filter(e => e.status === 'RUNNING' || e.status === 'LONGEVITY_SUSTAINING' || e.status === 'SUSTAINING');
+          const last24 = allExecs.filter(e => e.start_time && (now - new Date(e.start_time).getTime()) < h24);
+          const ratesArr = allExecs.slice(0, 10).map(e => e.success_rate ?? 0);
+          const avgRate = ratesArr.length ? ratesArr.reduce((a, b) => a + b, 0) / ratesArr.length : 0;
+          setExecutionStats({ running: running.length, last24h: last24.length, avgSuccessRate: avgRate, total: allExecs.length });
+          setRecentExecutions(allExecs.slice(0, 5));
+        }
+      } catch {
+        // Non-critical; execution stats are optional
+      }
 
     } catch (err) {
       console.error('Error fetching dashboard data:', err);
@@ -384,6 +400,126 @@ const DashboardHome: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Execution Overview Cards */}
+      <div className="row row-cols-1 row-cols-md-2 row-cols-xl-4 g-3 mb-4">
+        <div className="col">
+          <div className="card rounded-4 border-0 shadow-sm h-100">
+            <div className="card-body">
+              <div className="d-flex align-items-center gap-3">
+                <div style={{ width: 50, height: 50, borderRadius: 12, background: 'linear-gradient(135deg, #22c55e, #16a34a)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>play_circle</i>
+                </div>
+                <div>
+                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Running Now</p>
+                  <h3 className="mb-0 mt-1 fw-bold">{executionStats.running}</h3>
+                </div>
+                {executionStats.running > 0 && (
+                  <button className="btn btn-sm btn-outline-success ms-auto rounded-pill" onClick={() => navigate('/smart-execution/history')}>View</button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="col">
+          <div className="card rounded-4 border-0 shadow-sm h-100">
+            <div className="card-body">
+              <div className="d-flex align-items-center gap-3">
+                <div style={{ width: 50, height: 50, borderRadius: 12, background: 'linear-gradient(135deg, #3b82f6, #2563eb)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>schedule</i>
+                </div>
+                <div>
+                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Last 24h</p>
+                  <h3 className="mb-0 mt-1 fw-bold">{executionStats.last24h}</h3>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="col">
+          <div className="card rounded-4 border-0 shadow-sm h-100">
+            <div className="card-body">
+              <div className="d-flex align-items-center gap-3">
+                <div style={{ width: 50, height: 50, borderRadius: 12, background: `linear-gradient(135deg, ${executionStats.avgSuccessRate >= 90 ? '#22c55e' : executionStats.avgSuccessRate >= 70 ? '#f59e0b' : '#ef4444'}, ${executionStats.avgSuccessRate >= 90 ? '#16a34a' : executionStats.avgSuccessRate >= 70 ? '#d97706' : '#dc2626'})`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>trending_up</i>
+                </div>
+                <div>
+                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Avg Success Rate</p>
+                  <h3 className="mb-0 mt-1 fw-bold">{executionStats.avgSuccessRate.toFixed(1)}%</h3>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="col">
+          <div className="card rounded-4 border-0 shadow-sm h-100">
+            <div className="card-body">
+              <div className="d-flex align-items-center gap-3">
+                <div style={{ width: 50, height: 50, borderRadius: 12, background: 'linear-gradient(135deg, #8b5cf6, #7c3aed)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>science</i>
+                </div>
+                <div>
+                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Total Executions</p>
+                  <h3 className="mb-0 mt-1 fw-bold">{executionStats.total}</h3>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Recent Executions Timeline */}
+      {recentExecutions.length > 0 && (
+        <div className="row g-3 mb-4">
+          <div className="col-12">
+            <div className="card rounded-4 border-0 shadow-sm">
+              <div className="card-body">
+                <div className="d-flex align-items-center justify-content-between mb-3">
+                  <h5 className="mb-0 fw-bold">Recent Executions</h5>
+                  <button className="btn btn-sm btn-outline-primary rounded-pill" onClick={() => navigate('/smart-execution/history')}>View All</button>
+                </div>
+                <div className="table-responsive">
+                  <table className="table table-sm table-hover mb-0 align-middle">
+                    <thead className="table-light">
+                      <tr>
+                        <th>Execution</th>
+                        <th>Testbed</th>
+                        <th className="text-center">Status</th>
+                        <th className="text-center">Duration</th>
+                        <th className="text-center">Success</th>
+                        <th className="text-center">Ops</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {recentExecutions.map(exec => {
+                        const sColor = exec.status === 'COMPLETED' ? 'success' : exec.status === 'RUNNING' || exec.status === 'SUSTAINING' || exec.status === 'LONGEVITY_SUSTAINING' ? 'primary' : exec.status === 'FAILED' ? 'danger' : 'secondary';
+                        return (
+                          <tr key={exec.execution_id} style={{ cursor: 'pointer' }} onClick={() => navigate(`/smart-execution/report/${exec.execution_id}`)}>
+                            <td>
+                              {exec.execution_name ? (
+                                <span className="fw-semibold">{exec.execution_name}</span>
+                              ) : (
+                                <code className="small text-muted">{exec.execution_id.substring(0, 18)}...</code>
+                              )}
+                            </td>
+                            <td><span className="badge bg-secondary bg-opacity-10 text-secondary rounded-pill">{exec.testbed_label}</span></td>
+                            <td className="text-center"><span className={`badge bg-${sColor} bg-opacity-10 text-${sColor} rounded-pill`}>{exec.status}</span></td>
+                            <td className="text-center text-muted small">{exec.duration_minutes ? `${exec.duration_minutes.toFixed(0)}m` : '-'}</td>
+                            <td className="text-center fw-semibold">{exec.success_rate != null ? `${exec.success_rate.toFixed(0)}%` : '-'}</td>
+                            <td className="text-center text-muted">{exec.total_operations ?? '-'}</td>
+                            <td className="text-end"><i className="material-icons-outlined text-muted" style={{ fontSize: 16 }}>chevron_right</i></td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main Content Row */}
       <div className="row g-3">

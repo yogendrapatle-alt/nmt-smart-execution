@@ -175,7 +175,6 @@ const RuleConfigManager: React.FC = () => {
       
       // Auto-deploy rules after successful save
       if (savedRuleId) {
-        console.log('[DEBUG] Auto-deploying rules after save...');
         await handleDeployRules();
       }
     } catch (error) {

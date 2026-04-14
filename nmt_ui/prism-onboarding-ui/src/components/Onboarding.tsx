@@ -40,8 +40,6 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
     try {
       // Always use localhost:5000 for backend in development
       const backendUrl = getApiBase();
-      console.log('Backend URL:', backendUrl);
-      console.log('Full URL:', `${backendUrl}/api/expose-prometheus`);
 
       // Step 1: Discover NCM IP and expose Prometheus
       const res = await fetch(`${backendUrl}/api/expose-prometheus`, {
@@ -65,11 +63,6 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
           updatePcUuid(data.pc_uuid);
         }
         
-        // Step 2: Automatically save testbed to database with discovered NCM IP
-        console.log('✅ NCM Discovery Successful - Saving testbed to database...');
-        console.log('📍 NCM IP:', data.ncm_ip);
-        console.log('📍 NCM Node:', data.ncm_node);
-        
         try {
           const testbedData = {
             testbed_label: form.ncmLabel || `Testbed-${form.pcIp}`,
@@ -89,7 +82,6 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
             }
           };
 
-          console.log('📤 Sending testbed data to database...');
           const saveRes = await fetch(`${backendUrl}/api/upload-testbed`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -99,16 +91,11 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
           const saveData = await saveRes.json();
           
           if (saveData.success) {
-            console.log('✅ Testbed saved successfully with NCM IP:', data.ncm_ip);
-            console.log('📋 Testbed ID:', saveData.unique_testbed_id);
-            
-            // Store unique_testbed_id for later use
             if (saveData.unique_testbed_id) {
               localStorage.setItem('unique_testbed_id', saveData.unique_testbed_id);
-              console.log('💾 Stored testbed ID in localStorage:', saveData.unique_testbed_id);
             }
           } else {
-            console.warn('⚠️ Failed to save testbed to database:', saveData.error);
+            console.warn('Failed to save testbed to database:', saveData.error);
             // Don't fail the entire onboarding - NCM discovery succeeded
           }
         } catch (saveErr) {

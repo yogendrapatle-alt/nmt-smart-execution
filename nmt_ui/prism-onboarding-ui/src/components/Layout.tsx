@@ -19,20 +19,12 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
       try {
         // Always use localhost:5000 for backend in development
         const backendUrl = getApiBase();
-        console.log('Layout: Fetching alert count from:', backendUrl);
-        
         const res = await fetch(`${backendUrl}/api/alerts`);
-        console.log('Layout: Alert count response status:', res.status);
-        
         if (res.ok) {
           const data = await res.json();
-          console.log('Layout: Alert count data:', data);
           setAlertCount(data.count || 0);
-        } else {
-          console.warn('Layout: Failed to fetch alert count, status:', res.status);
         }
-      } catch (error) {
-        console.error('Layout: Failed to fetch alert count:', error);
+      } catch {
         // Don't show error to user - just keep count at 0
       }
     };
@@ -126,85 +118,101 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
 
             {/* Alert Summary */}
             <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/alert-summary'); }}
-                className={isActivePath('/alert-summary') ? 'active' : ''}
-              >
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/alert-summary'); }} className={isActivePath('/alert-summary') ? 'active' : ''}>
                 <i className="material-icons-outlined">notifications_active</i>
                 <span>Alert Summary</span>
               </a>
             </li>
 
-            <li className="menu-label">EXECUTION</li>
-
-            {/* Execution Workload Manager */}
+            {/* Alert Configuration */}
             <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/execution-workload-manager'); }}
-                className={isActivePath('/execution-workload-manager') ? 'active' : ''}
-              >
-                <i className="material-icons-outlined">play_circle</i>
-                <span>Execution Workload</span>
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/alert-configuration'); }} className={isActivePath('/alert-configuration') ? 'active' : ''}>
+                <i className="material-icons-outlined">tune</i>
+                <span>Alert Configuration</span>
               </a>
             </li>
 
+            <li className="menu-label">EXECUTION</li>
+
             {/* Smart Execution - Threshold-Based */}
             <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/smart-execution'); }}
-                className={isActivePath('/smart-execution') ? 'active' : ''}
-              >
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/smart-execution'); }} className={isActivePath('/smart-execution') || isActivePath('/smart-execution/configure') ? 'active' : ''}>
                 <i className="material-icons-outlined">psychology</i>
                 <span>Smart Execution</span>
               </a>
             </li>
-            
+
             {/* Smart Execution History */}
             <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/smart-execution/history'); }}
-                className={isActivePath('/smart-execution/history') ? 'active' : ''}
-              >
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/smart-execution/history'); }} className={isActivePath('/smart-execution/history') ? 'active' : ''}>
                 <i className="material-icons-outlined">history</i>
                 <span>Execution History</span>
               </a>
             </li>
 
+            {/* Scheduled Executions */}
+            <li>
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/scheduled-executions'); }} className={isActivePath('/scheduled-executions') ? 'active' : ''}>
+                <i className="material-icons-outlined">event</i>
+                <span>Scheduled Executions</span>
+              </a>
+            </li>
+
             {/* ML Insights */}
             <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/ml-insights'); }}
-                className={isActivePath('/ml-insights') ? 'active' : ''}
-              >
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/ml-insights'); }} className={isActivePath('/ml-insights') ? 'active' : ''}>
                 <i className="material-icons-outlined">model_training</i>
                 <span>ML Insights</span>
               </a>
             </li>
 
+            <li className="menu-label">ANALYTICS</li>
+
+            {/* Analytics Dashboard */}
+            <li>
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/analytics/dashboard'); }} className={isActivePath('/analytics/dashboard') ? 'active' : ''}>
+                <i className="material-icons-outlined">insights</i>
+                <span>Analytics Dashboard</span>
+              </a>
+            </li>
+
+            {/* Execution Comparison */}
+            <li>
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/analytics/comparison'); }} className={isActivePath('/analytics/comparison') ? 'active' : ''}>
+                <i className="material-icons-outlined">compare</i>
+                <span>Execution Comparison</span>
+              </a>
+            </li>
+
+            {/* Executive Summary */}
+            <li>
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/analytics/executive-summary'); }} className={isActivePath('/analytics/executive-summary') ? 'active' : ''}>
+                <i className="material-icons-outlined">summarize</i>
+                <span>Executive Summary</span>
+              </a>
+            </li>
+
+            <li className="menu-label">ADVANCED</li>
+
+            {/* Execution Workload Manager */}
+            <li>
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/execution-workload-manager'); }} className={isActivePath('/execution-workload-manager') ? 'active' : ''}>
+                <i className="material-icons-outlined">play_circle</i>
+                <span>Execution Workload</span>
+              </a>
+            </li>
+
             {/* Dynamic Workload (Legacy) */}
             <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/dynamic-workload'); }}
-                className={isActivePath('/dynamic-workload') ? 'active' : ''}
-              >
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/dynamic-workload'); }} className={isActivePath('/dynamic-workload') ? 'active' : ''}>
                 <i className="material-icons-outlined">trending_up</i>
-                <span>Dynamic Workload (Legacy)</span>
+                <span>Dynamic Workload</span>
               </a>
             </li>
 
             {/* Status & Monitoring */}
             <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/status'); }}
-                className={isActivePath('/status') ? 'active' : ''}
-              >
+              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/status'); }} className={isActivePath('/status') ? 'active' : ''}>
                 <i className="material-icons-outlined">show_chart</i>
                 <span>Status & Monitoring</span>
               </a>

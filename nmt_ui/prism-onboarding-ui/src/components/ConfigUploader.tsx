@@ -17,7 +17,6 @@ const ConfigUploader: React.FC<ConfigUploaderProps> = ({ onConfigLoaded }) => {
           alert('Invalid config file! Must contain a top-level "Config" key.');
           return;
         }
-        console.log('[ConfigUploader] Parsed config JSON:', json);
         onConfigLoaded(json);
       } catch {
         alert('Invalid config file!');

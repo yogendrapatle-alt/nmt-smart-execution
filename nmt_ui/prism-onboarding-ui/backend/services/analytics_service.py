@@ -60,17 +60,17 @@ class AnalyticsService:
                 if not executions:
                     return self._empty_overview()
                 
-                # Calculate metrics
+                # Calculate metrics (case-insensitive status comparison)
                 total_executions = len(executions)
-                completed = sum(1 for e in executions if e.status == 'completed')
-                failed = sum(1 for e in executions if e.status == 'failed')
-                running = sum(1 for e in executions if e.status == 'running')
+                completed = sum(1 for e in executions if (e.status or '').upper() == 'COMPLETED')
+                failed = sum(1 for e in executions if (e.status or '').upper() in ('FAILED', 'TIMEOUT', 'ERROR'))
+                running = sum(1 for e in executions if (e.status or '').upper() == 'RUNNING')
+                stopped = sum(1 for e in executions if (e.status or '').upper() == 'STOPPED')
                 
-                success_rate = (completed / total_executions * 100) if total_executions > 0 else 0
-                
-                # Total operations
+                # Use operation-level success rate (more accurate than just counting COMPLETED executions)
                 total_operations = sum(e.total_operations or 0 for e in executions)
                 successful_operations = sum(e.successful_operations or 0 for e in executions)
+                success_rate = (successful_operations / total_operations * 100) if total_operations > 0 else 0
                 
                 # Average duration
                 durations = [e.duration_minutes for e in executions if e.duration_minutes]
@@ -302,31 +302,21 @@ class AnalyticsService:
         try:
             from database import SessionLocal
             from models.smart_execution import SmartExecution
-            from models.cost_tracker import CostTracker
             
             session = SessionLocal()
             try:
-                # Get all executions
                 executions = session.query(SmartExecution).filter(
                     SmartExecution.start_time >= start_date,
                     SmartExecution.start_time <= end_date
                 ).all()
                 
-                # Get cost data
-                costs = session.query(CostTracker).filter(
-                    CostTracker.execution_date >= start_date,
-                    CostTracker.execution_date <= end_date
-                ).all()
-                
-                # Calculate key metrics
+                # Calculate key metrics (case-insensitive status)
                 total_executions = len(executions)
-                completed = sum(1 for e in executions if e.status == 'completed')
-                success_rate = (completed / total_executions * 100) if total_executions > 0 else 0
-                
-                total_cost = sum(c.total_cost for c in costs)
-                avg_cost = total_cost / len(costs) if costs else 0
+                completed = sum(1 for e in executions if (e.status or '').upper() == 'COMPLETED')
                 
                 total_operations = sum(e.total_operations or 0 for e in executions)
+                successful_operations = sum(e.successful_operations or 0 for e in executions)
+                success_rate = (successful_operations / total_operations * 100) if total_operations > 0 else 0
                 
                 # Get testbed with most executions
                 testbed_counts = defaultdict(int)
@@ -351,12 +341,11 @@ class AnalyticsService:
                         'icon': '⚠️'
                     })
                 
-                if total_cost > 0:
-                    cost_per_op = total_cost / total_operations if total_operations > 0 else 0
+                if total_operations > 0:
                     insights.append({
                         'type': 'info',
-                        'message': f'Average cost per operation: ${cost_per_op:.4f}',
-                        'icon': '💰'
+                        'message': f'{successful_operations:,} of {total_operations:,} operations succeeded ({success_rate:.1f}%)',
+                        'icon': 'check_circle'
                     })
                 
                 if most_active_testbed[1] > total_executions * 0.5:
@@ -376,8 +365,8 @@ class AnalyticsService:
                         'total_executions': total_executions,
                         'success_rate': round(success_rate, 2),
                         'total_operations': total_operations,
-                        'total_cost': round(total_cost, 2),
-                        'avg_cost_per_execution': round(avg_cost, 2)
+                        'successful_operations': successful_operations,
+                        'completed_executions': completed,
                     },
                     'insights': insights,
                     'most_active_testbed': {
@@ -448,15 +437,17 @@ class AnalyticsService:
             values = [e.final_metrics.get('final_memory', 0) for e in executions if e.final_metrics]
             return sum(values) / len(values) if values else 0
         elif metric == 'success_rate':
-            completed = sum(1 for e in executions if e.status == 'completed')
-            return (completed / len(executions) * 100) if executions else 0
+            total_ops = sum(e.total_operations or 0 for e in executions)
+            successful_ops = sum(e.successful_operations or 0 for e in executions)
+            return (successful_ops / total_ops * 100) if total_ops > 0 else 0
         return 0
     
     def _calculate_testbed_metrics(self, executions, testbed_id):
         """Calculate metrics for a testbed"""
         total = len(executions)
-        completed = sum(1 for e in executions if e.status == 'completed')
-        success_rate = (completed / total * 100) if total > 0 else 0
+        total_ops = sum(e.total_operations or 0 for e in executions)
+        successful_ops = sum(e.successful_operations or 0 for e in executions)
+        success_rate = (successful_ops / total_ops * 100) if total_ops > 0 else 0
         
         total_ops = sum(e.total_operations or 0 for e in executions)
         avg_duration = sum(e.duration_minutes or 0 for e in executions) / total if total > 0 else 0
@@ -472,13 +463,15 @@ class AnalyticsService:
     def _calculate_period_metrics(self, executions, period_name):
         """Calculate metrics for a time period"""
         total = len(executions)
-        completed = sum(1 for e in executions if e.status == 'completed')
+        completed = sum(1 for e in executions if (e.status or '').upper() == 'COMPLETED')
+        total_ops = sum(e.total_operations or 0 for e in executions)
+        successful_ops = sum(e.successful_operations or 0 for e in executions)
         
         return {
             'name': period_name,
             'total_executions': total,
             'completed_executions': completed,
-            'success_rate': round((completed / total * 100) if total > 0 else 0, 2),
+            'success_rate': round((successful_ops / total_ops * 100) if total_ops > 0 else 0, 2),
             'total_operations': sum(e.total_operations or 0 for e in executions),
             'avg_duration': round(sum(e.duration_minutes or 0 for e in executions) / total if total > 0 else 0, 2)
         }

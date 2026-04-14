@@ -93,7 +93,6 @@ const TestbedConfiguration: React.FC = () => {
   
       if (res.ok) {
         const result = await res.json();
-        console.log('Testbed saved successfully:', result.filename);
   
         localStorage.setItem('filename', result.filename);
         localStorage.setItem('testbed_filepath', result.filepath);

@@ -36,12 +36,14 @@ import AnalyticsDashboard from './pages/AnalyticsDashboard';
 import AnalyticsComparison from './pages/AnalyticsComparison';
 import ExecutiveSummary from './pages/ExecutiveSummary';
 import ErrorBoundaryTest from './pages/ErrorBoundaryTest';
+import { ToastProvider } from './context/ToastContext';
 
 const App: React.FC = () => {
   const [, setIsAuthenticated] = React.useState(false);
   const [, setOnboarded] = React.useState(false);
 
   return (
+    <ToastProvider>
     <Router>
       <Routes>
         {/* All pages now use Layout for consistent sidebar + header */}
@@ -88,6 +90,7 @@ const App: React.FC = () => {
         <Route path="/loading" element={<Layout><Loading /></Layout>} />
       </Routes>
     </Router>
+    </ToastProvider>
   );
 };
 

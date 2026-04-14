@@ -555,12 +555,50 @@ const ExecutionWorkloadManager: React.FC = () => {
 
       {/* Page Header */}
       <div className="mb-4">
-        <h2 className="fw-bold mb-2 d-flex align-items-center gap-2">
-          <i className="material-icons-outlined text-primary" style={{ fontSize: 32 }}>trending_up</i>
-          Execution Workload Manager
-        </h2>
-        <p className="text-muted mb-0">Configure and execute load generation workloads on your testbeds</p>
+        <div className="d-flex justify-content-between align-items-start flex-wrap gap-3">
+          <div>
+            <h2 className="fw-bold mb-1 d-flex align-items-center gap-2">
+              <div className="d-inline-flex align-items-center justify-content-center rounded-3" style={{ width: 48, height: 48, background: 'linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%)' }}>
+                <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>trending_up</i>
+              </div>
+              Execution Workload Manager
+            </h2>
+            <p className="text-muted mb-0" style={{ maxWidth: 700 }}>
+              Build and run custom workloads on your testbed. A workload defines which entities (VMs, projects, images, etc.) to create, update, or delete, and how many of each. Use this to generate API load for performance testing.
+            </p>
+          </div>
+        </div>
       </div>
+
+      {/* How it works */}
+      {!isExecuting && !selectedTestbed && (
+        <div className="card rounded-4 border shadow-none mb-4" style={{ background: 'linear-gradient(135deg, #eff6ff 0%, #f5f3ff 100%)' }}>
+          <div className="card-body p-4">
+            <h6 className="fw-bold mb-3 d-flex align-items-center gap-2">
+              <i className="material-icons-outlined text-primary" style={{ fontSize: 20 }}>help_outline</i>
+              How It Works
+            </h6>
+            <div className="row g-3">
+              {[
+                { icon: 'dns', title: '1. Select Testbed', desc: 'Choose which Nutanix cluster to run the workload against' },
+                { icon: 'settings', title: '2. Configure Entities', desc: 'Pick entity types (VM, Project, etc.) and how many to create/update/delete' },
+                { icon: 'tune', title: '3. Set Parameters', desc: 'Define duration, parallelism, and distribution pattern' },
+                { icon: 'rocket_launch', title: '4. Execute & Monitor', desc: 'Start the workload and track progress in real-time' },
+              ].map((s, i) => (
+                <div className="col-md-3" key={i}>
+                  <div className="d-flex align-items-start gap-2">
+                    <i className="material-icons-outlined flex-shrink-0" style={{ fontSize: 22, color: '#3b82f6' }}>{s.icon}</i>
+                    <div>
+                      <div className="fw-semibold small">{s.title}</div>
+                      <div className="text-muted" style={{ fontSize: '0.78rem' }}>{s.desc}</div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Messages */}
       {successMessage && (
@@ -1141,10 +1179,13 @@ const ExecutionWorkloadManager: React.FC = () => {
             <div className="card rounded-4 shadow-none border">
               <div className="card-body p-4">
                 <div className="d-flex justify-content-between align-items-center mb-4">
-                  <h5 className="card-title mb-0 d-flex align-items-center gap-2">
-                    <i className="material-icons-outlined text-primary" style={{ fontSize: 24 }}>history</i>
-                    <span className="fw-semibold">Execution History</span>
-                  </h5>
+                  <div>
+                    <h5 className="card-title mb-0 d-flex align-items-center gap-2">
+                      <i className="material-icons-outlined text-primary" style={{ fontSize: 24 }}>history</i>
+                      <span className="fw-semibold">Execution History</span>
+                    </h5>
+                    <p className="text-muted small mb-0 mt-1">Previous workload runs — shows status, operations completed, and duration for each execution</p>
+                  </div>
                   <button
                     onClick={fetchExecutionHistory}
                     className="btn btn-outline-secondary btn-sm rounded-3"

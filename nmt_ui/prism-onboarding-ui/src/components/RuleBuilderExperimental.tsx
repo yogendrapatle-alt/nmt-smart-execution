@@ -102,7 +102,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
   const isSimpleMode = testbedContext?.simpleMode || false;
   // Handler for config upload
   const handleConfigLoaded = (json: any) => {
-    console.log('[DEBUG] handleConfigLoaded received:', JSON.stringify(json, null, 2));
     try {
       // Support nested rule groups (e.g., 'Pod Rules', 'Node Rules')
       const config = json?.Config;
@@ -275,7 +274,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
       return;
     }
     const config = await loadConfig(pc_ip);
-    console.log('[DEBUG] handleFetchConfig loaded config:', JSON.stringify(config, null, 2));
     if (config && config.config) {
       handleConfigLoaded(config.config);
     } else if (config) {
@@ -328,7 +326,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
   // Load initialConfig when provided (for editing existing rules)
   useEffect(() => {
     if (initialConfig) {
-      console.log('[DEBUG] Loading initialConfig for editing:', initialConfig);
       try {
         handleConfigLoaded({ Config: initialConfig });
       } catch (error) {
@@ -683,7 +680,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
   
     // Simple mode: Just call onSave callback and return
     if (isSimpleMode) {
-      console.log('[DEBUG] Simple mode: Calling onSave with config');
       onSave(configJson.Config);
       return;
     }
@@ -721,7 +717,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
   );
     if (ruleUploadResponse.ok) {
       const ruleUploadResult = await ruleUploadResponse.json();
-      console.log("Rule config saved successfully:", ruleUploadResult.filename);
     } else {
       console.error("Failed to save rule config to submitted-rules folder");
     }
@@ -740,7 +735,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
         alert("Missing testbed UUID or PC IP – either upload a testbed first or provide PC IP in config!");
         return;
       }
-      console.log("Immediately deploying config to remote server...");
       const backendUrl2 = getApiBase();
       const deployResponse = await fetch(
         `${backendUrl2}/api/deploy-config-immediate`,
@@ -758,8 +752,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
     
       const deployResult = await deployResponse.json();
       if (deployResult.success) {
-        console.log("Config deployed immediately:", deployResult.message);
-        console.log("Remote output:", deployResult.stdout);
         setShowSuccess(true);
       } else {
         console.error("Failed to deploy config immediately:", deployResult.error);
@@ -799,7 +791,6 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
   
     if (res.ok) {
       const result = await res.json();
-      console.log("Config saved to database for future retrieval.");
   
       // ✅ Store unique_rule_id in localStorage
       localStorage.setItem('unique_rule_id', result.unique_rule_id);

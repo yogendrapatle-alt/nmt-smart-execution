@@ -303,7 +303,9 @@ def start_ai_execution():
             'engine': ai_engine,
             'thread': None,
             'start_time': datetime.now(timezone.utc).isoformat(),
-            'testbed_id': data['testbed_id']
+            'testbed_id': data['testbed_id'],
+            'execution_name': data.get('execution_name', ''),
+            'execution_description': data.get('execution_description', '')
         }
         
         # Start execution in background thread
@@ -376,6 +378,8 @@ def monitor_ai_execution(execution_id):
             status_data = {
                 'success': True,
                 'execution_id': execution_id,
+                'execution_name': exec_data.get('execution_name', ''),
+                'execution_description': exec_data.get('execution_description', ''),
                 'phase': engine.phase,
                 'iteration': engine.iteration,
                 'total_operations': engine.total_operations_executed,
@@ -798,6 +802,8 @@ def _save_execution_to_db(execution_id, testbed_info, config, engine):
         try:
             execution = SmartExecution(
                 execution_id=execution_id,
+                execution_name=config.get('execution_name', ''),
+                execution_description=config.get('execution_description', ''),
                 testbed_id=testbed_info['unique_testbed_id'],
                 pc_ip=testbed_info['pc_ip'],
                 ncm_ip=testbed_info['ncm_ip'],

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import ReactApexChart from 'react-apexcharts';
 import { getApiBase } from '../utils/backendUrl';
 
 /** Actionable copy when cluster health cannot be loaded (Phase 1 empty states). */
@@ -199,10 +200,7 @@ function csvEscapeCell(val: string): string {
 }
 
 function downloadRowsAsCsv(rows: Record<string, unknown>[], filename: string): void {
-  if (!rows.length) {
-    window.alert('No rows to export.');
-    return;
-  }
+  if (!rows.length) return;
   const keys = Object.keys(rows[0]);
   const header = keys.map((k) => csvEscapeCell(k)).join(',');
   const lines = rows.map((row) =>
@@ -221,6 +219,8 @@ function downloadRowsAsCsv(rows: Record<string, unknown>[], filename: string): v
 
 interface ReportData {
   execution_id: string;
+  execution_name?: string;
+  execution_description?: string;
   status: string;
   testbed_label: string;
   start_time: string;
@@ -275,6 +275,7 @@ const SmartExecutionReport: React.FC = () => {
   const [downloading, setDownloading] = useState(false);
   const [downloadingEnhanced, setDownloadingEnhanced] = useState(false);
   const [enhancedUnavailable, setEnhancedUnavailable] = useState(false);
+  const [shareCopied, setShareCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<'overview' | 'spikes' | 'health' | 'failures' | 'capacity' | 'iterations' | 'heatmap' | 'latency' | 'errors'>('overview');
   const [expandedIterations, setExpandedIterations] = useState<Set<number>>(new Set());
   const [expandedEffectiveOps, setExpandedEffectiveOps] = useState<Set<string>>(new Set());
@@ -376,10 +377,7 @@ const SmartExecutionReport: React.FC = () => {
 
   const exportOperationsCsv = () => {
     const ops = report?.operations_history as Record<string, unknown>[] | undefined;
-    if (!ops?.length) {
-      window.alert('No operations history to export.');
-      return;
-    }
+    if (!ops?.length) return;
     const rows = ops.map((o) => {
       const r: Record<string, unknown> = {};
       Object.keys(o).forEach((k) => {
@@ -393,10 +391,7 @@ const SmartExecutionReport: React.FC = () => {
 
   const exportMetricsCsv = () => {
     const mh = report?.metrics_history as Record<string, unknown>[] | undefined;
-    if (!mh?.length) {
-      window.alert('No metrics history to export.');
-      return;
-    }
+    if (!mh?.length) return;
     const rows = mh.map((o) => {
       const r: Record<string, unknown> = {};
       Object.keys(o).forEach((k) => {
@@ -515,10 +510,10 @@ const SmartExecutionReport: React.FC = () => {
                 }}>
                   <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>assessment</i>
                 </div>
-                Smart Execution Report
+                {report?.execution_name || 'Smart Execution Report'}
               </h2>
               <p className="text-muted mb-0">
-                Detailed analysis and metrics for execution <code className="small">{executionId?.substring(0, 20)}...</code>
+                {report?.execution_description || <>Detailed analysis and metrics for execution <code className="small">{executionId?.substring(0, 20)}...</code></>}
               </p>
             </div>
             <div className="d-flex gap-2">
@@ -574,6 +569,29 @@ const SmartExecutionReport: React.FC = () => {
                 <i className="material-icons-outlined" style={{ fontSize: 20 }}>show_chart</i>
                 Metrics CSV
               </button>
+              <button
+                type="button"
+                className="btn btn-outline-info btn-lg rounded-4 d-flex align-items-center gap-2"
+                onClick={() => {
+                  const url = `${window.location.origin}/smart-execution/report/${executionId}`;
+                  navigator.clipboard.writeText(url);
+                  setShareCopied(true);
+                  setTimeout(() => setShareCopied(false), 2000);
+                }}
+                title="Copy shareable report link to clipboard"
+              >
+                <i className="material-icons-outlined" style={{ fontSize: 20 }}>{shareCopied ? 'check' : 'share'}</i>
+                {shareCopied ? 'Copied!' : 'Share'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-lg rounded-4 d-flex align-items-center gap-2"
+                onClick={() => window.print()}
+                title="Print report as PDF via browser print dialog"
+              >
+                <i className="material-icons-outlined" style={{ fontSize: 20 }}>print</i>
+                Print PDF
+              </button>
               <button 
                 className="btn btn-outline-secondary btn-lg rounded-4 d-flex align-items-center gap-2"
                 onClick={() => navigate('/smart-execution/history')}
@@ -625,6 +643,54 @@ const SmartExecutionReport: React.FC = () => {
             </div>
           </div>
         </div>
+
+        {/* Auto-generated Executive Summary */}
+        {report && (() => {
+          const dur = report.duration_minutes || 0;
+          const durStr = dur >= 60 ? `${Math.floor(dur / 60)}h ${Math.round(dur % 60)}m` : `${Math.round(dur)} minutes`;
+          const testbed = report.testbed_label || 'unknown testbed';
+          const ops = report.total_operations || 0;
+          const rate = report.success_rate != null ? report.success_rate.toFixed(1) : '0';
+          const cpuFinal = report.current_metrics?.cpu_percent?.toFixed(1) || '?';
+          const cpuTarget = report.target_config?.cpu_threshold || '?';
+          const memFinal = report.current_metrics?.memory_percent?.toFixed(1) || '?';
+          const memTarget = report.target_config?.memory_threshold || '?';
+          const thresholdHit = report.execution_context?.threshold_reached;
+          const failedOps = report.failed_operations || 0;
+          const spikeCount = enhanced?.spike_analysis?.total_spikes || 0;
+          const verdictPass = Number(rate) >= 90 && !thresholdHit;
+          const verdictWarn = Number(rate) >= 70 && Number(rate) < 90;
+          const verdictColor = verdictPass ? '#22c55e' : verdictWarn ? '#f59e0b' : '#ef4444';
+          const verdictLabel = verdictPass ? 'PASS' : verdictWarn ? 'PASS WITH WARNINGS' : 'NEEDS REVIEW';
+          const verdictBg = verdictPass ? '#f0fdf4' : verdictWarn ? '#fffbeb' : '#fef2f2';
+          return (
+            <div className="card rounded-4 shadow-none border mb-3" style={{ borderLeft: `4px solid ${verdictColor}` }}>
+              <div className="card-body p-4">
+                <div className="d-flex align-items-center gap-3 mb-3">
+                  <div style={{ width: 44, height: 44, borderRadius: 12, background: verdictBg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <i className="material-icons-outlined" style={{ fontSize: 24, color: verdictColor }}>
+                      {verdictPass ? 'check_circle' : verdictWarn ? 'warning' : 'error'}
+                    </i>
+                  </div>
+                  <div>
+                    <h6 className="fw-bold mb-0">Executive Summary</h6>
+                    <span className="badge rounded-pill px-3 py-1 mt-1" style={{ background: verdictBg, color: verdictColor, fontWeight: 700, fontSize: 11 }}>
+                      VERDICT: {verdictLabel}
+                    </span>
+                  </div>
+                </div>
+                <p className="mb-0" style={{ lineHeight: 1.7, color: '#334155' }}>
+                  This execution ran for <strong>{durStr}</strong> on testbed <strong>{testbed}</strong>, executing <strong>{ops} operations</strong> ({rate}% success rate).
+                  {failedOps > 0 && <> <strong>{failedOps} operations failed.</strong></>}
+                  {' '}CPU reached <strong>{cpuFinal}%</strong> against a target of {cpuTarget}%, and memory reached <strong>{memFinal}%</strong> against a target of {memTarget}%.
+                  {spikeCount > 0 && <> The cluster experienced <strong>{spikeCount} resource spike{spikeCount > 1 ? 's' : ''}</strong>.</>}
+                  {thresholdHit && <> The <strong>resource threshold was reached</strong>.</>}
+                  {enhanced?.health_assessment?.findings?.length > 0 && <> {enhanced.health_assessment.findings.length} health finding{enhanced.health_assessment.findings.length > 1 ? 's' : ''} were recorded.</>}
+                </p>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Executive Summary Cards */}
         <div className="row g-3 mb-3">
@@ -764,6 +830,52 @@ const SmartExecutionReport: React.FC = () => {
               {/* OVERVIEW TAB */}
               {activeTab === 'overview' && (
                 <div>
+                  {/* CPU/Memory Over Time Chart */}
+                  {report.metrics_history && report.metrics_history.length > 1 && (() => {
+                    const mh = report.metrics_history;
+                    const step = Math.max(1, Math.floor(mh.length / 60));
+                    const sampled = mh.filter((_: any, i: number) => i % step === 0);
+                    const cpuD = sampled.map((m: any) => parseFloat((m.cpu_percent ?? m.cpu ?? 0).toFixed(1)));
+                    const memD = sampled.map((m: any) => parseFloat((m.memory_percent ?? m.memory ?? 0).toFixed(1)));
+                    const cats = sampled.map((_: any, i: number) => `${i + 1}`);
+                    return (
+                      <div className="mb-4">
+                        <div className="d-flex align-items-center gap-2 mb-2">
+                          <h6 className="fw-semibold mb-0">Resource Usage Over Time</h6>
+                          <span className="badge bg-light text-muted rounded-pill" style={{ fontSize: 10, cursor: 'help' }} title="Shows how CPU and memory usage changed throughout the execution. Horizontal dashed lines indicate configured thresholds.">
+                            <i className="material-icons-outlined" style={{ fontSize: 14, verticalAlign: 'middle' }}>info</i>
+                          </span>
+                        </div>
+                        <ReactApexChart
+                          type="area"
+                          height={260}
+                          series={[
+                            { name: 'CPU %', data: cpuD },
+                            { name: 'Memory %', data: memD }
+                          ]}
+                          options={{
+                            chart: { toolbar: { show: false }, zoom: { enabled: false }, fontFamily: 'inherit' },
+                            colors: ['#3b82f6', '#10b981'],
+                            dataLabels: { enabled: false },
+                            stroke: { curve: 'smooth', width: 2 },
+                            fill: { type: 'gradient', gradient: { shadeIntensity: 1, opacityFrom: 0.3, opacityTo: 0.05, stops: [0, 100] } },
+                            xaxis: { categories: cats, labels: { show: false }, axisBorder: { show: false }, axisTicks: { show: false } },
+                            yaxis: { min: 0, max: 100, labels: { formatter: (v: number) => `${v.toFixed(0)}%` } },
+                            annotations: {
+                              yaxis: [
+                                { y: report.target_config?.cpu_threshold || 0, borderColor: '#3b82f6', strokeDashArray: 4, label: { text: `CPU Target`, style: { color: '#3b82f6', background: '#eff6ff', fontSize: '10px' } } },
+                                { y: report.target_config?.memory_threshold || 0, borderColor: '#10b981', strokeDashArray: 4, label: { text: `Mem Target`, style: { color: '#10b981', background: '#f0fdf4', fontSize: '10px' }, position: 'front' } }
+                              ]
+                            },
+                            tooltip: { y: { formatter: (v: number) => `${v.toFixed(1)}%` } },
+                            grid: { borderColor: '#f1f5f9', strokeDashArray: 4 },
+                            legend: { position: 'top' as const, horizontalAlign: 'right' as const }
+                          }}
+                        />
+                      </div>
+                    );
+                  })()}
+
                   {/* Simulation Mode Warning Banner */}
                   {enhanced.execution_mode_summary?.available && (enhanced.execution_mode_summary.simulated_operations ?? 0) > 0 && (
                     <div className={`alert ${enhanced.execution_mode_summary.trust_level === 'LOW' ? 'alert-danger' : 'alert-warning'} rounded-3 mb-3 d-flex align-items-start gap-2`}>
@@ -1040,6 +1152,10 @@ const SmartExecutionReport: React.FC = () => {
               {/* SPIKE ANALYSIS TAB */}
               {activeTab === 'spikes' && (
                 <div>
+                  <div className="alert alert-light border rounded-3 mb-3 py-2 px-3 d-flex align-items-center gap-2" style={{ fontSize: 13 }}>
+                    <i className="material-icons-outlined text-info" style={{ fontSize: 18 }}>info</i>
+                    <span>Spikes are sudden resource jumps &gt;5% between consecutive polls. High-risk spikes exceeded the target threshold and may indicate capacity limits.</span>
+                  </div>
                   {enhanced.spike_analysis?.spikes?.length > 0 ? (
                     <>
                       <div className="row g-3 mb-4">
@@ -1156,6 +1272,10 @@ const SmartExecutionReport: React.FC = () => {
               {/* CLUSTER HEALTH TAB */}
               {activeTab === 'health' && (
                 <div>
+                  <div className="alert alert-light border rounded-3 mb-3 py-2 px-3 d-flex align-items-center gap-2" style={{ fontSize: 13 }}>
+                    <i className="material-icons-outlined text-info" style={{ fontSize: 18 }}>info</i>
+                    <span>Cluster health data from Prometheus: CPU throttling, container restarts, OOM kills, node conditions, and PVC health. Scores below 50 indicate serious issues.</span>
+                  </div>
                   {/* QA Health Assessment */}
                   {enhanced.health_assessment?.findings?.length > 0 && (
                     <div className="mb-4">
@@ -1857,6 +1977,10 @@ const SmartExecutionReport: React.FC = () => {
               {/* CAPACITY TAB */}
               {activeTab === 'capacity' && (
                 <div>
+                  <div className="alert alert-light border rounded-3 mb-3 py-2 px-3 d-flex align-items-center gap-2" style={{ fontSize: 13 }}>
+                    <i className="material-icons-outlined text-info" style={{ fontSize: 18 }}>info</i>
+                    <span>Capacity planning estimates how much CPU/memory each operation type consumes, based on resource deltas during execution. Use this to predict cluster limits.</span>
+                  </div>
                   {enhanced.capacity_planning?.available ? (
                     <>
                       <div className="row g-3 mb-4">
@@ -2292,7 +2416,7 @@ const SmartExecutionReport: React.FC = () => {
                 }}>
                   <i className="material-icons-outlined" style={{ fontSize: 24 }}>psychology</i>
                 </div>
-                <span className="fw-semibold">🤖 AI Insights</span>
+                <span className="fw-semibold"><i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle' }}>psychology</i> AI Insights</span>
               </h5>
               {report.ai_enabled && (
                 <p className="text-white-50 mb-0 mt-2" style={{ fontSize: '0.9rem' }}>
@@ -2399,7 +2523,7 @@ const SmartExecutionReport: React.FC = () => {
                           <div className="text-muted small mb-1">Model Status</div>
                           <div className="h5 mb-0">
                             {report.ml_stats.model_trained ? (
-                              <span className="badge bg-success">✓ Trained</span>
+                              <span className="badge bg-success"><i className="material-icons-outlined" style={{ fontSize: 14 }}>check</i> Trained</span>
                             ) : (
                               <span className="badge bg-warning">⏳ Training</span>
                             )}
@@ -2747,6 +2871,19 @@ const SmartExecutionReport: React.FC = () => {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Report Metadata Footer */}
+      {report && (
+        <div className="card rounded-4 shadow-none border mt-3 mb-3">
+          <div className="card-body p-3 d-flex flex-wrap gap-4" style={{ fontSize: 12, color: '#94a3b8' }}>
+            <div><i className="material-icons-outlined me-1" style={{ fontSize: 14, verticalAlign: 'middle' }}>schedule</i> Generated: {new Date().toUTCString()}</div>
+            <div><i className="material-icons-outlined me-1" style={{ fontSize: 14, verticalAlign: 'middle' }}>storage</i> Source: {enhanced?.report_metadata?.prometheus_configured ? 'Live Prometheus + DB' : 'Persisted snapshot'}</div>
+            <div><i className="material-icons-outlined me-1" style={{ fontSize: 14, verticalAlign: 'middle' }}>analytics</i> Samples: {enhanced?.report_metadata?.metrics_samples ?? report.metrics_history?.length ?? 0}</div>
+            <div><i className="material-icons-outlined me-1" style={{ fontSize: 14, verticalAlign: 'middle' }}>list</i> Operations: {enhanced?.report_metadata?.operations_recorded ?? report.total_operations ?? 0}</div>
+            <div><i className="material-icons-outlined me-1" style={{ fontSize: 14, verticalAlign: 'middle' }}>fingerprint</i> ID: {executionId}</div>
           </div>
         </div>
       )}

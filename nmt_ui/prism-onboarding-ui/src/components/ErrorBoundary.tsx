@@ -44,9 +44,8 @@ class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
-    // Log error details to console for debugging
-    console.error('🔴 React Error Boundary caught an error:', error);
-    console.error('📊 Component Stack:', errorInfo.componentStack);
+    console.error('[ErrorBoundary]', error);
+    console.error('[ErrorBoundary] Component Stack:', errorInfo.componentStack);
     
     // Update state with error details
     this.setState({
@@ -90,7 +89,6 @@ class ErrorBoundary extends Component<Props, State> {
             padding: '3rem',
             textAlign: 'center'
           }}>
-            {/* Error Icon */}
             <div style={{
               width: '80px',
               height: '80px',
@@ -101,10 +99,7 @@ class ErrorBoundary extends Component<Props, State> {
               alignItems: 'center',
               justifyContent: 'center'
             }}>
-              <span style={{
-                fontSize: '48px',
-                color: 'white'
-              }}>⚠️</span>
+              <i className="material-icons-outlined" style={{ fontSize: '40px', color: 'white' }}>error_outline</i>
             </div>
 
             {/* Error Message */}
@@ -143,7 +138,7 @@ class ErrorBoundary extends Component<Props, State> {
                   color: '#495057',
                   marginBottom: '0.5rem'
                 }}>
-                  🔍 Technical Details (for developers)
+                  <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', marginRight: 4 }}>code</i> Technical Details (for developers)
                 </summary>
                 <div style={{
                   marginTop: '1rem',
@@ -209,7 +204,7 @@ class ErrorBoundary extends Component<Props, State> {
                 onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#0b5ed7'}
                 onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#0d6efd'}
               >
-                🔄 Reload Page
+                <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle', marginRight: 4 }}>refresh</i> Reload Page
               </button>
 
               <button
@@ -234,7 +229,7 @@ class ErrorBoundary extends Component<Props, State> {
                   e.currentTarget.style.color = '#0d6efd';
                 }}
               >
-                🏠 Go to Home
+                <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle', marginRight: 4 }}>home</i> Go to Home
               </button>
             </div>
 

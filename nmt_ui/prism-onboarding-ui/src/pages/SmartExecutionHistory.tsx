@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getApiBase } from '../utils/backendUrl';
+import { useToast } from '../context/ToastContext';
 
 interface ChildExecution {
   execution_id: string;
@@ -17,6 +18,8 @@ interface ChildExecution {
 
 interface SmartExecution {
   execution_id: string;
+  execution_name?: string;
+  execution_description?: string;
   testbed_id: string;
   testbed_label: string;
   status: string;
@@ -41,6 +44,7 @@ interface SmartExecution {
 
 const SmartExecutionHistory: React.FC = () => {
   const navigate = useNavigate();
+  const { addToast, confirm } = useToast();
   const [executions, setExecutions] = useState<SmartExecution[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -53,6 +57,7 @@ const SmartExecutionHistory: React.FC = () => {
   const [selectedForCompare, setSelectedForCompare] = useState<Set<string>>(new Set());
   const [compareData, setCompareData] = useState<any>(null);
   const [comparingFlag, setComparingFlag] = useState(false);
+  const [viewMode, setViewMode] = useState<'table' | 'card'>('table');
 
   useEffect(() => {
     fetchExecutions();
@@ -179,74 +184,60 @@ const SmartExecutionHistory: React.FC = () => {
   };
 
   const cleanupEntities = async (executionId: string) => {
-    if (!window.confirm('Delete all entities created by this execution? (VMs, projects, blueprints, etc.)')) return;
+    const ok = await confirm({ title: 'Cleanup Entities', message: 'Delete all entities created by this execution? (VMs, projects, blueprints, etc.)', confirmLabel: 'Cleanup', variant: 'warning' });
+    if (!ok) return;
     try {
       const response = await fetch(`${getApiBase()}/api/smart-execution/cleanup/${executionId}`, { method: 'POST' });
-      if (!response.ok) {
-        setError(`Cleanup failed (HTTP ${response.status})`);
-        return;
-      }
+      if (!response.ok) { addToast('error', `Cleanup failed (HTTP ${response.status})`); return; }
       const data = await response.json();
       if (data.success) {
-        setError(null);
+        addToast('success', `Cleanup complete: ${data.cleanup_summary?.success || 0}/${data.cleanup_summary?.total || 0} entities deleted`);
         fetchExecutions();
       } else {
-        setError(data.error || 'Cleanup failed');
+        addToast('error', data.error || 'Cleanup failed');
       }
     } catch (err: any) {
-      setError(`Cleanup error: ${err.message}`);
+      addToast('error', `Cleanup error: ${err.message}`);
     }
   };
 
   const deleteExecution = async (executionId: string) => {
-    if (!window.confirm('Are you sure you want to delete this execution record? This action cannot be undone.')) {
-      return;
-    }
-
+    const ok = await confirm({ title: 'Delete Execution', message: 'Are you sure you want to delete this execution record? This action cannot be undone.', confirmLabel: 'Delete', variant: 'danger' });
+    if (!ok) return;
     try {
       setDeletingId(executionId);
-      const response = await fetch(`${getApiBase()}/api/smart-execution/${executionId}`, {
-        method: 'DELETE'
-      });
-      if (!response.ok) {
-        setError(`Failed to delete execution (HTTP ${response.status})`);
-        return;
-      }
+      const response = await fetch(`${getApiBase()}/api/smart-execution/${executionId}`, { method: 'DELETE' });
+      if (!response.ok) { addToast('error', `Failed to delete execution (HTTP ${response.status})`); return; }
       const data = await response.json();
-      
       if (data.success) {
-        setError(null);
+        addToast('success', 'Execution record deleted');
         fetchExecutions();
       } else {
-        setError(data.error || 'Failed to delete execution');
+        addToast('error', data.error || 'Failed to delete execution');
       }
     } catch (err: any) {
-      setError(`Failed to delete execution: ${err.message}`);
+      addToast('error', `Failed to delete execution: ${err.message}`);
     } finally {
       setDeletingId(null);
     }
   };
 
   const stopExecution = async (executionId: string) => {
-    if (!window.confirm('Stop this running execution?')) return;
+    const ok = await confirm({ title: 'Stop Execution', message: 'Stop this running execution?', confirmLabel: 'Stop', variant: 'danger' });
+    if (!ok) return;
     try {
       setStoppingId(executionId);
-      const response = await fetch(`${getApiBase()}/api/smart-execution/stop/${executionId}`, {
-        method: 'POST'
-      });
-      if (!response.ok) {
-        setError(`Failed to stop execution (HTTP ${response.status})`);
-        return;
-      }
+      const response = await fetch(`${getApiBase()}/api/smart-execution/stop/${executionId}`, { method: 'POST' });
+      if (!response.ok) { addToast('error', `Failed to stop execution (HTTP ${response.status})`); return; }
       const data = await response.json();
       if (data.success) {
-        setError(null);
+        addToast('success', 'Execution stopped');
         fetchExecutions();
       } else {
-        setError(data.error || 'Failed to stop execution');
+        addToast('error', data.error || 'Failed to stop execution');
       }
     } catch (err: any) {
-      setError(`Failed to stop execution: ${err.message}`);
+      addToast('error', `Failed to stop execution: ${err.message}`);
     } finally {
       setStoppingId(null);
     }
@@ -254,23 +245,21 @@ const SmartExecutionHistory: React.FC = () => {
 
   const stopAllRunning = async () => {
     const runningCount = executions.filter(e => e.status === 'RUNNING' || e.status === 'LONGEVITY_SUSTAINING').length;
-    if (runningCount === 0) { setError('No running executions found.'); return; }
-    if (!window.confirm(`Stop all ${runningCount} running execution(s)?`)) return;
+    if (runningCount === 0) { addToast('info', 'No running executions found.'); return; }
+    const ok = await confirm({ title: 'Stop All', message: `Stop all ${runningCount} running execution(s)?`, confirmLabel: 'Stop All', variant: 'danger' });
+    if (!ok) return;
     try {
       const response = await fetch(`${getApiBase()}/api/smart-execution/stop-all`, { method: 'POST' });
-      if (!response.ok) {
-        setError(`Failed to stop executions (HTTP ${response.status})`);
-        return;
-      }
+      if (!response.ok) { addToast('error', `Failed to stop executions (HTTP ${response.status})`); return; }
       const data = await response.json();
       if (data.success) {
-        setError(null);
+        addToast('success', `Stopped ${data.stopped_count || runningCount} execution(s)`);
         fetchExecutions();
       } else {
-        setError(data.error || 'Failed to stop executions');
+        addToast('error', data.error || 'Failed to stop executions');
       }
     } catch (err: any) {
-      setError(`Error: ${err.message}`);
+      addToast('error', `Error: ${err.message}`);
     }
   };
 
@@ -301,8 +290,9 @@ const SmartExecutionHistory: React.FC = () => {
   const filteredExecutions = executions.filter(exec => {
     const matchesStatus = filterStatus === 'all' || exec.status === filterStatus;
     const matchesTestbed = filterTestbed === 'all' || exec.testbed_label === filterTestbed;
-    const matchesSearch = searchQuery === '' || 
+    const matchesSearch = searchQuery === '' ||
       exec.execution_id.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (exec.execution_name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
       exec.testbed_label.toLowerCase().includes(searchQuery.toLowerCase());
     
     return matchesStatus && matchesTestbed && matchesSearch;
@@ -467,14 +457,24 @@ const SmartExecutionHistory: React.FC = () => {
                 <span className="fw-semibold">Executions</span>
                 <span className="badge bg-primary rounded-pill">{filteredExecutions.length}</span>
               </h5>
-              <button 
-                className="btn btn-outline-secondary btn-sm rounded-3"
-                onClick={fetchExecutions}
-                disabled={loading}
-              >
-                <i className="material-icons-outlined me-1" style={{ fontSize: 18, verticalAlign: 'middle' }}>refresh</i>
-                Refresh
-              </button>
+              <div className="d-flex gap-2">
+                <div className="btn-group btn-group-sm" role="group">
+                  <button className={`btn ${viewMode === 'table' ? 'btn-primary' : 'btn-outline-secondary'} rounded-start-3`} onClick={() => setViewMode('table')} title="Table view">
+                    <i className="material-icons-outlined" style={{ fontSize: 18 }}>view_list</i>
+                  </button>
+                  <button className={`btn ${viewMode === 'card' ? 'btn-primary' : 'btn-outline-secondary'} rounded-end-3`} onClick={() => setViewMode('card')} title="Card view">
+                    <i className="material-icons-outlined" style={{ fontSize: 18 }}>grid_view</i>
+                  </button>
+                </div>
+                <button 
+                  className="btn btn-outline-secondary btn-sm rounded-3"
+                  onClick={fetchExecutions}
+                  disabled={loading}
+                >
+                  <i className="material-icons-outlined me-1" style={{ fontSize: 18, verticalAlign: 'middle' }}>refresh</i>
+                  Refresh
+                </button>
+              </div>
             </div>
           </div>
           <div className="card-body p-0">
@@ -566,12 +566,54 @@ const SmartExecutionHistory: React.FC = () => {
                 </div>
               )}
 
+              {/* Card View */}
+              {viewMode === 'card' && (
+                <div className="row g-3 p-3">
+                  {filteredExecutions.map(exec => {
+                    const si = getStatusBadge(exec.status);
+                    return (
+                      <div key={exec.execution_id} className="col-md-6 col-xl-4">
+                        <div className="card border rounded-4 h-100 shadow-sm" style={{ cursor: 'pointer' }} onClick={() => viewReport(exec.execution_id)}>
+                          <div className="card-body p-3">
+                            <div className="d-flex justify-content-between align-items-start mb-2">
+                              <div>
+                                {exec.execution_name ? (
+                                  <h6 className="fw-bold mb-0">{exec.execution_name}</h6>
+                                ) : (
+                                  <code className="small text-muted">{exec.execution_id.substring(0, 18)}...</code>
+                                )}
+                                <div className="text-muted small">{exec.testbed_label}</div>
+                              </div>
+                              <span className={`badge ${si.bg} rounded-pill px-2 py-1`}>
+                                <i className="material-icons-outlined" style={{ fontSize: 12 }}>{si.icon}</i> {exec.status}
+                              </span>
+                            </div>
+                            <div className="d-flex gap-3 text-muted small mb-2">
+                              <span><i className="material-icons-outlined" style={{ fontSize: 14, verticalAlign: 'middle' }}>schedule</i> {new Date(exec.start_time).toLocaleDateString()}</span>
+                              {exec.duration_minutes != null && <span>{Math.round(exec.duration_minutes)}m</span>}
+                            </div>
+                            <div className="d-flex gap-2">
+                              <span className="badge bg-primary bg-opacity-10 text-primary rounded-pill">{exec.total_operations} ops</span>
+                              {exec.tags?.map((tag, i) => (
+                                <span key={i} className="badge bg-info bg-opacity-10 text-info rounded-pill">{tag}</span>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Table View */}
+              {viewMode === 'table' && (
               <div className="table-responsive">
                 <table className="table table-hover align-middle mb-0">
                   <thead className="table-light">
                     <tr>
                       <th style={{ width: 30 }}></th>
-                      <th className="ps-2">Execution ID</th>
+                      <th className="ps-2">Execution</th>
                       <th>Testbed</th>
                       <th className="text-center">Status</th>
                       <th>Started</th>
@@ -614,9 +656,14 @@ const SmartExecutionHistory: React.FC = () => {
                                   </button>
                                 )}
                                 <div>
-                                  <code className="font-monospace small text-muted">
-                                    {exec.execution_id.substring(0, 20)}...
-                                  </code>
+                                  {exec.execution_name ? (
+                                    <span className="fw-semibold text-dark">{exec.execution_name}</span>
+                                  ) : (
+                                    <code className="font-monospace small text-muted">
+                                      {exec.execution_id.substring(0, 20)}...
+                                    </code>
+                                  )}
+                                  <div className="font-monospace text-muted" style={{ fontSize: '0.7rem' }}>{exec.execution_id}</div>
                                   {exec.tags && exec.tags.length > 0 && (
                                     <div className="d-flex gap-1 flex-wrap mt-1">
                                       {exec.tags.map((tag, i) => (
@@ -781,7 +828,7 @@ const SmartExecutionHistory: React.FC = () => {
                                           </div>
                                           <div>
                                             <h6 className="mb-0 fw-bold d-flex align-items-center gap-2">
-                                              🤖 AI Model-Adjusted Execution
+                                              <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle' }}>psychology</i> AI Model-Adjusted Execution
                                               {child.threshold_reached && (
                                                 <span className="badge bg-success rounded-pill">Threshold Reached!</span>
                                               )}
@@ -810,7 +857,7 @@ const SmartExecutionHistory: React.FC = () => {
                                         {child.target_config && (
                                           <div className="mt-2 p-2 rounded-3" style={{ background: 'rgba(255,255,255,0.5)' }}>
                                             <div className="small">
-                                              <strong>🎯 AI Adjustments:</strong> Load increased by {((child.target_config.load_adjustment_factor || 1) * 100 - 100).toFixed(0)}% • 
+                                              <strong><i className="material-icons-outlined" style={{ fontSize: 14, verticalAlign: 'middle' }}>track_changes</i> AI Adjustments:</strong> Load increased by {((child.target_config.load_adjustment_factor || 1) * 100 - 100).toFixed(0)}% • 
                                               Model confidence: {((child.target_config.model_confidence || 0) * 100).toFixed(0)}%
                                             </div>
                                           </div>
@@ -837,6 +884,7 @@ const SmartExecutionHistory: React.FC = () => {
                   </tbody>
                 </table>
               </div>
+              )}
               </>
             )}
           </div>

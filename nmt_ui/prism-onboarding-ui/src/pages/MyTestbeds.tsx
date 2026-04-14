@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds } from '../fake-data';
 import { getApiBase } from '../utils/backendUrl';
+import { useToast } from '../context/ToastContext';
 
 interface Testbed {
   id: number;
@@ -18,6 +19,7 @@ interface Testbed {
 
 const MyTestbeds: React.FC = () => {
   const navigate = useNavigate();
+  const { addToast, confirm: toastConfirm } = useToast();
   const [testbeds, setTestbeds] = useState<Testbed[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -42,8 +44,6 @@ const MyTestbeds: React.FC = () => {
       }
 
       const backendUrl = getApiBase();
-      console.log('Fetching testbeds from:', backendUrl);
-
       const response = await fetch(`${backendUrl}/api/get-testbeds`);
       
       if (!response.ok) {
@@ -51,7 +51,6 @@ const MyTestbeds: React.FC = () => {
       }
 
       const data = await response.json();
-      console.log('Testbeds data:', data);
 
       if (data.success) {
         setTestbeds(data.testbeds || []);
@@ -81,50 +80,42 @@ const MyTestbeds: React.FC = () => {
   };
 
   const handleDelete = async (testbed: Testbed) => {
-    if (!confirm(`Are you sure you want to delete testbed "${testbed.testbed_label}"?\n\nThis will also delete all associated rules and configurations.`)) {
-      return;
-    }
+    const ok = await toastConfirm({
+      title: 'Delete Testbed',
+      message: `Are you sure you want to delete testbed "${testbed.testbed_label}"? This will also delete all associated rules and configurations.`,
+      confirmLabel: 'Delete',
+      variant: 'danger'
+    });
+    if (!ok) return;
 
     setDeleteLoading(testbed.unique_testbed_id);
 
     try {
-      // FAKE DATA MODE: Just remove from local state
       if (IS_FAKE_MODE) {
-        await new Promise(resolve => setTimeout(resolve, 500)); // Simulate network delay
+        await new Promise(resolve => setTimeout(resolve, 500));
         setTestbeds(testbeds.filter(t => t.unique_testbed_id !== testbed.unique_testbed_id));
-        alert(`✓ Testbed deleted successfully (DEMO mode)`);
+        addToast('success', 'Testbed deleted successfully (DEMO mode)');
         setDeleteLoading(null);
         return;
       }
 
       const backendUrl = getApiBase();
-      console.log(`Deleting testbed: ${testbed.unique_testbed_id}`);
-      
       const response = await fetch(`${backendUrl}/api/delete-testbed/${testbed.unique_testbed_id}`, {
         method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json'
-        }
+        headers: { 'Content-Type': 'application/json' }
       });
 
-      console.log('Delete response status:', response.status);
-      
       const data = await response.json();
-      console.log('Delete response data:', data);
 
       if (response.ok && data.success) {
-        // Remove from local state
         setTestbeds(testbeds.filter(t => t.unique_testbed_id !== testbed.unique_testbed_id));
-        alert(`✓ ${data.message}`);
+        addToast('success', data.message || 'Testbed deleted successfully');
       } else {
-        const errorMsg = data.error || data.message || 'Unknown error';
-        console.error('Delete failed:', errorMsg);
-        alert(`✗ Failed to delete testbed: ${errorMsg}`);
+        addToast('error', `Failed to delete testbed: ${data.error || data.message || 'Unknown error'}`);
       }
     } catch (err) {
-      console.error('Error deleting testbed:', err);
       const errorMsg = err instanceof Error ? err.message : 'Network error or server not responding';
-      alert(`✗ Failed to delete testbed: ${errorMsg}\n\nPlease check:\n- Backend server is running\n- Network connection is stable`);
+      addToast('error', `Failed to delete testbed: ${errorMsg}`);
     } finally {
       setDeleteLoading(null);
     }

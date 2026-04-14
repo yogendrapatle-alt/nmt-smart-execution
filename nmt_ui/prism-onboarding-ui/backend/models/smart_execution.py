@@ -13,6 +13,8 @@ class SmartExecution(Base):
 
     id = Column(Integer, primary_key=True)
     execution_id = Column(String(128), unique=True, nullable=False, index=True)
+    execution_name = Column(String(100), nullable=True)
+    execution_description = Column(Text, nullable=True)
     testbed_id = Column(String(128), nullable=False, index=True)
     testbed_label = Column(String(255), nullable=True)
     
@@ -100,6 +102,8 @@ class SmartExecution(Base):
         return {
             'id': self.id,
             'execution_id': self.execution_id,
+            'execution_name': self.execution_name,
+            'execution_description': self.execution_description,
             'testbed_id': self.testbed_id,
             'testbed_label': self.testbed_label,
             'status': self.status,

@@ -4028,7 +4028,12 @@ def start_smart_execution_api():
         
         logging.info(f"🚀 Starting AI-powered smart execution for testbed {testbed_info.get('testbed_label')}")
         
-        # Use the existing start_smart_execution which now has AI capabilities
+        # Pass execution_name/description into target_config for DB persistence
+        if data.get('execution_name'):
+            target_config['execution_name'] = data['execution_name']
+        if data.get('execution_description'):
+            target_config['execution_description'] = data['execution_description']
+
         execution_id = start_smart_execution(testbed_info, target_config, normalized_entities, rule_config)
         
         logging.info(f"✅ Smart execution started: {execution_id}")
@@ -4497,6 +4502,41 @@ def purge_stale_executions():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/smart-execution/<execution_id>/update-identity', methods=['PATCH'])
+def update_execution_identity(execution_id):
+    """Update execution_name and/or execution_description for an execution."""
+    try:
+        from database import SessionLocal
+        from models.smart_execution import SmartExecution
+
+        data = request.get_json() or {}
+        new_name = data.get('execution_name')
+        new_desc = data.get('execution_description')
+
+        if new_name is None and new_desc is None:
+            return jsonify({'success': False, 'error': 'Nothing to update'}), 400
+
+        session = SessionLocal()
+        try:
+            execution = session.query(SmartExecution).filter_by(execution_id=execution_id).first()
+            if not execution:
+                return jsonify({'success': False, 'error': 'Execution not found'}), 404
+
+            if new_name is not None:
+                execution.execution_name = new_name[:100]
+            if new_desc is not None:
+                execution.execution_description = new_desc[:500]
+
+            session.commit()
+            return jsonify({'success': True, 'execution_id': execution_id})
+        finally:
+            session.close()
+
+    except Exception as e:
+        logging.exception("Error updating execution identity")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/smart-execution/history', methods=['GET'])
 def get_smart_execution_history():
     """
@@ -4561,6 +4601,10 @@ def get_smart_execution_history():
             else:
                 enriched['final_cpu'] = 0
                 enriched['final_memory'] = 0
+            
+            # Include execution identity fields
+            enriched['execution_name'] = exec_data.get('execution_name', '')
+            enriched['execution_description'] = exec_data.get('execution_description', '')
             
             # Include new fields in history listing
             enriched['anomaly_count'] = exec_data.get('anomaly_count', 0)
@@ -5699,6 +5743,10 @@ def get_smart_execution_report(execution_id):
                     'testbed_id': db_data.get('testbed_id')
                 }
             }
+            # Include execution identity
+            report['execution_name'] = db_data.get('execution_name', '')
+            report['execution_description'] = db_data.get('execution_description', '')
+
             # Include AI/ML fields
             report['ai_enabled'] = db_data.get('ai_enabled', False)
             report['ai_settings'] = db_data.get('ai_settings')
