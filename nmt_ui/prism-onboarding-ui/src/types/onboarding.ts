@@ -83,7 +83,7 @@ export interface AlertDiagnostics {
     start_time: string;
     end_time: string | null;
   }>;
-  live_data: Record<string, unknown>;
+  live_data: Record<string, any>;
   metric_context: {
     value?: number;
     threshold?: number;

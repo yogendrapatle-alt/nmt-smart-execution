@@ -1,85 +1,31 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { IS_FAKE_MODE } from '../config/fakeMode';
-import { getFakeTestbeds } from '../fake-data';
 import { getApiBase } from '../utils/backendUrl';
 import { useToast } from '../context/ToastContext';
-
-interface Testbed {
-  id: number;
-  unique_testbed_id: string;
-  testbed_label: string;
-  pc_ip: string | null;
-  uuid: string | null;
-  timestamp: string;
-  testbed_json: any;
-  ncm_ip: string | null;
-  deployment_status?: string;
-}
+import { PageHeader } from '../components/ui';
+import { SkeletonMetricRow, SkeletonTable } from '../components/ui/LoadingSkeleton';
+import { useTestbeds } from '../hooks';
+import { invalidateCache } from '../hooks/useApi';
 
 const MyTestbeds: React.FC = () => {
   const navigate = useNavigate();
   const { addToast, confirm: toastConfirm } = useToast();
-  const [testbeds, setTestbeds] = useState<Testbed[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { testbeds, loading, error, refetch } = useTestbeds();
   const [deleteLoading, setDeleteLoading] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetchTestbeds();
-  }, []);
-
-  const fetchTestbeds = async () => {
-    setLoading(true);
-    setError(null);
-
-    try {
-      // FAKE DATA MODE: Return demo data without backend call
-      if (IS_FAKE_MODE) {
-        await new Promise(resolve => setTimeout(resolve, 500)); // Simulate network delay
-        const data = getFakeTestbeds();
-        setTestbeds(data.testbeds || []);
-        setLoading(false);
-        return;
-      }
-
-      const backendUrl = getApiBase();
-      const response = await fetch(`${backendUrl}/api/get-testbeds`);
-      
-      if (!response.ok) {
-        throw new Error(`API returned ${response.status}`);
-      }
-
-      const data = await response.json();
-
-      if (data.success) {
-        setTestbeds(data.testbeds || []);
-      } else {
-        setError('Failed to fetch testbeds');
-      }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : 'Unknown error';
-      setError(`Error fetching testbeds: ${errorMsg}`);
-      console.error('Error fetching testbeds:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleView = (testbed: Testbed) => {
-    // Navigate to status page with this testbed selected
+  const handleView = (testbed: any) => {
     localStorage.setItem('selected_testbed_label', testbed.testbed_label);
     navigate('/status');
   };
 
-  const handleConfigure = (testbed: Testbed) => {
-    // Store testbed ID and navigate to rule config manager
+  const handleConfigure = (testbed: any) => {
     localStorage.setItem('unique_testbed_id', testbed.unique_testbed_id);
     localStorage.setItem('selected_testbed_label', testbed.testbed_label);
     navigate('/rule-config-manager');
   };
 
-  const handleDelete = async (testbed: Testbed) => {
+  const handleDelete = async (testbed: any) => {
     const ok = await toastConfirm({
       title: 'Delete Testbed',
       message: `Are you sure you want to delete testbed "${testbed.testbed_label}"? This will also delete all associated rules and configurations.`,
@@ -93,7 +39,8 @@ const MyTestbeds: React.FC = () => {
     try {
       if (IS_FAKE_MODE) {
         await new Promise(resolve => setTimeout(resolve, 500));
-        setTestbeds(testbeds.filter(t => t.unique_testbed_id !== testbed.unique_testbed_id));
+        invalidateCache('testbeds');
+        refetch();
         addToast('success', 'Testbed deleted successfully (DEMO mode)');
         setDeleteLoading(null);
         return;
@@ -108,7 +55,8 @@ const MyTestbeds: React.FC = () => {
       const data = await response.json();
 
       if (response.ok && data.success) {
-        setTestbeds(testbeds.filter(t => t.unique_testbed_id !== testbed.unique_testbed_id));
+        invalidateCache('testbeds');
+        refetch();
         addToast('success', data.message || 'Testbed deleted successfully');
       } else {
         addToast('error', `Failed to delete testbed: ${data.error || data.message || 'Unknown error'}`);
@@ -121,8 +69,7 @@ const MyTestbeds: React.FC = () => {
     }
   };
 
-  const getStatusBadge = (testbed: Testbed) => {
-    // Determine status based on available data
+  const getStatusBadge = (testbed: any) => {
     if (testbed.ncm_ip) {
       return <span className="badge bg-success">Active</span>;
     } else if (testbed.pc_ip) {
@@ -148,11 +95,9 @@ const MyTestbeds: React.FC = () => {
   if (loading) {
     return (
       <div className="main-content">
-        <div className="d-flex justify-content-center align-items-center" style={{ minHeight: '60vh' }}>
-          <div className="spinner-border text-primary" role="status" style={{ width: '3rem', height: '3rem' }}>
-            <span className="visually-hidden">Loading...</span>
-          </div>
-        </div>
+        <PageHeader icon="dns" title="My Testbeds" subtitle="Loading your testbeds…" />
+        <SkeletonMetricRow count={3} />
+        <SkeletonTable rows={5} cols={4} />
       </div>
     );
   }
@@ -165,7 +110,7 @@ const MyTestbeds: React.FC = () => {
           <div>
             <h5 className="alert-heading">Error Loading Testbeds</h5>
             <p className="mb-0">{error}</p>
-            <button className="btn btn-sm btn-danger mt-2" onClick={fetchTestbeds}>
+            <button className="btn btn-sm btn-danger mt-2" onClick={refetch}>
               <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle' }}>refresh</i> Retry
             </button>
           </div>
@@ -218,7 +163,7 @@ const MyTestbeds: React.FC = () => {
                 </div>
               </div>
             </div>
-            <button className="btn btn-outline-primary" onClick={fetchTestbeds} style={{ borderRadius: 8, padding: '10px 20px', fontWeight: 600 }}>
+            <button className="btn btn-outline-primary" onClick={refetch} style={{ borderRadius: 8, padding: '10px 20px', fontWeight: 600 }}>
               <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle', marginRight: 6 }}>refresh</i>
               Refresh
             </button>

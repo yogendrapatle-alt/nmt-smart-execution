@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import Layout from '../components/Layout';
 import { getApiBase } from '../utils/backendUrl';
+import { SkeletonMetricRow, SkeletonTable } from '../components/ui/LoadingSkeleton';
 
 interface Execution {
   execution_id: string;
@@ -112,12 +113,8 @@ const TestbedActivity: React.FC = () => {
     return (
       <Layout>
         <div className="container-fluid p-4">
-          <div className="d-flex justify-content-center align-items-center" style={{ minHeight: '400px' }}>
-            <div className="spinner-border text-primary" role="status">
-              <span className="visually-hidden">Loading...</span>
-            </div>
-            <span className="ms-3">Loading testbed activity...</span>
-          </div>
+          <SkeletonMetricRow count={3} />
+          <SkeletonTable rows={5} cols={4} />
         </div>
       </Layout>
     );

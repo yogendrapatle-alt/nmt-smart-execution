@@ -1,52 +1,16 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getApiBase } from '../utils/backendUrl';
 import { useToast } from '../context/ToastContext';
-
-interface ChildExecution {
-  execution_id: string;
-  status: string;
-  total_operations: number;
-  successful_operations: number;
-  failed_operations: number;
-  success_rate: number;
-  duration_minutes: number;
-  threshold_reached: boolean;
-  target_config: any;
-  entity_types_count: number;
-}
-
-interface SmartExecution {
-  execution_id: string;
-  execution_name?: string;
-  execution_description?: string;
-  testbed_id: string;
-  testbed_label: string;
-  status: string;
-  start_time: string;
-  end_time?: string;
-  total_operations: number;
-  duration_minutes?: number | null;
-  target_cpu?: number;
-  target_memory?: number;
-  final_cpu?: number;
-  final_memory?: number;
-  threshold_reached?: boolean;
-  anomaly_count?: number;
-  anomaly_high_count?: number;
-  tags?: string[];
-  learning_summary?: string;
-  latency_avg?: number;
-  entities_config?: {
-    child_executions?: ChildExecution[];
-  };
-}
+import { SkeletonTable } from '../components/ui/LoadingSkeleton';
+import { useExecutions } from '../hooks';
+import { invalidateCache } from '../hooks/useApi';
 
 const SmartExecutionHistory: React.FC = () => {
   const navigate = useNavigate();
   const { addToast, confirm } = useToast();
-  const [executions, setExecutions] = useState<SmartExecution[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { executions: rawExecutions, loading, error: fetchError, refetch } = useExecutions();
+  const executions = rawExecutions as any[];
   const [error, setError] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [filterTestbed, setFilterTestbed] = useState<string>('all');
@@ -59,31 +23,11 @@ const SmartExecutionHistory: React.FC = () => {
   const [comparingFlag, setComparingFlag] = useState(false);
   const [viewMode, setViewMode] = useState<'table' | 'card'>('table');
 
-  useEffect(() => {
-    fetchExecutions();
-  }, []);
+  const displayError = error || fetchError;
 
-  const fetchExecutions = async () => {
-    try {
-      setLoading(true);
-      const response = await fetch(`${getApiBase()}/api/smart-execution/history`);
-      if (!response.ok) {
-        setError(`Failed to fetch execution history (HTTP ${response.status})`);
-        return;
-      }
-      const data = await response.json();
-      
-      if (data.success) {
-        setExecutions(data.executions || []);
-        setError(null);
-      } else {
-        setError(data.error || 'Failed to fetch execution history');
-      }
-    } catch (err: any) {
-      setError(err.message || 'Network error fetching execution history');
-    } finally {
-      setLoading(false);
-    }
+  const fetchExecutions = () => {
+    invalidateCache('executions');
+    refetch();
   };
 
   const downloadReport = async (executionId: string) => {
@@ -183,21 +127,143 @@ const SmartExecutionHistory: React.FC = () => {
     }
   };
 
+  const [cleaningUpId, setCleaningUpId] = useState<string | null>(null);
+  const [deepCleaning, setDeepCleaning] = useState(false);
+  const [deepCleanScan, setDeepCleanScan] = useState<any>(null);
+
+  const deepCleanTestbed = async () => {
+    if (filterTestbed === 'all') {
+      addToast('warning', 'Please select a specific testbed from the filter first.');
+      return;
+    }
+    const matchExec = executions.find(e => e.testbed_label === filterTestbed);
+    const testbedId = matchExec?.unique_testbed_id || matchExec?.testbed_id;
+    if (!testbedId) { addToast('error', 'Could not resolve testbed ID'); return; }
+
+    // First do a dry-run scan
+    try {
+      setDeepCleaning(true);
+      const scanRes = await fetch(`${getApiBase()}/api/smart-execution/deep-clean/${testbedId}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dry_run: true })
+      });
+      const scanData = await scanRes.json();
+      const scan = scanData.scan_results;
+      if (!scan || scan.total_found === 0) {
+        addToast('success', 'Testbed is already clean! No smart-* entities found.');
+        setDeepCleaning(false);
+        return;
+      }
+      setDeepCleanScan({ testbedId, testbedLabel: filterTestbed, scan });
+      setDeepCleaning(false);
+    } catch (err: any) {
+      addToast('error', `Scan failed: ${err.message}`);
+      setDeepCleaning(false);
+    }
+  };
+
+  const confirmDeepClean = async () => {
+    if (!deepCleanScan) return;
+    const { testbedId, scan } = deepCleanScan;
+    const ok = await confirm({
+      title: 'Deep Clean Testbed',
+      message: `This will delete ALL ${scan.total_found} smart-* entities found on this testbed, including stress pods. This cannot be undone.`,
+      confirmLabel: 'Deep Clean',
+      variant: 'danger'
+    });
+    if (!ok) { setDeepCleanScan(null); return; }
+    setDeepCleanScan(null);
+    setDeepCleaning(true);
+    try {
+      const res = await fetch(`${getApiBase()}/api/smart-execution/deep-clean/${testbedId}`, { method: 'POST' });
+      if (res.status === 202) {
+        addToast('info', `Deep clean started for ${scan.total_found} entities. Please wait...`);
+        pollDeepCleanStatus(testbedId);
+        return;
+      }
+      const data = await res.json();
+      if (data.success) {
+        addToast('success', `Deep clean complete: ${data.cleanup_summary?.success || 0} entities deleted`);
+      } else {
+        addToast('error', data.error || 'Deep clean failed');
+      }
+      setDeepCleaning(false);
+    } catch (err: any) {
+      addToast('error', `Deep clean error: ${err.message}`);
+      setDeepCleaning(false);
+    }
+  };
+
+  const pollDeepCleanStatus = async (testbedId: string) => {
+    const maxAttempts = 120;
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const res = await fetch(`${getApiBase()}/api/smart-execution/deep-clean/${testbedId}/status`);
+        const data = await res.json();
+        const summary = data.cleanup_summary;
+        if (summary?.status === 'completed') {
+          addToast('success', summary.message || `Deep clean done: ${summary.success}/${summary.total} deleted`);
+          setDeepCleaning(false);
+          return;
+        } else if (summary?.status === 'failed') {
+          addToast('error', `Deep clean failed: ${summary.message || 'Unknown'}`);
+          setDeepCleaning(false);
+          return;
+        }
+      } catch { /* retry */ }
+    }
+    addToast('warning', 'Deep clean still running. Refresh later.');
+    setDeepCleaning(false);
+  };
+
+  const pollCleanupStatus = async (executionId: string) => {
+    const maxAttempts = 60;
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const res = await fetch(`${getApiBase()}/api/smart-execution/cleanup/${executionId}/status`);
+        const data = await res.json();
+        const summary = data.cleanup_summary;
+        if (summary?.status === 'completed') {
+          addToast('success', `Cleanup complete: ${summary.success}/${summary.total} entities deleted`);
+          setCleaningUpId(null);
+          fetchExecutions();
+          return;
+        } else if (summary?.status === 'failed') {
+          addToast('error', `Cleanup failed: ${summary.message || 'Unknown error'}`);
+          setCleaningUpId(null);
+          return;
+        }
+      } catch { /* retry */ }
+    }
+    addToast('warning', 'Cleanup is still running in background. Refresh the page later to see results.');
+    setCleaningUpId(null);
+  };
+
   const cleanupEntities = async (executionId: string) => {
-    const ok = await confirm({ title: 'Cleanup Entities', message: 'Delete all entities created by this execution? (VMs, projects, blueprints, etc.)', confirmLabel: 'Cleanup', variant: 'warning' });
+    const ok = await confirm({ title: 'Cleanup Entities', message: 'Delete all entities created by this execution? (VMs, images, projects, stress pods, etc.)', confirmLabel: 'Cleanup', variant: 'warning' });
     if (!ok) return;
+    setCleaningUpId(executionId);
     try {
       const response = await fetch(`${getApiBase()}/api/smart-execution/cleanup/${executionId}`, { method: 'POST' });
-      if (!response.ok) { addToast('error', `Cleanup failed (HTTP ${response.status})`); return; }
+      if (!response.ok) { addToast('error', `Cleanup failed (HTTP ${response.status})`); setCleaningUpId(null); return; }
       const data = await response.json();
+      if (response.status === 202) {
+        addToast('info', `Cleanup started for ${data.cleanup_summary?.total || '?'} entities. This may take a few minutes...`);
+        pollCleanupStatus(executionId);
+        return;
+      }
       if (data.success) {
         addToast('success', `Cleanup complete: ${data.cleanup_summary?.success || 0}/${data.cleanup_summary?.total || 0} entities deleted`);
         fetchExecutions();
       } else {
         addToast('error', data.error || 'Cleanup failed');
       }
+      setCleaningUpId(null);
     } catch (err: any) {
       addToast('error', `Cleanup error: ${err.message}`);
+      setCleaningUpId(null);
     }
   };
 
@@ -361,6 +427,19 @@ const SmartExecutionHistory: React.FC = () => {
                   Stop All Running
                 </button>
               )}
+              <button
+                className="btn btn-outline-warning btn-lg rounded-4 d-flex align-items-center gap-2"
+                onClick={deepCleanTestbed}
+                disabled={deepCleaning || filterTestbed === 'all'}
+                title={filterTestbed === 'all' ? 'Select a testbed from filters to deep clean' : `Scan & remove ALL smart-* entities from ${filterTestbed}`}
+              >
+                {deepCleaning ? (
+                  <span className="spinner-border spinner-border-sm" role="status"></span>
+                ) : (
+                  <i className="material-icons-outlined" style={{ fontSize: 20 }}>delete_sweep</i>
+                )}
+                {deepCleaning ? 'Deep Cleaning...' : 'Deep Clean Testbed'}
+              </button>
               <button 
                 className="btn btn-primary btn-lg rounded-4 d-flex align-items-center gap-2"
                 onClick={() => navigate('/smart-execution')}
@@ -374,11 +453,42 @@ const SmartExecutionHistory: React.FC = () => {
         </div>
 
         {/* Error Alert */}
-        {error && (
+        {displayError && (
           <div className="alert alert-danger alert-dismissible fade show rounded-4 d-flex align-items-center mb-3" role="alert">
             <i className="material-icons-outlined me-2">error_outline</i>
-            <div className="flex-grow-1"><strong>Error:</strong> {error}</div>
+            <div className="flex-grow-1"><strong>Error:</strong> {displayError}</div>
             <button type="button" className="btn-close" onClick={() => setError(null)} aria-label="Close"></button>
+          </div>
+        )}
+
+        {/* Deep Clean Scan Results */}
+        {deepCleanScan && (
+          <div className="alert alert-warning rounded-4 shadow-sm mb-3">
+            <div className="d-flex align-items-start gap-3">
+              <i className="material-icons-outlined text-warning mt-1" style={{ fontSize: 28 }}>delete_sweep</i>
+              <div className="flex-grow-1">
+                <h6 className="fw-bold mb-2">Deep Clean Scan: {deepCleanScan.testbedLabel}</h6>
+                <p className="mb-2 small">Found <strong>{deepCleanScan.scan.total_found}</strong> smart-* entities on this testbed:</p>
+                <div className="row g-2 mb-3">
+                  {Object.entries(deepCleanScan.scan.found as Record<string, any[]>).map(([type, items]) => (
+                    items.length > 0 && (
+                      <div key={type} className="col-auto">
+                        <span className="badge bg-dark rounded-pill px-3 py-2">
+                          {type}: <strong>{items.length}</strong>
+                        </span>
+                      </div>
+                    )
+                  ))}
+                </div>
+                <div className="d-flex gap-2">
+                  <button className="btn btn-danger btn-sm rounded-3 d-flex align-items-center gap-1" onClick={confirmDeepClean}>
+                    <i className="material-icons-outlined" style={{ fontSize: 16 }}>delete_forever</i>
+                    Delete All {deepCleanScan.scan.total_found} Entities
+                  </button>
+                  <button className="btn btn-light btn-sm rounded-3" onClick={() => setDeepCleanScan(null)}>Cancel</button>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
@@ -479,11 +589,8 @@ const SmartExecutionHistory: React.FC = () => {
           </div>
           <div className="card-body p-0">
             {loading ? (
-              <div className="text-center py-5">
-                <div className="spinner-border text-primary" role="status" style={{ width: '3rem', height: '3rem' }}>
-                  <span className="visually-hidden">Loading...</span>
-                </div>
-                <p className="mt-3 text-muted">Loading execution history...</p>
+              <div className="p-4">
+                <SkeletonTable rows={6} cols={6} />
               </div>
             ) : filteredExecutions.length === 0 ? (
               <div className="text-center py-5">
@@ -594,7 +701,7 @@ const SmartExecutionHistory: React.FC = () => {
                             </div>
                             <div className="d-flex gap-2">
                               <span className="badge bg-primary bg-opacity-10 text-primary rounded-pill">{exec.total_operations} ops</span>
-                              {exec.tags?.map((tag, i) => (
+                              {exec.tags?.map((tag: string, i: number) => (
                                 <span key={i} className="badge bg-info bg-opacity-10 text-info rounded-pill">{tag}</span>
                               ))}
                             </div>
@@ -666,7 +773,7 @@ const SmartExecutionHistory: React.FC = () => {
                                   <div className="font-monospace text-muted" style={{ fontSize: '0.7rem' }}>{exec.execution_id}</div>
                                   {exec.tags && exec.tags.length > 0 && (
                                     <div className="d-flex gap-1 flex-wrap mt-1">
-                                      {exec.tags.map((tag, i) => (
+                                      {exec.tags.map((tag: string, i: number) => (
                                         <span key={i} className="badge bg-info bg-opacity-25 text-info small">{tag}</span>
                                       ))}
                                     </div>
@@ -783,13 +890,17 @@ const SmartExecutionHistory: React.FC = () => {
                                 <button
                                   className="btn btn-outline-warning btn-sm rounded-3 d-inline-flex align-items-center gap-1"
                                   onClick={() => cleanupEntities(exec.execution_id)}
-                                  disabled={exec.status === 'RUNNING' || exec.status === 'LONGEVITY_SUSTAINING'}
+                                  disabled={exec.status === 'RUNNING' || exec.status === 'LONGEVITY_SUSTAINING' || cleaningUpId === exec.execution_id}
                                   data-bs-toggle="tooltip"
                                   data-bs-placement="top"
-                                  title="Delete all entities (VMs, blueprints, etc.) created by this execution"
+                                  title="Delete all entities (VMs, images, stress pods, etc.) created by this execution"
                                 >
-                                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>cleaning_services</i>
-                                  <span className="d-none d-xl-inline small">Cleanup</span>
+                                  {cleaningUpId === exec.execution_id ? (
+                                    <span className="spinner-border spinner-border-sm" role="status"></span>
+                                  ) : (
+                                    <i className="material-icons-outlined" style={{ fontSize: 16 }}>cleaning_services</i>
+                                  )}
+                                  <span className="d-none d-xl-inline small">{cleaningUpId === exec.execution_id ? 'Cleaning...' : 'Cleanup'}</span>
                                 </button>
                                 <button
                                   className="btn btn-outline-danger btn-sm rounded-3 d-inline-flex align-items-center gap-1"
@@ -811,7 +922,7 @@ const SmartExecutionHistory: React.FC = () => {
                           </tr>
 
                           {/* Child Execution Row */}
-                          {isExpanded && hasChildren && exec.entities_config!.child_executions!.map(child => (
+                          {isExpanded && hasChildren && exec.entities_config!.child_executions!.map((child: any) => (
                             <tr key={child.execution_id} className="table-info">
                               <td colSpan={9} className="ps-5 pe-4">
                                 <div className="card border-0 shadow-sm my-2" style={{ background: 'linear-gradient(135deg, #f8f9fa 0%, #e3f2fd 100%)' }}>

@@ -3,6 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import { getApiBase } from '../utils/backendUrl';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeAlertsByTestbed, getFakeExecutionsByTestbed } from '../fake-data';
+import { PageHeader, MetricCard, StatusBadge, EmptyState } from '../components/ui';
+import { SkeletonMetricRow, SkeletonTable } from '../components/ui/LoadingSkeleton';
 
 interface Testbed {
   unique_testbed_id: string;
@@ -13,10 +15,7 @@ interface Testbed {
   username: string;
   password: string;
   timestamp: string;
-  testbed_json?: {
-    prometheus_endpoint?: string;
-    [key: string]: any;
-  };
+  testbed_json?: { prometheus_endpoint?: string; [key: string]: any };
 }
 
 interface Alert {
@@ -75,8 +74,7 @@ const Status: React.FC = () => {
       setSelectedTestbedDetails(testbed || null);
       fetchAlerts(selectedTestbed);
       fetchExecutions(selectedTestbed);
-      const promUrl = getPrometheusUrl(testbed);
-      checkPrometheusStatus(promUrl);
+      checkPrometheusStatus(getPrometheusUrl(testbed));
     }
   }, [selectedTestbed, testbeds]);
 
@@ -99,9 +97,7 @@ const Status: React.FC = () => {
 
   const getPrometheusUrl = (testbed?: Testbed | null): string | undefined => {
     if (!testbed) return undefined;
-    if (testbed.prometheus_url) return testbed.prometheus_url;
-    if (testbed.testbed_json?.prometheus_endpoint) return testbed.testbed_json.prometheus_endpoint;
-    return undefined;
+    return testbed.prometheus_url || testbed.testbed_json?.prometheus_endpoint || undefined;
   };
 
   const fetchTestbeds = async () => {
@@ -117,11 +113,28 @@ const Status: React.FC = () => {
         return;
       }
       const base = getApiBase();
-      const response = await fetch(`${base}/api/get-testbeds`);
-      const data = await response.json();
+      const [tbRes, histRes] = await Promise.all([
+        fetch(`${base}/api/get-testbeds`),
+        fetch(`${base}/api/smart-execution/history`),
+      ]);
+      const data = await tbRes.json();
       if (data.success && data.testbeds) {
         setTestbeds(data.testbeds);
-        if (data.testbeds.length > 0 && !selectedTestbed) setSelectedTestbed(data.testbeds[0].unique_testbed_id);
+        if (data.testbeds.length > 0 && !selectedTestbed) {
+          let bestId = data.testbeds[0].unique_testbed_id;
+          try {
+            const histData = await histRes.json();
+            const execs = histData.executions || [];
+            if (execs.length > 0) {
+              const counts: Record<string, number> = {};
+              execs.forEach((e: any) => { counts[e.testbed_id] = (counts[e.testbed_id] || 0) + 1; });
+              const tbIds = new Set(data.testbeds.map((t: any) => t.unique_testbed_id));
+              const best = Object.entries(counts).filter(([id]) => tbIds.has(id)).sort((a, b) => b[1] - a[1])[0];
+              if (best) bestId = best[0];
+            }
+          } catch { /* best-effort */ }
+          setSelectedTestbed(bestId);
+        }
       }
     } catch (err) {
       console.error('Error fetching testbeds:', err);
@@ -139,13 +152,10 @@ const Status: React.FC = () => {
         setAlerts(data.alerts as any || []);
         return;
       }
-      const base = getApiBase();
-      const response = await fetch(`${base}/api/alerts/${testbedId}`);
+      const response = await fetch(`${getApiBase()}/api/alerts/${testbedId}`);
       const data = await response.json();
       if (data.success) setAlerts(data.alerts || []);
-    } catch (err) {
-      console.warn('Error fetching alerts:', err);
-    }
+    } catch (err) { console.warn('Error fetching alerts:', err); }
   };
 
   const fetchExecutions = async (testbedId: string) => {
@@ -156,57 +166,46 @@ const Status: React.FC = () => {
         setExecutions(data.executions as any || []);
         return;
       }
-      const base = getApiBase();
-      const response = await fetch(`${base}/api/smart-execution/history?testbed_id=${testbedId}`);
+      const response = await fetch(`${getApiBase()}/api/smart-execution/history?testbed_id=${testbedId}`);
       const data = await response.json();
       if (data.success) setExecutions(data.executions || []);
-    } catch (err) {
-      console.warn('Error fetching executions:', err);
-    }
+    } catch (err) { console.warn('Error fetching executions:', err); }
   };
 
   const checkPrometheusStatus = async (url?: string) => {
     if (!url) { setPrometheusStatus('offline'); return; }
     try {
       setPrometheusStatus('checking');
-      const base = getApiBase();
-      const response = await fetch(`${base}/api/check-prometheus?url=${encodeURIComponent(url)}`);
+      const response = await fetch(`${getApiBase()}/api/check-prometheus?url=${encodeURIComponent(url)}`);
       const data = await response.json();
       setPrometheusStatus(data.status === 'online' ? 'online' : 'offline');
-    } catch (err) {
-      console.warn('Error checking Prometheus status:', err);
-      setPrometheusStatus('offline');
-    }
+    } catch { setPrometheusStatus('offline'); }
   };
 
-  const getExecStartTime = (exec: ExecutionRecord): string | undefined => exec.start_time || exec.started_at;
+  const getExecStartTime = (exec: ExecutionRecord) => exec.start_time || exec.started_at;
 
-  const getExecutionStatusColor = (status: string) => {
-    switch (status.toUpperCase()) {
-      case 'COMPLETED': return 'bg-success';
-      case 'FAILED': case 'TIMEOUT': return 'bg-danger';
-      case 'RUNNING': return 'bg-primary';
-      case 'STOPPED': return 'bg-secondary';
-      default: return 'bg-secondary';
-    }
+  const execStatusVariant = (status: string): 'success' | 'danger' | 'primary' | 'neutral' => {
+    const s = status.toUpperCase();
+    if (s === 'COMPLETED') return 'success';
+    if (s === 'FAILED' || s === 'TIMEOUT') return 'danger';
+    if (s === 'RUNNING') return 'primary';
+    return 'neutral';
   };
 
-  const getSeverityBadge = (severity: string) => {
-    switch (severity.toLowerCase()) {
-      case 'critical': return 'bg-danger';
-      case 'warning': return 'bg-warning text-dark';
-      case 'info': return 'bg-info';
-      default: return 'bg-secondary';
-    }
+  const alertSeverityVariant = (severity: string): 'danger' | 'warning' | 'info' | 'neutral' => {
+    const s = severity.toLowerCase();
+    if (s === 'critical') return 'danger';
+    if (s === 'warning') return 'warning';
+    if (s === 'info') return 'info';
+    return 'neutral';
   };
 
-  const getStatusBadge = (status: string) => {
-    switch (status.toLowerCase()) {
-      case 'active': case 'firing': return 'bg-danger';
-      case 'pending': return 'bg-warning text-dark';
-      case 'resolved': return 'bg-success';
-      default: return 'bg-secondary';
-    }
+  const alertStatusVariant = (status: string): 'danger' | 'warning' | 'success' | 'neutral' => {
+    const s = status.toLowerCase();
+    if (s === 'active' || s === 'firing') return 'danger';
+    if (s === 'pending') return 'warning';
+    if (s === 'resolved') return 'success';
+    return 'neutral';
   };
 
   const totalExecs = executions.length;
@@ -216,46 +215,46 @@ const Status: React.FC = () => {
   const avgSuccessRate = executions.length > 0 ? executions.reduce((sum, e) => sum + (e.success_rate || 0), 0) / executions.length : 0;
   const activeAlerts = alerts.filter(a => ['active', 'firing'].includes(a.status.toLowerCase())).length;
   const criticalAlerts = alerts.filter(a => a.severity.toLowerCase() === 'critical').length;
+  const successRateVariant: 'success' | 'warning' | 'danger' = avgSuccessRate >= 80 ? 'success' : avgSuccessRate >= 50 ? 'warning' : 'danger';
+
+  const promVariant: 'success' | 'danger' | 'warning' = prometheusStatus === 'online' ? 'success' : prometheusStatus === 'offline' ? 'danger' : 'warning';
+  const promLabel = prometheusStatus === 'online' ? 'Connected' : prometheusStatus === 'offline' ? 'Disconnected' : 'Checking…';
 
   return (
     <div className="main-content">
-      {/* Header */}
-      <div className="d-flex justify-content-between align-items-start mb-4 flex-wrap gap-3">
-        <div>
-          <h2 className="fw-bold mb-1 d-flex align-items-center gap-2">
-            <div className="d-inline-flex align-items-center justify-content-center rounded-3" style={{ width: 48, height: 48, background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)' }}>
-              <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>monitoring</i>
-            </div>
-            Testbed Health & Status
-          </h2>
-          <p className="text-muted mb-0" style={{ maxWidth: 700 }}>
-            Real-time health overview of your testbed. See active alerts, execution history, and service connectivity at a glance. Select a testbed below to view its current status.
-          </p>
-        </div>
-        <div className="d-flex align-items-center gap-2 flex-wrap">
-          <span className="text-muted" style={{ fontSize: '0.78rem' }}>Updated {lastRefreshed.toLocaleTimeString()}</span>
-          <select className="form-select form-select-sm rounded-3" value={autoRefreshInterval} onChange={e => setAutoRefreshInterval(Number(e.target.value))} style={{ width: 'auto' }}>
-            {AUTO_REFRESH_INTERVALS.map(opt => <option key={opt.value} value={opt.value}>Auto: {opt.label}</option>)}
-          </select>
-          <button className="btn btn-outline-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={refreshAll}>
-            <i className="material-icons-outlined" style={{ fontSize: 18 }}>refresh</i>
-          </button>
-        </div>
-      </div>
+      <PageHeader
+        icon="monitoring"
+        iconGradient="linear-gradient(135deg, #10b981, #059669)"
+        title="Testbed Health & Status"
+        subtitle="Real-time health overview — alerts, execution history, and service connectivity at a glance."
+        actions={
+          <div className="d-flex align-items-center gap-2 flex-wrap">
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>Updated {lastRefreshed.toLocaleTimeString()}</span>
+            <select className="form-select form-select-sm rounded-3" value={autoRefreshInterval} onChange={e => setAutoRefreshInterval(Number(e.target.value))} style={{ width: 'auto' }}>
+              {AUTO_REFRESH_INTERVALS.map(opt => <option key={opt.value} value={opt.value}>Auto: {opt.label}</option>)}
+            </select>
+            <button className="btn btn-outline-primary btn-sm rounded-3 d-flex align-items-center" onClick={refreshAll}>
+              <i className="material-icons-outlined" style={{ fontSize: 18 }}>refresh</i>
+            </button>
+          </div>
+        }
+      />
 
       {/* Testbed Selector */}
-      <div className="card rounded-4 border shadow-none mb-4">
+      <div className="card border-0 rounded-3 mb-4" style={{ boxShadow: 'var(--shadow-sm)' }}>
         <div className="card-body p-4">
           <div className="d-flex align-items-center gap-3 flex-wrap">
-            <div className="d-flex align-items-center justify-content-center rounded-3 flex-shrink-0" style={{ width: 40, height: 40, background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' }}>
+            <div className="d-flex align-items-center justify-content-center rounded-3 flex-shrink-0" style={{ width: 40, height: 40, background: 'linear-gradient(135deg, #667eea, #764ba2)' }}>
               <i className="material-icons-outlined text-white" style={{ fontSize: 20 }}>dns</i>
             </div>
             <div className="flex-grow-1" style={{ maxWidth: 400 }}>
-              <label className="form-label fw-semibold small mb-1">Select Testbed</label>
+              <label className="form-label fw-semibold mb-1" style={{ fontSize: 'var(--text-sm)' }}>Select Testbed</label>
               {loading ? (
-                <div className="d-flex align-items-center gap-2 text-muted"><span className="spinner-border spinner-border-sm"></span>Loading testbeds...</div>
+                <div className="d-flex align-items-center gap-2" style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-sm)' }}>
+                  <span className="spinner-border spinner-border-sm" />Loading testbeds…
+                </div>
               ) : error ? (
-                <div className="text-danger small">{error}</div>
+                <div className="text-danger" style={{ fontSize: 'var(--text-sm)' }}>{error}</div>
               ) : (
                 <select className="form-select form-select-sm rounded-3" value={selectedTestbed} onChange={e => setSelectedTestbed(e.target.value)}>
                   <option value="">-- Select a testbed --</option>
@@ -265,100 +264,94 @@ const Status: React.FC = () => {
             </div>
             {selectedTestbedDetails && (
               <div className="d-flex gap-4 ms-auto flex-wrap">
-                {selectedTestbedDetails.pc_ip && (
-                  <div className="small"><span className="text-muted">PC:</span> <code className="ms-1">{selectedTestbedDetails.pc_ip}</code></div>
-                )}
-                {selectedTestbedDetails.ncm_ip && (
-                  <div className="small"><span className="text-muted">NCM:</span> <code className="ms-1">{selectedTestbedDetails.ncm_ip}</code></div>
-                )}
-                <div className="small"><span className="text-muted">Onboarded:</span> <span className="ms-1">{new Date(selectedTestbedDetails.timestamp).toLocaleDateString()}</span></div>
+                {selectedTestbedDetails.pc_ip && <div style={{ fontSize: 'var(--text-sm)' }}><span style={{ color: 'var(--color-text-muted)' }}>PC:</span> <code className="ms-1">{selectedTestbedDetails.pc_ip}</code></div>}
+                {selectedTestbedDetails.ncm_ip && <div style={{ fontSize: 'var(--text-sm)' }}><span style={{ color: 'var(--color-text-muted)' }}>NCM:</span> <code className="ms-1">{selectedTestbedDetails.ncm_ip}</code></div>}
+                <div style={{ fontSize: 'var(--text-sm)' }}><span style={{ color: 'var(--color-text-muted)' }}>Onboarded:</span> <span className="ms-1">{new Date(selectedTestbedDetails.timestamp).toLocaleDateString()}</span></div>
               </div>
             )}
           </div>
         </div>
       </div>
 
+      {/* No testbed selected */}
       {!selectedTestbed && !loading && (
-        <div className="card rounded-4 border shadow-none">
-          <div className="card-body p-5 text-center">
-            <i className="material-icons-outlined text-muted mb-3" style={{ fontSize: 64, opacity: 0.3 }}>monitor_heart</i>
-            <h5 className="fw-semibold mb-2">Select a Testbed to View Status</h5>
-            <p className="text-muted mb-0" style={{ maxWidth: 500, margin: '0 auto' }}>
-              Choose a testbed from the dropdown above to see its health status, active alerts, Prometheus connectivity, and recent execution history.
-            </p>
-          </div>
-        </div>
+        <EmptyState icon="monitor_heart" title="Select a Testbed to View Status" description="Choose a testbed from the dropdown above to see health status, active alerts, Prometheus connectivity, and execution history." />
+      )}
+
+      {/* Loading skeleton while testbed content loads */}
+      {loading && (
+        <>
+          <SkeletonMetricRow count={4} />
+          <SkeletonTable rows={4} cols={5} />
+        </>
       )}
 
       {selectedTestbedDetails && (
         <>
-          {/* Summary Cards */}
-          <div className="row g-3 mb-4">
-            {[
-              { icon: 'history', label: 'Total Executions', value: totalExecs, color: '#8b5cf6', sub: `${completedExecs} completed` },
-              { icon: runningExecs > 0 ? 'play_circle' : 'check_circle', label: runningExecs > 0 ? 'Running Now' : 'Completed', value: runningExecs > 0 ? runningExecs : completedExecs, color: runningExecs > 0 ? '#3b82f6' : '#22c55e', sub: runningExecs > 0 ? 'In progress' : `${failedExecs} failed` },
-              { icon: 'trending_up', label: 'Avg Success Rate', value: `${avgSuccessRate.toFixed(1)}%`, color: avgSuccessRate >= 80 ? '#22c55e' : avgSuccessRate >= 50 ? '#f59e0b' : '#ef4444', sub: 'Across all executions' },
-              { icon: 'warning', label: 'Active Alerts', value: activeAlerts, color: activeAlerts > 0 ? '#ef4444' : '#22c55e', sub: criticalAlerts > 0 ? `${criticalAlerts} critical` : 'No critical alerts' },
-            ].map((c, i) => (
-              <div className="col-md-3" key={i}>
-                <div className="card rounded-4 border shadow-none h-100">
-                  <div className="card-body d-flex align-items-center gap-3 p-3">
-                    <div className="d-flex align-items-center justify-content-center rounded-3 flex-shrink-0" style={{ width: 48, height: 48, background: `${c.color}15` }}>
-                      <i className="material-icons-outlined" style={{ fontSize: 26, color: c.color }}>{c.icon}</i>
-                    </div>
-                    <div>
-                      <div className="text-muted small">{c.label}</div>
-                      <div className="fw-bold fs-4" style={{ color: c.color }}>{c.value}</div>
-                      <div className="text-muted" style={{ fontSize: '0.72rem' }}>{c.sub}</div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ))}
+          {/* Summary Metric Cards */}
+          <div className="row row-cols-1 row-cols-md-2 row-cols-xl-4 g-3 mb-4">
+            <div className="col">
+              <MetricCard icon="history" iconGradient="linear-gradient(135deg, #8b5cf6, #7c3aed)" label="Total Executions" value={totalExecs} detail={`${completedExecs} completed`} />
+            </div>
+            <div className="col">
+              <MetricCard
+                icon={runningExecs > 0 ? 'play_circle' : 'check_circle'}
+                variant={runningExecs > 0 ? 'default' : 'success'}
+                label={runningExecs > 0 ? 'Running Now' : 'Completed'}
+                value={runningExecs > 0 ? runningExecs : completedExecs}
+                detail={runningExecs > 0 ? 'In progress' : `${failedExecs} failed`}
+              />
+            </div>
+            <div className="col">
+              <MetricCard icon="trending_up" variant={successRateVariant} label="Avg Success Rate" value={`${avgSuccessRate.toFixed(1)}`} suffix="%" detail="Across all executions" />
+            </div>
+            <div className="col">
+              <MetricCard
+                icon="warning"
+                variant={activeAlerts > 0 ? 'danger' : 'success'}
+                label="Active Alerts"
+                value={activeAlerts}
+                detail={criticalAlerts > 0 ? `${criticalAlerts} critical` : 'No critical alerts'}
+              />
+            </div>
           </div>
 
-          {/* Prometheus + Testbed Info Row */}
+          {/* Prometheus + Testbed Details */}
           <div className="row g-3 mb-4">
             <div className="col-md-6">
-              <div className="card rounded-4 border shadow-none h-100">
-                <div className="card-header bg-transparent border-bottom p-4">
-                  <h6 className="mb-0 fw-semibold d-flex align-items-center gap-2">
-                    <i className="material-icons-outlined" style={{ fontSize: 20, color: prometheusStatus === 'online' ? '#22c55e' : prometheusStatus === 'offline' ? '#ef4444' : '#f59e0b' }}>
+              <div className="card border-0 rounded-3 h-100" style={{ boxShadow: 'var(--shadow-sm)' }}>
+                <div className="card-body p-4">
+                  <div className="d-flex align-items-center gap-2 mb-3">
+                    <i className="material-icons-outlined" style={{ fontSize: 20, color: promVariant === 'success' ? 'var(--color-success)' : promVariant === 'danger' ? 'var(--color-danger)' : 'var(--color-warning)' }}>
                       {prometheusStatus === 'online' ? 'cloud_done' : prometheusStatus === 'offline' ? 'cloud_off' : 'cloud_sync'}
                     </i>
-                    Prometheus Monitoring
-                    <span className={`badge rounded-pill ms-2 ${prometheusStatus === 'online' ? 'bg-success' : prometheusStatus === 'offline' ? 'bg-danger' : 'bg-warning text-dark'}`} style={{ fontSize: '0.7rem' }}>
-                      {prometheusStatus === 'online' ? 'Connected' : prometheusStatus === 'offline' ? 'Disconnected' : 'Checking...'}
-                    </span>
-                  </h6>
-                </div>
-                <div className="card-body p-4">
-                  <p className="text-muted small mb-3">
-                    Prometheus collects real-time metrics (CPU, memory, disk) from your cluster. When connected, it powers the alert system and resource monitoring.
+                    <h6 className="mb-0 fw-semibold" style={{ fontSize: 'var(--text-md)' }}>Prometheus Monitoring</h6>
+                    <StatusBadge label={promLabel} variant={promVariant} dot size="sm" />
+                  </div>
+                  <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }} className="mb-3">
+                    Prometheus collects real-time metrics (CPU, memory, disk) from your cluster and powers the alert system.
                   </p>
                   {getPrometheusUrl(selectedTestbedDetails) ? (
-                    <div className="d-flex align-items-center gap-2">
-                      <span className="text-muted small">Endpoint:</span>
-                      <code className="small">{getPrometheusUrl(selectedTestbedDetails)}</code>
+                    <div className="d-flex align-items-center gap-2 mb-3">
+                      <span style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-muted)' }}>Endpoint:</span>
+                      <code style={{ fontSize: 'var(--text-sm)' }}>{getPrometheusUrl(selectedTestbedDetails)}</code>
                     </div>
                   ) : (
-                    <div className="text-muted small fst-italic">No Prometheus endpoint configured for this testbed</div>
+                    <div style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-muted)', fontStyle: 'italic' }} className="mb-3">No Prometheus endpoint configured</div>
                   )}
-                  <button className="btn btn-outline-primary btn-sm rounded-3 mt-3 d-flex align-items-center gap-1" onClick={() => checkPrometheusStatus(getPrometheusUrl(selectedTestbedDetails))}>
+                  <button className="btn btn-outline-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={() => checkPrometheusStatus(getPrometheusUrl(selectedTestbedDetails))}>
                     <i className="material-icons-outlined" style={{ fontSize: 16 }}>refresh</i>Check Connection
                   </button>
                 </div>
               </div>
             </div>
             <div className="col-md-6">
-              <div className="card rounded-4 border shadow-none h-100">
-                <div className="card-header bg-transparent border-bottom p-4">
-                  <h6 className="mb-0 fw-semibold d-flex align-items-center gap-2">
-                    <i className="material-icons-outlined text-primary" style={{ fontSize: 20 }}>info</i>
-                    Testbed Details
-                  </h6>
-                </div>
+              <div className="card border-0 rounded-3 h-100" style={{ boxShadow: 'var(--shadow-sm)' }}>
                 <div className="card-body p-4">
+                  <div className="d-flex align-items-center gap-2 mb-3">
+                    <i className="material-icons-outlined" style={{ fontSize: 20, color: 'var(--color-primary)' }}>info</i>
+                    <h6 className="mb-0 fw-semibold" style={{ fontSize: 'var(--text-md)' }}>Testbed Details</h6>
+                  </div>
                   <div className="row g-3">
                     {[
                       { label: 'Name', value: selectedTestbedDetails.testbed_label },
@@ -367,13 +360,13 @@ const Status: React.FC = () => {
                       { label: 'Onboarded', value: new Date(selectedTestbedDetails.timestamp).toLocaleString() },
                     ].map((row, i) => (
                       <div className="col-6" key={i}>
-                        <div className="text-muted small">{row.label}</div>
-                        <div className="fw-medium small">{(row as any).code ? <code>{row.value}</code> : row.value}</div>
+                        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>{row.label}</div>
+                        <div className="fw-medium" style={{ fontSize: 'var(--text-sm)' }}>{(row as any).code ? <code>{row.value}</code> : row.value}</div>
                       </div>
                     ))}
                     <div className="col-12">
-                      <div className="text-muted small">Testbed ID</div>
-                      <code style={{ fontSize: '0.72rem' }}>{selectedTestbedDetails.unique_testbed_id}</code>
+                      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>Testbed ID</div>
+                      <code style={{ fontSize: 'var(--text-xs)' }}>{selectedTestbedDetails.unique_testbed_id}</code>
                     </div>
                   </div>
                 </div>
@@ -382,80 +375,89 @@ const Status: React.FC = () => {
           </div>
 
           {/* Active Alerts */}
-          <div className="card rounded-4 border shadow-none mb-4">
-            <div className="card-header bg-transparent border-bottom p-4 d-flex justify-content-between align-items-center">
-              <div>
-                <h6 className="mb-0 fw-semibold d-flex align-items-center gap-2">
-                  <i className="material-icons-outlined" style={{ fontSize: 20, color: alerts.length > 0 ? '#ef4444' : '#22c55e' }}>
+          <div className="card border-0 rounded-3 mb-4" style={{ boxShadow: 'var(--shadow-sm)' }}>
+            <div className="card-body p-4">
+              <div className="d-flex justify-content-between align-items-center mb-3">
+                <div className="d-flex align-items-center gap-2">
+                  <i className="material-icons-outlined" style={{ fontSize: 20, color: alerts.length > 0 ? 'var(--color-danger)' : 'var(--color-success)' }}>
                     {alerts.length > 0 ? 'warning' : 'verified'}
                   </i>
-                  Active Alerts
-                  {alerts.length > 0 && <span className="badge bg-danger rounded-pill">{alerts.length}</span>}
-                </h6>
-                <p className="text-muted small mb-0 mt-1">Resource alerts fired by Prometheus for this testbed (e.g. high CPU, memory, or disk usage)</p>
+                  <h6 className="mb-0 fw-semibold" style={{ fontSize: 'var(--text-md)' }}>Active Alerts</h6>
+                  {alerts.length > 0 && <StatusBadge label={String(alerts.length)} variant="danger" size="sm" />}
+                </div>
+                <button className="btn btn-outline-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={() => navigate('/alert-summary')}>
+                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>open_in_new</i>Full Alert Dashboard
+                </button>
               </div>
-              <button className="btn btn-outline-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={() => navigate('/alert-summary')}>
-                <i className="material-icons-outlined" style={{ fontSize: 16 }}>open_in_new</i>Full Alert Dashboard
-              </button>
-            </div>
-            <div className="card-body p-4">
+              <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }} className="mb-3">Resource alerts fired by Prometheus for this testbed</p>
+
               {alerts.length === 0 ? (
-                <div className="d-flex align-items-center gap-2 p-3 rounded-3" style={{ background: '#dcfce7', border: '1px solid #86efac' }}>
-                  <i className="material-icons-outlined" style={{ color: '#166534', fontSize: 22 }}>check_circle</i>
-                  <span style={{ color: '#166534', fontWeight: 500 }}>No active alerts — all systems healthy for this testbed</span>
+                <div className="d-flex align-items-center gap-2 p-3 rounded-3" style={{ background: 'var(--color-success-light)' }}>
+                  <i className="material-icons-outlined" style={{ color: 'var(--color-success)', fontSize: 22 }}>check_circle</i>
+                  <span style={{ color: 'var(--color-success)', fontWeight: 500, fontSize: 'var(--text-base)' }}>No active alerts — all systems healthy for this testbed</span>
                 </div>
               ) : (
                 <div className="table-responsive">
-                  <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: '0.82rem' }}>
-                    <thead className="table-light">
-                      <tr><th className="ps-3">Alert</th><th>Severity</th><th>Status</th><th>Description</th><th>Time</th></tr>
-                    </thead>
+                  <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 'var(--text-sm)' }}>
+                    <thead><tr style={{ color: 'var(--color-text-secondary)' }}>
+                      <th className="fw-semibold border-0 pb-2 ps-3">Alert</th>
+                      <th className="fw-semibold border-0 pb-2">Severity</th>
+                      <th className="fw-semibold border-0 pb-2">Status</th>
+                      <th className="fw-semibold border-0 pb-2">Description</th>
+                      <th className="fw-semibold border-0 pb-2">Time</th>
+                    </tr></thead>
                     <tbody>
                       {alerts.slice(0, 10).map(alert => (
                         <tr key={alert.id}>
-                          <td className="ps-3 fw-medium">{alert.alert_name}</td>
-                          <td><span className={`badge rounded-pill ${getSeverityBadge(alert.severity)}`}>{alert.severity}</span></td>
-                          <td><span className={`badge rounded-pill ${getStatusBadge(alert.status)}`}>{alert.status}</span></td>
-                          <td className="text-muted" style={{ maxWidth: 300 }}>{alert.description.length > 100 ? alert.description.slice(0, 100) + '...' : alert.description}</td>
-                          <td className="text-muted text-nowrap">{new Date(alert.timestamp).toLocaleString()}</td>
+                          <td className="ps-3 fw-medium border-0">{alert.alert_name}</td>
+                          <td className="border-0"><StatusBadge label={alert.severity} variant={alertSeverityVariant(alert.severity)} size="sm" /></td>
+                          <td className="border-0"><StatusBadge label={alert.status} variant={alertStatusVariant(alert.status)} dot size="sm" /></td>
+                          <td className="border-0" style={{ maxWidth: 300, color: 'var(--color-text-secondary)' }}>{alert.description.length > 100 ? alert.description.slice(0, 100) + '…' : alert.description}</td>
+                          <td className="border-0 text-nowrap" style={{ color: 'var(--color-text-muted)' }}>{new Date(alert.timestamp).toLocaleString()}</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                  {alerts.length > 10 && <div className="text-center mt-3"><button className="btn btn-link btn-sm" onClick={() => navigate('/alert-summary')}>View all {alerts.length} alerts</button></div>}
+                  {alerts.length > 10 && (
+                    <div className="text-center mt-3">
+                      <button className="btn btn-link btn-sm" onClick={() => navigate('/alert-summary')}>View all {alerts.length} alerts</button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
           </div>
 
           {/* Recent Executions */}
-          <div className="card rounded-4 border shadow-none">
-            <div className="card-header bg-transparent border-bottom p-4 d-flex justify-content-between align-items-center">
-              <div>
-                <h6 className="mb-0 fw-semibold d-flex align-items-center gap-2">
-                  <i className="material-icons-outlined text-primary" style={{ fontSize: 20 }}>history</i>
-                  Recent Executions
-                  <span className="badge bg-light text-muted rounded-pill">{executions.length}</span>
-                </h6>
-                <p className="text-muted small mb-0 mt-1">Smart Execution runs on this testbed — click any row to view its report or live monitor</p>
-              </div>
-              <button className="btn btn-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={() => navigate('/smart-execution/history')}>
-                <i className="material-icons-outlined" style={{ fontSize: 16 }}>list</i>View All
-              </button>
-            </div>
-            <div className="card-body p-0">
-              {executions.length === 0 ? (
-                <div className="text-center py-5">
-                  <i className="material-icons-outlined text-muted mb-2" style={{ fontSize: 48, opacity: 0.3 }}>rocket_launch</i>
-                  <p className="text-muted mb-0">No executions yet for this testbed</p>
-                  <button className="btn btn-primary btn-sm rounded-3 mt-3" onClick={() => navigate('/smart-execution/configure')}>Start First Execution</button>
+          <div className="card border-0 rounded-3" style={{ boxShadow: 'var(--shadow-sm)' }}>
+            <div className="card-body p-4">
+              <div className="d-flex justify-content-between align-items-center mb-3">
+                <div className="d-flex align-items-center gap-2">
+                  <i className="material-icons-outlined" style={{ fontSize: 20, color: 'var(--color-primary)' }}>history</i>
+                  <h6 className="mb-0 fw-semibold" style={{ fontSize: 'var(--text-md)' }}>Recent Executions</h6>
+                  <StatusBadge label={String(executions.length)} variant="neutral" size="sm" />
                 </div>
+                <button className="btn btn-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={() => navigate('/smart-execution/history')}>
+                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>list</i>View All
+                </button>
+              </div>
+              <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }} className="mb-3">Smart Execution runs on this testbed — click any row to view its report or live monitor</p>
+
+              {executions.length === 0 ? (
+                <EmptyState icon="rocket_launch" title="No executions yet" description="No Smart Executions have been run on this testbed."
+                  action={<button className="btn btn-primary btn-sm rounded-3" onClick={() => navigate('/smart-execution/configure')}>Start First Execution</button>} />
               ) : (
                 <div className="table-responsive">
-                  <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: '0.82rem' }}>
-                    <thead className="table-light">
-                      <tr><th className="ps-4">Execution</th><th>Status</th><th>Started</th><th>Duration</th><th>Operations</th><th>Success Rate</th><th></th></tr>
-                    </thead>
+                  <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 'var(--text-sm)' }}>
+                    <thead><tr style={{ color: 'var(--color-text-secondary)' }}>
+                      <th className="fw-semibold border-0 pb-2 ps-3">Execution</th>
+                      <th className="fw-semibold border-0 pb-2">Status</th>
+                      <th className="fw-semibold border-0 pb-2">Started</th>
+                      <th className="fw-semibold border-0 pb-2">Duration</th>
+                      <th className="fw-semibold border-0 pb-2">Operations</th>
+                      <th className="fw-semibold border-0 pb-2">Success Rate</th>
+                      <th className="border-0"></th>
+                    </tr></thead>
                     <tbody>
                       {executions.slice(0, 10).map(exec => {
                         const startTime = getExecStartTime(exec);
@@ -463,19 +465,23 @@ const Status: React.FC = () => {
                         return (
                           <tr key={exec.execution_id} style={{ cursor: 'pointer' }}
                             onClick={() => navigate(isRunning ? `/smart-execution/monitor/${exec.execution_id}` : `/smart-execution/report/${exec.execution_id}`)}>
-                            <td className="ps-4">
-                              <code style={{ fontSize: '0.72rem' }}>{exec.execution_id.length > 28 ? exec.execution_id.substring(0, 28) + '...' : exec.execution_id}</code>
+                            <td className="ps-3 border-0">
+                              <code style={{ fontSize: 'var(--text-xs)' }}>{exec.execution_id.length > 28 ? exec.execution_id.substring(0, 28) + '…' : exec.execution_id}</code>
                             </td>
-                            <td><span className={`badge rounded-pill ${getExecutionStatusColor(exec.status)}`}>{exec.status}</span></td>
-                            <td className="text-muted">{startTime ? new Date(startTime).toLocaleString() : '—'}</td>
-                            <td>{exec.duration_minutes != null ? `${exec.duration_minutes.toFixed(1)} min` : '—'}</td>
-                            <td>{exec.successful_operations != null && exec.total_operations != null ? <><span className="fw-medium">{exec.successful_operations}</span><span className="text-muted">/{exec.total_operations}</span></> : '—'}</td>
-                            <td>
+                            <td className="border-0"><StatusBadge label={exec.status} variant={execStatusVariant(exec.status)} dot size="sm" /></td>
+                            <td className="border-0" style={{ color: 'var(--color-text-muted)' }}>{startTime ? new Date(startTime).toLocaleString() : '—'}</td>
+                            <td className="border-0">{exec.duration_minutes != null ? `${exec.duration_minutes.toFixed(1)} min` : '—'}</td>
+                            <td className="border-0">
+                              {exec.successful_operations != null && exec.total_operations != null
+                                ? <><span className="fw-medium">{exec.successful_operations}</span><span style={{ color: 'var(--color-text-muted)' }}>/{exec.total_operations}</span></>
+                                : '—'}
+                            </td>
+                            <td className="border-0">
                               {exec.success_rate != null ? (
-                                <span className={`fw-semibold ${exec.success_rate >= 80 ? 'text-success' : exec.success_rate >= 50 ? 'text-warning' : 'text-danger'}`}>{exec.success_rate.toFixed(1)}%</span>
+                                <span className="fw-semibold" style={{ color: exec.success_rate >= 80 ? 'var(--color-success)' : exec.success_rate >= 50 ? 'var(--color-warning)' : 'var(--color-danger)' }}>{exec.success_rate.toFixed(1)}%</span>
                               ) : '—'}
                             </td>
-                            <td><i className="material-icons-outlined text-muted" style={{ fontSize: 18 }}>{isRunning ? 'visibility' : 'description'}</i></td>
+                            <td className="border-0"><i className="material-icons-outlined" style={{ fontSize: 18, color: 'var(--color-text-muted)' }}>{isRunning ? 'visibility' : 'description'}</i></td>
                           </tr>
                         );
                       })}

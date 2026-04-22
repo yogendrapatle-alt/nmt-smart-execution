@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { getApiBase } from '../utils/backendUrl';
+import { SkeletonTable } from '../components/ui/LoadingSkeleton';
 
 interface TimelineEvent {
   timestamp: string;
@@ -166,11 +167,8 @@ const TestbedTimeline: React.FC = () => {
       <div className="card">
         <div className="card-body">
           {loading && (
-            <div className="text-center py-5">
-              <div className="spinner-border text-primary" role="status">
-                <span className="visually-hidden">Loading...</span>
-              </div>
-              <p className="mt-3">Loading timeline...</p>
+            <div className="p-4">
+              <SkeletonTable rows={6} cols={3} />
             </div>
           )}
 

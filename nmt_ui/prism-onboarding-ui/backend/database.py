@@ -1336,70 +1336,76 @@ def log_pool_status():
 def recover_orphaned_executions():
     """
     Recover orphaned executions from backend restart.
-    
+
     Finds all executions in active states (PENDING, STARTING, RUNNING, PAUSED)
     and marks them as FAILED with appropriate error message.
-    
+
+    Checks BOTH the `executions` table and the `smart_executions` table.
+
     Called during backend startup to handle executions that were interrupted
     when the backend crashed or was restarted.
-    
+
     Returns:
         int: Number of executions recovered
     """
     session = SessionLocal()
     recovered_count = 0
-    
+    active_states = ['PENDING', 'STARTING', 'RUNNING', 'PAUSED',
+                     'pending', 'starting', 'running', 'paused']
+
     try:
-        # Find all active executions (non-terminal states)
-        active_states = ['PENDING', 'STARTING', 'RUNNING', 'PAUSED', 'pending', 'starting', 'running', 'paused']
-        
-        query = text("""
-            SELECT execution_id, testbed_id, status, start_time, created_at
-            FROM executions
-            WHERE status IN :active_states
-            ORDER BY created_at DESC
-        """)
-        
-        result = session.execute(query, {'active_states': tuple(active_states)})
-        orphaned_executions = result.fetchall()
-        
-        if not orphaned_executions:
-            logging.info("✅ No orphaned executions found during startup")
-            return 0
-        
-        logging.warning(f"⚠️  Found {len(orphaned_executions)} orphaned execution(s) - marking as FAILED")
-        
-        # Mark each orphaned execution as FAILED
-        for exec_row in orphaned_executions:
-            exec_id = exec_row.execution_id
-            
-            update_query = text("""
-                UPDATE executions
-                SET status = :status,
-                    end_time = :end_time,
-                    last_error = :error_message
-                WHERE execution_id = :execution_id
-            """)
-            
-            session.execute(update_query, {
-                'execution_id': exec_id,
-                'status': 'FAILED',
-                'end_time': datetime.utcnow(),
-                'error_message': 'Execution interrupted due to backend restart or crash'
-            })
-            
-            logging.info(f"  ↳ Marked execution {exec_id[:20]}... as FAILED")
-            recovered_count += 1
-        
+        for table_name, id_col, has_last_error in [
+            ('executions', 'execution_id', True),
+            ('smart_executions', 'execution_id', False),
+        ]:
+            try:
+                query = text(f"""
+                    SELECT execution_id, status
+                    FROM {table_name}
+                    WHERE status IN :active_states
+                """)
+                result = session.execute(query, {'active_states': tuple(active_states)})
+                orphaned = result.fetchall()
+            except Exception:
+                continue
+
+            for row in orphaned:
+                exec_id = row.execution_id
+                if has_last_error:
+                    update_q = text(f"""
+                        UPDATE {table_name}
+                        SET status = :status, end_time = :end_time,
+                            last_error = :msg
+                        WHERE execution_id = :eid
+                    """)
+                else:
+                    update_q = text(f"""
+                        UPDATE {table_name}
+                        SET status = :status, end_time = :end_time
+                        WHERE execution_id = :eid
+                    """)
+                session.execute(update_q, {
+                    'eid': exec_id,
+                    'status': 'FAILED',
+                    'end_time': datetime.utcnow(),
+                    'msg': 'Execution interrupted due to backend restart or crash',
+                })
+                logging.info(f"  ↳ [{table_name}] Marked {exec_id[:30]}... as FAILED")
+                recovered_count += 1
+
         session.commit()
-        logging.info(f"✅ Successfully recovered {recovered_count} orphaned execution(s)")
-        
+
+        if recovered_count:
+            logging.warning(f"⚠️  Recovered {recovered_count} orphaned execution(s)")
+        else:
+            logging.info("✅ No orphaned executions found during startup")
+
     except Exception as e:
         session.rollback()
         logging.error(f"❌ Error recovering orphaned executions: {e}", exc_info=True)
     finally:
         session.close()
-    
+
     return recovered_count
 
 

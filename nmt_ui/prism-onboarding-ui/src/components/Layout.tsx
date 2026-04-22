@@ -7,216 +7,123 @@ interface LayoutProps {
   children: React.ReactNode;
 }
 
+const PAGE_TITLES: Record<string, string> = {
+  '/': 'Dashboard',
+  '/dashboard': 'Dashboard',
+  '/deploy-new': 'Deploy New Testbed',
+  '/onboarding': 'Onboard Testbed',
+  '/my-testbeds': 'My Testbeds',
+  '/testbeds': 'My Testbeds',
+  '/rule-config-manager': 'Rule & Config Manager',
+  '/alert-summary': 'Alert Summary',
+  '/alert-configuration': 'Alert Configuration',
+  '/smart-execution': 'Smart Execution',
+  '/smart-execution/configure': 'Smart Execution',
+  '/smart-execution/history': 'Execution History',
+  '/scheduled-executions': 'Scheduled Executions',
+  '/ml-insights': 'ML Insights',
+  '/analytics/dashboard': 'Analytics Dashboard',
+  '/analytics/comparison': 'Execution Comparison',
+  '/analytics/executive-summary': 'Executive Summary',
+  '/execution-workload-manager': 'Execution Workload',
+  '/dynamic-workload': 'Dynamic Workload',
+  '/status': 'Status & Monitoring',
+};
+
 const Layout: React.FC<LayoutProps> = ({ children }) => {
   const navigate = useNavigate();
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [alertCount, setAlertCount] = useState<number>(0);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  // Fetch alert count for notification badge
   useEffect(() => {
     const fetchAlertCount = async () => {
       try {
-        // Always use localhost:5000 for backend in development
         const backendUrl = getApiBase();
         const res = await fetch(`${backendUrl}/api/alerts`);
         if (res.ok) {
           const data = await res.json();
           setAlertCount(data.count || 0);
         }
-      } catch {
-        // Don't show error to user - just keep count at 0
-      }
+      } catch { /* keep count at 0 */ }
     };
     fetchAlertCount();
-    // Refresh every 60 seconds
     const interval = setInterval(fetchAlertCount, 60000);
     return () => clearInterval(interval);
   }, []);
 
-  const isActivePath = (path: string) => {
-    return location.pathname === path;
-  };
+  const isActive = (path: string) => location.pathname === path;
+  const pageTitle = PAGE_TITLES[location.pathname]
+    || (location.pathname.startsWith('/smart-execution/monitor') ? 'Live Monitor'
+    : location.pathname.startsWith('/smart-execution/report') ? 'Execution Report'
+    : location.pathname.startsWith('/multi-testbed') ? 'Multi-Testbed'
+    : '');
+
+  const navItem = (path: string, icon: string, label: string, activePaths?: string[]) => (
+    <li key={path}>
+      <a
+        href="#"
+        onClick={(e) => { e.preventDefault(); navigate(path); }}
+        className={activePaths ? (activePaths.some(p => isActive(p)) ? 'active' : '') : (isActive(path) ? 'active' : '')}
+      >
+        <i className="material-icons-outlined">{icon}</i>
+        <span>{label}</span>
+      </a>
+    </li>
+  );
 
   return (
     <>
       {/* Sidebar */}
       <aside className={`sidebar-wrapper ${!sidebarOpen ? 'closed' : ''}`}>
         <div className="sidebar-header">
-          <img src={ntnxLogo} alt="Nutanix Logo" style={{ width: 40, height: 40 }} />
+          <img src={ntnxLogo} alt="Nutanix Logo" style={{ width: 38, height: 38 }} />
           <div>
-            <h5 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: '#00008B' }}>NCM Monitoring</h5>
-            <p style={{ margin: 0, fontSize: 11, color: '#6c757d' }}>Tool</p>
+            <h5 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: 'var(--color-primary-hover)' }}>NCM Monitoring</h5>
+            <p style={{ margin: 0, fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>Tool</p>
           </div>
         </div>
 
         <div className="sidebar-nav">
           <ul>
-            {/* Dashboard */}
-            <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/dashboard'); }}
-                className={isActivePath('/dashboard') || isActivePath('/') ? 'active' : ''}
-              >
-                <i className="material-icons-outlined">dashboard</i>
-                <span>Dashboard</span>
-              </a>
-            </li>
+            {navItem('/dashboard', 'dashboard', 'Dashboard', ['/', '/dashboard'])}
 
-            <li className="menu-label">TESTBED SETUP</li>
+            <li className="menu-label">TESTBEDS</li>
+            {navItem('/deploy-new', 'rocket_launch', 'Deploy New')}
+            {navItem('/onboarding', 'add_circle_outline', 'Onboard Existing')}
+            {navItem('/my-testbeds', 'dns', 'My Testbeds', ['/my-testbeds', '/testbeds'])}
 
-            {/* Deploy New Testbed */}
-            <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/deploy-new'); }}
-                className={isActivePath('/deploy-new') ? 'active' : ''}
-              >
-                <i className="material-icons-outlined">rocket_launch</i>
-                <span>Deploy New Testbed</span>
-              </a>
-            </li>
+            <li className="menu-label">MONITORING</li>
+            {navItem('/rule-config-manager', 'rule', 'Rules & Config', ['/rule-config-manager', '/rulebuilder-experimental', '/rulebuilder'])}
+            {navItem('/alert-summary', 'notifications_active', 'Alert Summary')}
+            {navItem('/alert-configuration', 'tune', 'Alert Configuration')}
+            {navItem('/status', 'show_chart', 'Status & Health')}
 
-            {/* Onboard Existing Testbed */}
-            <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/onboarding'); }}
-                className={isActivePath('/onboarding') ? 'active' : ''}
-              >
-                <i className="material-icons-outlined">add_circle_outline</i>
-                <span>Onboard Existing</span>
-              </a>
-            </li>
-
-            {/* My Testbeds */}
-            <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/my-testbeds'); }}
-                className={isActivePath('/my-testbeds') || isActivePath('/testbeds') ? 'active' : ''}
-              >
-                <i className="material-icons-outlined">dns</i>
-                <span>My Testbeds</span>
-              </a>
-            </li>
-
-            <li className="menu-label">MONITORING & ALERTS</li>
-
-            {/* Rules & Configuration */}
-            <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); navigate('/rule-config-manager'); }}
-                className={isActivePath('/rule-config-manager') || isActivePath('/rulebuilder-experimental') || isActivePath('/rulebuilder') ? 'active' : ''}
-              >
-                <i className="material-icons-outlined">rule</i>
-                <span>Rule & Config Manager</span>
-              </a>
-            </li>
-
-            {/* Alert Summary */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/alert-summary'); }} className={isActivePath('/alert-summary') ? 'active' : ''}>
-                <i className="material-icons-outlined">notifications_active</i>
-                <span>Alert Summary</span>
-              </a>
-            </li>
-
-            {/* Alert Configuration */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/alert-configuration'); }} className={isActivePath('/alert-configuration') ? 'active' : ''}>
-                <i className="material-icons-outlined">tune</i>
-                <span>Alert Configuration</span>
-              </a>
-            </li>
-
-            <li className="menu-label">EXECUTION</li>
-
-            {/* Smart Execution - Threshold-Based */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/smart-execution'); }} className={isActivePath('/smart-execution') || isActivePath('/smart-execution/configure') ? 'active' : ''}>
-                <i className="material-icons-outlined">psychology</i>
-                <span>Smart Execution</span>
-              </a>
-            </li>
-
-            {/* Smart Execution History */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/smart-execution/history'); }} className={isActivePath('/smart-execution/history') ? 'active' : ''}>
-                <i className="material-icons-outlined">history</i>
-                <span>Execution History</span>
-              </a>
-            </li>
-
-            {/* Scheduled Executions */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/scheduled-executions'); }} className={isActivePath('/scheduled-executions') ? 'active' : ''}>
-                <i className="material-icons-outlined">event</i>
-                <span>Scheduled Executions</span>
-              </a>
-            </li>
-
-            {/* ML Insights */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/ml-insights'); }} className={isActivePath('/ml-insights') ? 'active' : ''}>
-                <i className="material-icons-outlined">model_training</i>
-                <span>ML Insights</span>
-              </a>
-            </li>
+            <li className="menu-label">SMART EXECUTION</li>
+            {navItem('/smart-execution', 'psychology', 'Configure & Run', ['/smart-execution', '/smart-execution/configure'])}
+            {navItem('/smart-execution/history', 'history', 'Execution History')}
+            {navItem('/scheduled-executions', 'event', 'Scheduled')}
+            {navItem('/ml-insights', 'model_training', 'ML Insights')}
 
             <li className="menu-label">ANALYTICS</li>
+            {navItem('/analytics/dashboard', 'insights', 'Analytics Dashboard')}
+            {navItem('/analytics/comparison', 'compare', 'Comparison')}
+            {navItem('/analytics/executive-summary', 'summarize', 'Executive Summary')}
 
-            {/* Analytics Dashboard */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/analytics/dashboard'); }} className={isActivePath('/analytics/dashboard') ? 'active' : ''}>
-                <i className="material-icons-outlined">insights</i>
-                <span>Analytics Dashboard</span>
-              </a>
+            {/* Collapsible Advanced section */}
+            <li className="menu-label" style={{ cursor: 'pointer', userSelect: 'none' }} onClick={() => setAdvancedOpen(!advancedOpen)}>
+              <span className="d-flex align-items-center justify-content-between w-100">
+                ADVANCED
+                <i className="material-icons-outlined" style={{ fontSize: 16, transition: 'transform 200ms', transform: advancedOpen ? 'rotate(180deg)' : 'rotate(0)' }}>expand_more</i>
+              </span>
             </li>
-
-            {/* Execution Comparison */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/analytics/comparison'); }} className={isActivePath('/analytics/comparison') ? 'active' : ''}>
-                <i className="material-icons-outlined">compare</i>
-                <span>Execution Comparison</span>
-              </a>
-            </li>
-
-            {/* Executive Summary */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/analytics/executive-summary'); }} className={isActivePath('/analytics/executive-summary') ? 'active' : ''}>
-                <i className="material-icons-outlined">summarize</i>
-                <span>Executive Summary</span>
-              </a>
-            </li>
-
-            <li className="menu-label">ADVANCED</li>
-
-            {/* Execution Workload Manager */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/execution-workload-manager'); }} className={isActivePath('/execution-workload-manager') ? 'active' : ''}>
-                <i className="material-icons-outlined">play_circle</i>
-                <span>Execution Workload</span>
-              </a>
-            </li>
-
-            {/* Dynamic Workload (Legacy) */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/dynamic-workload'); }} className={isActivePath('/dynamic-workload') ? 'active' : ''}>
-                <i className="material-icons-outlined">trending_up</i>
-                <span>Dynamic Workload</span>
-              </a>
-            </li>
-
-            {/* Status & Monitoring */}
-            <li>
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/status'); }} className={isActivePath('/status') ? 'active' : ''}>
-                <i className="material-icons-outlined">show_chart</i>
-                <span>Status & Monitoring</span>
-              </a>
-            </li>
+            {advancedOpen && (
+              <>
+                {navItem('/execution-workload-manager', 'play_circle', 'Execution Workload')}
+                {navItem('/dynamic-workload', 'trending_up', 'Dynamic Workload')}
+              </>
+            )}
           </ul>
         </div>
       </aside>
@@ -227,17 +134,21 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
           <i className="material-icons-outlined">menu</i>
         </div>
 
-        <div style={{ flexGrow: 1, marginLeft: 20 }}>
-          <span style={{ fontSize: 18, fontWeight: 600, color: '#00008B' }}>NCM Monitoring Tool</span>
+        <div style={{ flexGrow: 1, marginLeft: 'var(--space-5)', display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+          <span style={{ fontSize: 'var(--text-lg)', fontWeight: 600, color: 'var(--color-text)' }}>
+            {pageTitle || 'NCM Monitoring Tool'}
+          </span>
         </div>
 
         {/* Notification Bell */}
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          <div 
-            style={{ position: 'relative', cursor: 'pointer', padding: 8 }}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+          <div
+            style={{ position: 'relative', cursor: 'pointer', padding: 'var(--space-2)', borderRadius: 'var(--radius-sm)', transition: 'background var(--transition-fast)' }}
             onClick={() => navigate('/alert-summary')}
+            onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-hover)')}
+            onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
           >
-            <i className="material-icons-outlined" style={{ fontSize: 24, color: '#6c757d' }}>notifications</i>
+            <i className="material-icons-outlined" style={{ fontSize: 22, color: 'var(--color-text-secondary)' }}>notifications</i>
             {alertCount > 0 && (
               <span className="badge-notify">
                 {alertCount > 99 ? '99+' : alertCount}

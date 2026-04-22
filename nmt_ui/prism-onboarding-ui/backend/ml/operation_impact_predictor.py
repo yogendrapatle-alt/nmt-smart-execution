@@ -28,6 +28,7 @@ KNOWN_ENTITIES = [
     'vm', 'blueprint_single_vm', 'blueprint_multi_vm', 'playbook',
     'scenario', 'rate_card', 'business_unit', 'cost_center',
     'project', 'recovery_plan', 'protection_policy', 'category',
+    'image', 'subnet',
 ]
 
 KNOWN_OPERATIONS = [
@@ -252,36 +253,27 @@ class OperationImpactPredictor:
         top_k: int = 10
     ) -> List[Dict]:
         """
-        Recommend best operations to reach target increase
-        
-        Args:
-            target_cpu_increase: Desired CPU increase (%)
-            target_memory_increase: Desired Memory increase (%)
-            current_metrics: Current system state
-            top_k: Number of recommendations to return
-            
-        Returns:
-            List of recommended operations sorted by relevance
+        Recommend best operations to reach target increase.
+
+        Ensures diversity in recommendations so the control loop doesn't get
+        locked onto a single entity type (ML feedback loop prevention).
         """
         if not self.is_trained:
             logger.warning("Model not trained, returning default recommendations")
             return self._get_default_recommendations(top_k)
-        
+
         recommendations = []
-        
+
         for entity_type in KNOWN_ENTITIES:
             for operation in KNOWN_OPERATIONS:
                 try:
                     prediction = self.predict(entity_type, operation, current_metrics)
-                    
-                    # Calculate how well this operation matches our target
-                    # Using weighted distance (CPU more important typically)
+
                     cpu_diff = abs(prediction['cpu_impact'] - target_cpu_increase)
                     memory_diff = abs(prediction['memory_impact'] - target_memory_increase)
-                    
-                    # Weighted score (CPU weighted 60%, Memory 40%)
+
                     score = 1.0 / (1.0 + 0.6 * cpu_diff + 0.4 * memory_diff)
-                    
+
                     recommendations.append({
                         'entity': entity_type,
                         'operation': operation,
@@ -293,20 +285,49 @@ class OperationImpactPredictor:
                 except Exception as e:
                     logger.debug(f"Prediction failed for {entity_type}-{operation}: {e}")
                     continue
-        
-        # Sort by score (highest first)
+
         recommendations.sort(key=lambda x: x['score'], reverse=True)
-        
+
+        # Diversity enforcement: ensure at least 3 different entity types in top_k
+        # This prevents the ML from returning all recommendations for one entity type
+        if len(recommendations) > top_k:
+            diverse_result = []
+            entity_counts: Dict[str, int] = {}
+            max_per_entity = max(2, top_k // 3)
+
+            for rec in recommendations:
+                ent = rec['entity']
+                cnt = entity_counts.get(ent, 0)
+                if cnt < max_per_entity:
+                    diverse_result.append(rec)
+                    entity_counts[ent] = cnt + 1
+                if len(diverse_result) >= top_k:
+                    break
+
+            # If we didn't fill top_k, backfill from remaining
+            if len(diverse_result) < top_k:
+                used = set(id(r) for r in diverse_result)
+                for rec in recommendations:
+                    if id(rec) not in used:
+                        diverse_result.append(rec)
+                    if len(diverse_result) >= top_k:
+                        break
+
+            return diverse_result
+
         return recommendations[:top_k]
-    
+
     def _get_default_recommendations(self, top_k: int) -> List[Dict]:
-        """Return default recommendations when model is not trained"""
+        """Return diverse default recommendations when model is not trained."""
         defaults = [
             {'entity': 'vm', 'operation': 'CREATE', 'cpu_impact': 2.5, 'memory_impact': 2.0, 'score': 0.8, 'confidence': 0.5},
-            {'entity': 'blueprint_multi_vm', 'operation': 'CREATE', 'cpu_impact': 3.5, 'memory_impact': 3.0, 'score': 0.75, 'confidence': 0.5},
-            {'entity': 'blueprint_multi_vm', 'operation': 'EXECUTE', 'cpu_impact': 4.0, 'memory_impact': 3.5, 'score': 0.7, 'confidence': 0.5},
-            {'entity': 'vm', 'operation': 'DELETE', 'cpu_impact': 1.8, 'memory_impact': 1.5, 'score': 0.65, 'confidence': 0.5},
-            {'entity': 'blueprint_single_vm', 'operation': 'CREATE', 'cpu_impact': 2.2, 'memory_impact': 1.8, 'score': 0.6, 'confidence': 0.5},
+            {'entity': 'project', 'operation': 'CREATE', 'cpu_impact': 1.5, 'memory_impact': 1.0, 'score': 0.75, 'confidence': 0.5},
+            {'entity': 'image', 'operation': 'CREATE', 'cpu_impact': 1.8, 'memory_impact': 1.5, 'score': 0.7, 'confidence': 0.5},
+            {'entity': 'category', 'operation': 'CREATE', 'cpu_impact': 0.8, 'memory_impact': 0.5, 'score': 0.65, 'confidence': 0.5},
+            {'entity': 'scenario', 'operation': 'EXECUTE', 'cpu_impact': 2.0, 'memory_impact': 1.5, 'score': 0.6, 'confidence': 0.5},
+            {'entity': 'vm', 'operation': 'DELETE', 'cpu_impact': 1.8, 'memory_impact': 1.5, 'score': 0.55, 'confidence': 0.5},
+            {'entity': 'blueprint_multi_vm', 'operation': 'CREATE', 'cpu_impact': 3.5, 'memory_impact': 3.0, 'score': 0.5, 'confidence': 0.5},
+            {'entity': 'blueprint_single_vm', 'operation': 'CREATE', 'cpu_impact': 2.2, 'memory_impact': 1.8, 'score': 0.45, 'confidence': 0.5},
         ]
         return defaults[:top_k]
     
@@ -391,16 +412,18 @@ def generate_synthetic_training_data(num_samples: int = 100) -> List[Dict]:
     """
     import random
     
-    entities = ['vm', 'blueprint_single_vm', 'blueprint_multi_vm', 'playbook', 
-                'scenario', 'rate_card', 'business_unit', 'cost_center']
-    
+    entities = ['vm', 'blueprint_single_vm', 'blueprint_multi_vm', 'playbook',
+                'scenario', 'rate_card', 'business_unit', 'cost_center',
+                'project', 'image', 'category', 'subnet']
+
     operations = ['CREATE', 'DELETE', 'UPDATE', 'LIST', 'EXECUTE', 'READ']
-    
-    # Impact profiles (CPU, Memory) for different operations
+
     impact_profiles = {
         ('vm', 'CREATE'): (2.5, 2.0),
         ('vm', 'DELETE'): (1.5, 1.2),
         ('vm', 'LIST'): (0.3, 0.2),
+        ('vm', 'CLONE'): (2.8, 2.2),
+        ('vm', 'MIGRATE'): (3.0, 2.5),
         ('blueprint_multi_vm', 'CREATE'): (3.5, 3.0),
         ('blueprint_multi_vm', 'EXECUTE'): (4.5, 3.8),
         ('blueprint_multi_vm', 'DELETE'): (2.0, 1.8),
@@ -409,11 +432,21 @@ def generate_synthetic_training_data(num_samples: int = 100) -> List[Dict]:
         ('playbook', 'EXECUTE'): (3.0, 2.5),
         ('scenario', 'CREATE'): (1.5, 1.3),
         ('scenario', 'DELETE'): (1.0, 0.8),
+        ('scenario', 'EXECUTE'): (2.5, 2.0),
         ('rate_card', 'CREATE'): (0.8, 0.7),
         ('rate_card', 'UPDATE'): (0.6, 0.5),
         ('business_unit', 'CREATE'): (0.5, 0.4),
         ('business_unit', 'UPDATE'): (0.4, 0.3),
         ('cost_center', 'CREATE'): (0.5, 0.4),
+        ('project', 'CREATE'): (1.5, 1.0),
+        ('project', 'DELETE'): (1.0, 0.8),
+        ('project', 'UPDATE'): (0.6, 0.4),
+        ('image', 'CREATE'): (1.8, 1.5),
+        ('image', 'DELETE'): (1.0, 0.8),
+        ('category', 'CREATE'): (0.8, 0.5),
+        ('category', 'DELETE'): (0.5, 0.3),
+        ('subnet', 'CREATE'): (1.2, 0.8),
+        ('subnet', 'DELETE'): (0.8, 0.5),
     }
     
     data = []

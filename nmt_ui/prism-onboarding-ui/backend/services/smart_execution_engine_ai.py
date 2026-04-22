@@ -73,8 +73,15 @@ class SmartExecutionEngineAI:
         self.execution_id = execution_id
         self.testbed_info = testbed_info
         self.target_config = target_config
-        self.entities_config = entities_config
         self.rule_config = rule_config or {}
+
+        # Validate entities_config has real entity-operation pairs
+        real_entities = {k: v for k, v in (entities_config or {}).items()
+                        if k not in ('ai_enabled', 'ml_enabled') and isinstance(v, list) and v}
+        if not real_entities:
+            logger.warning(f"⚠️ [{execution_id}] entities_config is empty — "
+                           "the control loop will apply defaults at runtime")
+        self.entities_config = entities_config or {}
         
         self.enable_ml = enable_ml and AI_AVAILABLE
         self.data_collection_mode = data_collection_mode
@@ -89,15 +96,28 @@ class SmartExecutionEngineAI:
             self.ml_predictor = OperationImpactPredictor()
             self._try_load_existing_model()
         
-        # Initialize PID Controller
+        # Initialize PID Controller with gap-based initial rate
         self.adaptive_controller = None
         if AI_AVAILABLE and AdaptiveLoadController:
+            cpu_gap = max(self.target_cpu - 5.0, 0)   # assume ~5% idle baseline
+            mem_gap = max(self.target_memory - 10.0, 0)
+            min_gap = min(cpu_gap, mem_gap)
+            if min_gap > 40:
+                initial_rate = 50.0
+            elif min_gap > 20:
+                initial_rate = 30.0
+            elif min_gap > 10:
+                initial_rate = 20.0
+            else:
+                initial_rate = 10.0
             self.adaptive_controller = AdaptiveLoadController(
                 target_cpu=self.target_cpu,
                 target_memory=self.target_memory,
-                initial_ops_per_min=10.0,
+                initial_ops_per_min=initial_rate,
                 ml_predictor=self.ml_predictor
             )
+            logger.info(f"🚀 AI engine initial rate: {initial_rate} ops/min "
+                        f"(cpu_gap={cpu_gap:.0f}%, mem_gap={mem_gap:.0f}%)")
         
         # Execution state
         self.phase = "initializing"  # initializing, ramp_up, maintain, ramp_down, completed, failed
@@ -111,12 +131,12 @@ class SmartExecutionEngineAI:
         self.operation_history = []
         self.training_data = []  # Collect data for ML training
         
-        # Safety features
+        # Safety features — generous limits since API failures are expected under heavy load
         self.emergency_stop = False
         self.circuit_breaker_trips = 0
-        self.max_circuit_breaker_trips = 3
+        self.max_circuit_breaker_trips = 10
         self.consecutive_failures = 0
-        self.max_consecutive_failures = 5
+        self.max_consecutive_failures = 15
         
         # Performance tracking
         self.phase_durations = {}
@@ -195,8 +215,24 @@ class SmartExecutionEngineAI:
         if self.adaptive_controller:
             action = self.adaptive_controller.adjust_load(current_metrics)
             
-            # Update phase from PID
-            self.phase = action['phase']
+            # Enforce minimum ops/min floor during ramp_up when far from target
+            cpu_gap = self.target_cpu - current_cpu
+            mem_gap = self.target_memory - current_memory
+            min_gap = min(cpu_gap, mem_gap)
+            if action['phase'] == 'ramp_up' and min_gap > 10:
+                if min_gap > 40:
+                    floor = 40.0
+                elif min_gap > 20:
+                    floor = 25.0
+                else:
+                    floor = 15.0
+                if self.adaptive_controller.operations_per_minute < floor:
+                    self.adaptive_controller.operations_per_minute = floor
+                    action['operations_per_minute'] = floor
+
+            # Update phase from PID — but don't overwrite sustaining
+            if self.phase != 'sustaining':
+                self.phase = action['phase']
             
             # Enhance with ML recommendations
             if action.get('recommended_operations'):
@@ -205,9 +241,11 @@ class SmartExecutionEngineAI:
                 )
             
             # Sustain logic: hold at threshold instead of immediate stop
+            # Enter sustain when threshold is reached in maintain OR ramp_down
+            # (ramp_down means we overshot — still counts as reaching the target)
             should_stop = False
             is_in_sustain = self.phase == 'sustaining'
-            if threshold_reached and self.phase == 'maintain':
+            if threshold_reached and self.phase in ('maintain', 'ramp_down', 'fine_tune'):
                 now = datetime.now(timezone.utc)
                 if self._sustain_start_time is None:
                     self._sustain_start_time = now
@@ -305,11 +343,12 @@ class SmartExecutionEngineAI:
         metrics_before: Dict,
         metrics_after: Dict,
         success: bool,
-        duration: float
+        duration: float,
+        entity_name: str = ''
     ):
         """
         Record operation result for ML training
-        
+
         Args:
             entity_type: Entity type executed
             operation: Operation executed
@@ -317,6 +356,7 @@ class SmartExecutionEngineAI:
             metrics_after: Metrics after operation
             success: Whether operation succeeded
             duration: Operation duration in seconds
+            entity_name: Name of the entity that was operated on
         """
         self.total_operations_executed += 1
         
@@ -337,8 +377,11 @@ class SmartExecutionEngineAI:
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'entity_type': entity_type,
             'operation': operation,
+            'entity_name': entity_name or f"smart-{entity_type.lower()}-{self.total_operations_executed}",
             'success': success,
+            'status': 'SUCCESS' if success else 'FAILED',
             'duration': duration,
+            'duration_seconds': duration,
             'metrics_before': metrics_before,
             'metrics_after': metrics_after,
             'cpu_impact': cpu_impact,
@@ -348,8 +391,11 @@ class SmartExecutionEngineAI:
         
         self.operation_history.append(operation_record)
         
-        # Collect training data
+        # Collect training data — record actual impact (including zero for failures)
+        # so the model learns which operations actually generate load
         if self.data_collection_mode:
+            effective_cpu = cpu_impact if success else 0.0
+            effective_mem = memory_impact if success else 0.0
             training_sample = {
                 'entity_type': entity_type,
                 'operation': operation,
@@ -357,8 +403,8 @@ class SmartExecutionEngineAI:
                 'current_memory': metrics_before.get('memory', 0),
                 'cluster_size': metrics_before.get('cluster_size', 1),
                 'current_load': self.adaptive_controller.operations_per_minute if self.adaptive_controller else 10,
-                'cpu_impact': max(0, cpu_impact),  # Only positive impacts
-                'memory_impact': max(0, memory_impact)
+                'cpu_impact': max(0, effective_cpu),
+                'memory_impact': max(0, effective_mem)
             }
             self.training_data.append(training_sample)
         
@@ -454,16 +500,36 @@ class SmartExecutionEngineAI:
             'status': self.phase,
             'total_operations': self.total_operations_executed,
             'successful_operations': successful_ops,
+            'failed_operations': self.total_operations_executed - successful_ops,
             'success_rate': round(success_rate, 2),
             'duration_seconds': duration,
+            'duration_minutes': round(duration / 60, 2) if duration else None,
             'iterations': self.iteration,
+            'start_time': self.start_time.isoformat() if self.start_time else None,
+            'end_time': self.end_time.isoformat() if self.end_time else None,
+            'testbed_label': self.testbed_info.get('testbed_label', 'Unknown'),
+            'target_config': self.target_config,
             'target': {
                 'cpu': self.target_cpu,
                 'memory': self.target_memory
             },
+            'current_metrics': {
+                'cpu_percent': final_metrics.get('cpu', 0),
+                'memory_percent': final_metrics.get('memory', 0),
+                'cpu': final_metrics.get('cpu', 0),
+                'memory': final_metrics.get('memory', 0),
+            },
             'final_metrics': {
                 'cpu': final_metrics.get('cpu', 0),
-                'memory': final_metrics.get('memory', 0)
+                'memory': final_metrics.get('memory', 0),
+                'cpu_percent': final_metrics.get('cpu', 0),
+                'memory_percent': final_metrics.get('memory', 0),
+            },
+            'baseline_metrics': {
+                'cpu': self.metrics_history[0].get('cpu', 0) if self.metrics_history else 0,
+                'memory': self.metrics_history[0].get('memory', 0) if self.metrics_history else 0,
+                'cpu_percent': self.metrics_history[0].get('cpu', 0) if self.metrics_history else 0,
+                'memory_percent': self.metrics_history[0].get('memory', 0) if self.metrics_history else 0,
             },
             'phase_durations': phase_times,
             'circuit_breaker_trips': self.circuit_breaker_trips,
@@ -471,7 +537,9 @@ class SmartExecutionEngineAI:
             'pid_stats': pid_stats,
             'ml_stats': ml_stats,
             'ai_enabled': self.enable_ml,
-            'emergency_stop': self.emergency_stop
+            'emergency_stop': self.emergency_stop,
+            'operations_history': self.operation_history[-200:],
+            'metrics_history': self.metrics_history[-200:],
         }
         
         return summary

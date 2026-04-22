@@ -134,6 +134,13 @@ class EnhancedReportService:
             execution_id=execution_id,
         )
 
+        pod_restart_tracking = (
+            report_data.get('pod_restart_tracking')
+            or status_data.get('pod_restart_tracking')
+            or (report_data.get('full_execution_data', {}) or {}).get('pod_restart_tracking')
+            or {}
+        )
+
         return {
             'verdict': verdict,
             'spike_analysis': spike_analysis,
@@ -161,6 +168,7 @@ class EnhancedReportService:
                 'resolution_note': metrics_resolution_note,
             },
             'report_metadata': report_metadata,
+            'pod_restart_tracking': pod_restart_tracking,
         }
 
     def _entity_operation_counts(self, operations_history: List) -> List[Dict[str, Any]]:
@@ -1544,7 +1552,11 @@ class EnhancedReportService:
         skipped_ops = sum(1 for op in operations_history if op.get('status') == 'SKIPPED')
         failed_ops = failure_groups.get('total_failures', 0)
         countable_ops = total_ops - skipped_ops
-        success_rate = ((countable_ops - failed_ops) / countable_ops * 100) if countable_ops > 0 else 100
+        if countable_ops > 0:
+            success_rate = ((countable_ops - failed_ops) / countable_ops * 100)
+        else:
+            stored_rate = float(status_data.get('success_rate') or report_data.get('success_rate') or 0)
+            success_rate = stored_rate if stored_rate > 0 else 100
 
         threshold_reached = report_data.get('threshold_reached', False) or status_data.get('threshold_reached', False)
         oom_count = len(cluster_health.get('oom_killed', []))
@@ -1572,9 +1584,19 @@ class EnhancedReportService:
         if oom_count > 0:
             verdict = 'WARN' if verdict == 'PASS' else verdict
             issues.append(f'{oom_count} container(s) OOMKilled during execution')
-        if restart_count > 3:
+        prt = (report_data.get('pod_restart_tracking')
+               or status_data.get('pod_restart_tracking')
+               or (report_data.get('full_execution_data', {}) or {}).get('pod_restart_tracking')
+               or {})
+        continuous_restarts = prt.get('total_restarts_during_execution', 0)
+        effective_restart_count = max(restart_count, continuous_restarts)
+        if effective_restart_count > 3:
             verdict = 'WARN' if verdict == 'PASS' else verdict
-            issues.append(f'{restart_count} container restarts detected')
+            if continuous_restarts > 0:
+                issues.append(f'{continuous_restarts} container restarts during execution '
+                              f'({prt.get("pods_restarted", 0)} pods affected)')
+            else:
+                issues.append(f'{restart_count} container restarts detected')
         if success_rate < 70:
             verdict = 'FAIL'
             issues.append(f'Low success rate: {success_rate:.1f}%')
@@ -1687,9 +1709,9 @@ class EnhancedReportService:
             'container_restarts': restart_count,
             'high_risk_spikes': high_risk_spikes,
             'qa_summary': {
-                'total_operations': total_ops,
-                'successful': total_ops - failed_ops - skipped_ops,
-                'failed': failed_ops,
+                'total_operations': total_ops or int(status_data.get('total_operations') or report_data.get('total_operations') or 0),
+                'successful': (total_ops - failed_ops - skipped_ops) or int(status_data.get('successful_operations') or report_data.get('successful_operations') or 0),
+                'failed': failed_ops or int(status_data.get('failed_operations') or report_data.get('failed_operations') or 0),
                 'skipped': skipped_ops,
                 'target_cpu': target_config.get('cpu_threshold'),
                 'target_memory': target_config.get('memory_threshold'),
@@ -2134,8 +2156,8 @@ class EnhancedReportService:
         iterations = []
         for mi in metrics_history:
             iteration_num = mi.get('iteration', 0)
-            cpu = mi.get('cpu_percent', 0)
-            memory = mi.get('memory_percent', 0)
+            cpu = mi.get('cpu_percent', 0) or mi.get('cpu', 0)
+            memory = mi.get('memory_percent', 0) or mi.get('memory', 0)
             ts = mi.get('timestamp', '')
 
             iter_ops = [
@@ -2155,8 +2177,9 @@ class EnhancedReportService:
             is_spike = iteration_num in spike_iters
             spike_info = spike_map.get(iteration_num)
 
-            prev_cpu = metrics_history[max(0, metrics_history.index(mi) - 1)].get('cpu_percent', 0) if metrics_history.index(mi) > 0 else cpu
-            prev_mem = metrics_history[max(0, metrics_history.index(mi) - 1)].get('memory_percent', 0) if metrics_history.index(mi) > 0 else memory
+            prev_mi = metrics_history[max(0, metrics_history.index(mi) - 1)] if metrics_history.index(mi) > 0 else mi
+            prev_cpu = (prev_mi.get('cpu_percent', 0) or prev_mi.get('cpu', 0)) if metrics_history.index(mi) > 0 else cpu
+            prev_mem = (prev_mi.get('memory_percent', 0) or prev_mi.get('memory', 0)) if metrics_history.index(mi) > 0 else memory
             cpu_delta = round(cpu - prev_cpu, 2)
             mem_delta = round(memory - prev_mem, 2)
 

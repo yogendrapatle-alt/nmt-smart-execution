@@ -228,33 +228,48 @@ class AlertService:
     
     def get_channels_config_for_testbed(self, testbed_id: str) -> Optional[Dict]:
         """
-        Get alert configuration for a testbed
-        
-        Args:
-            testbed_id: Testbed unique ID
-        
-        Returns:
-            Dict: Channel configuration or None
+        Get alert configuration for a testbed.
+
+        Lookup order:
+          1. testbed.alert_config (per-testbed config from Alert Config page)
+          2. Global SLACK_WEBHOOK_URL env var (fallback for all testbeds)
         """
+        import os
+
         try:
             from database import SessionLocal
             from models.testbed import Testbed
-            
+
             session = SessionLocal()
             try:
                 testbed = session.query(Testbed).filter_by(
                     unique_testbed_id=testbed_id
                 ).first()
-                
-                if testbed and hasattr(testbed, 'alert_config'):
-                    return testbed.alert_config
-                
-                return None
+
+                if testbed and hasattr(testbed, 'alert_config') and testbed.alert_config:
+                    cfg = testbed.alert_config
+                    slack_url = (cfg.get('slack') or {}).get('webhook_url', '')
+                    if slack_url and slack_url.startswith('https://hooks.slack.com/'):
+                        return cfg
             finally:
                 session.close()
         except Exception as e:
-            logger.error(f"❌ Failed to get alert config: {e}")
-            return None
+            logger.error(f"❌ Failed to get alert config from DB: {e}")
+
+        # Fallback: build config from SLACK_WEBHOOK_URL env var
+        env_url = (os.environ.get('SLACK_WEBHOOK_URL') or '').strip()
+        if env_url and env_url.startswith('https://hooks.slack.com/'):
+            logger.info(f"Using global SLACK_WEBHOOK_URL for testbed {testbed_id}")
+            return {
+                'slack': {
+                    'enabled': True,
+                    'webhook_url': env_url,
+                },
+                'email': {'enabled': False},
+                'webhook': {'enabled': False},
+            }
+
+        return None
 
 
 # Global alert service instance

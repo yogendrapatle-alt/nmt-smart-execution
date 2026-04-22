@@ -116,57 +116,482 @@ def _resolve_metrics_for_ai_loop(iter_idx: int, engine: Any, prometheus_url: str
     return _synthetic_metrics_for_ai_loop(iter_idx, engine)
 
 
+DEFAULT_ENTITIES_CONFIG: Dict[str, list] = {
+    'vm': ['CREATE', 'DELETE', 'LIST', 'UPDATE', 'CLONE', 'POWER_ON', 'POWER_OFF'],
+    'project': ['CREATE', 'DELETE', 'LIST', 'UPDATE'],
+    'image': ['CREATE', 'DELETE', 'LIST'],
+    'category': ['CREATE', 'DELETE', 'LIST'],
+    'subnet': ['CREATE', 'DELETE', 'LIST'],
+    'scenario': ['CREATE', 'DELETE', 'LIST', 'EXECUTE'],
+    'blueprint_single_vm': ['CREATE', 'DELETE', 'LIST', 'EXECUTE'],
+    'blueprint_multi_vm': ['CREATE', 'DELETE', 'LIST', 'EXECUTE'],
+    'playbook': ['CREATE', 'DELETE', 'LIST', 'EXECUTE'],
+}
+
+
+def _ensure_entities_config(entities_config: Optional[Dict]) -> Dict:
+    """
+    Return a usable entities_config, falling back to DEFAULT_ENTITIES_CONFIG
+    when the caller passes None or an empty dict.
+    """
+    if not entities_config:
+        logger.warning("⚠️ entities_config is empty — using comprehensive default "
+                       f"({len(DEFAULT_ENTITIES_CONFIG)} entity types)")
+        return dict(DEFAULT_ENTITIES_CONFIG)
+
+    real_entities = {k: v for k, v in entities_config.items()
+                     if k not in ('ai_enabled', 'ml_enabled') and isinstance(v, list) and v}
+    if not real_entities:
+        logger.warning("⚠️ entities_config has no usable entity-operation pairs — "
+                       "using comprehensive default")
+        preserved = {k: v for k, v in entities_config.items()
+                     if k in ('ai_enabled', 'ml_enabled')}
+        return {**DEFAULT_ENTITIES_CONFIG, **preserved}
+
+    return entities_config
+
+
+def _sync_created_entities(controller, ai_engine):
+    """Deep-copy created entities from the standard controller to the AI engine."""
+    import copy
+    if controller.created_entities:
+        ai_engine._created_entities = copy.deepcopy(controller.created_entities)
+        total = sum(len(v) for v in ai_engine._created_entities.values())
+        logger.debug(f"🔄 Synced {total} created entities to AI engine")
+
+
 def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
     """
-    Run calculate_next_action until should_stop, emergency, or safety caps.
-    Uses Prometheus if reachable; otherwise synthetic metrics (always progresses).
+    Run the AI control loop with REAL NCM operations.
+
+    Uses the standard SmartExecutionController to execute actual API calls against
+    Prism Central while the AI engine (PID + ML) makes the decisions about what
+    operations to run and at what rate.
+
+    Includes adaptive safeguards:
+    - Entity blacklisting: entities with 100% failure rate are temporarily skipped
+    - Diversity enforcement: prevents ML feedback loop locking onto one entity type
+    - Stagnation detection: forces entity rotation when CPU/Memory aren't improving
     """
+    import asyncio
+    from collections import defaultdict
+    from services.smart_execution_service import SmartExecutionController
+
     max_iterations = int(os.environ.get('AI_ENGINE_MAX_ITERATIONS', '2000'))
     max_seconds = float(os.environ.get('AI_ENGINE_MAX_SECONDS', '7200'))
-    prom = (testbed_info.get('prometheus_endpoint') or '').strip()
-    if prom and not prom.startswith('http'):
-        prom = f'http://{prom}' if '://' not in prom else prom
+
+    BLACKLIST_THRESHOLD = 5          # Blacklist entity after N consecutive failures
+    STAGNATION_WINDOW = 10           # Check last N iterations for stagnation
+    STAGNATION_MIN_IMPROVEMENT = 2.0 # CPU must improve by at least this % over window
+    DIVERSITY_MIN_TYPES = 3          # Force at least N different entity types per window
+    DIVERSITY_WINDOW = 15            # Check diversity over last N iterations
+
+    # Adaptive ops-per-iteration: read from user config, scale up on stagnation
+    adv = ai_engine.target_config.get('advanced', {})
+    user_ops_per_iter = (
+        ai_engine.target_config.get('operations_per_iteration')
+        or adv.get('operations_per_iteration')
+        or 5
+    )
+    max_ops_per_iter = max(user_ops_per_iter, 5)
+    OPS_PER_ITER_CAP = 30  # absolute ceiling for adaptive increase
+
+    # Heavy operations that actually generate cluster load (CPU/Memory impact)
+    LOAD_GENERATING_OPS = [
+        ('vm', 'CREATE'), ('vm', 'CLONE'), ('vm', 'MIGRATE'),
+        ('project', 'CREATE'), ('image', 'CREATE'),
+        ('category', 'CREATE'), ('subnet', 'CREATE'),
+        ('scenario', 'EXECUTE'),
+    ]
+
+    # Build entities_config list for the standard controller
+    entities_config = _ensure_entities_config(ai_engine.entities_config)
+    ai_engine.entities_config = entities_config
+
+    entity_ops = []
+    for entity, operations in entities_config.items():
+        if entity in ('ai_enabled', 'ml_enabled'):
+            continue
+        if isinstance(operations, list):
+            for op in operations:
+                entity_ops.append((entity, op))
+
+    if not entity_ops:
+        for entity, operations in DEFAULT_ENTITIES_CONFIG.items():
+            for op in operations:
+                entity_ops.append((entity, op))
+        logger.warning(f"⚠️ Populated entity_ops from defaults: {len(entity_ops)} pairs")
+
+    # Separate load-generating ops from the full list for stagnation recovery
+    load_gen_ops = [eo for eo in entity_ops if eo in LOAD_GENERATING_OPS]
+    if not load_gen_ops:
+        load_gen_ops = [(e, o) for e, o in entity_ops if o in ('CREATE', 'EXECUTE')]
+    if not load_gen_ops:
+        load_gen_ops = entity_ops[:5]
+
+    # --- Adaptive tracking state ---
+    entity_stats: Dict[str, Dict] = defaultdict(lambda: {'attempts': 0, 'successes': 0, 'consecutive_fails': 0})
+    blacklisted_entities: set = set()
+    recent_entity_types: list = []  # Track entity types used in recent iterations
+    cpu_history_window: list = []   # Track CPU over recent iterations for stagnation
+
+    # Create a standard controller for real operations
+    controller = SmartExecutionController(
+        testbed_info=testbed_info,
+        target_config=ai_engine.target_config,
+        entities_config=ai_engine.entities_config,
+        rule_config=ai_engine.rule_config,
+    )
+
+    # Initialize NCM client in an async context
+    loop = asyncio.new_event_loop()
+
+    try:
+        loop.run_until_complete(controller._initialize_ncm_client())
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize NCM client: {e}")
+        ai_engine.phase = 'failed'
+        ai_engine.end_execution(reason=f'NCM client init failed: {e}')
+        loop.close()
+        return
+
+    if not controller.ncm_client_ready:
+        logger.error("❌ NCM client not ready — cannot run real operations")
+        ai_engine.phase = 'failed'
+        ai_engine.end_execution(reason='NCM client not ready')
+        loop.close()
+        return
+
+    logger.info(f"✅ NCM client ready for REAL operations on {testbed_info.get('pc_ip')}")
+
+    # Resolve Prometheus URL for real metrics.
+    # Priority: 1) controller's discovered URL  2) explicit endpoint from DB
+    # 3) auto-construct https://<pc_ip>:30546 (NCM standard NodePort)
+    prom = ''
+    if getattr(controller, 'prometheus_url', None):
+        prom = controller.prometheus_url
+        logger.info(f"🔍 Using controller's Prometheus URL: {prom}")
+    if not prom:
+        prom = (testbed_info.get('prometheus_endpoint') or '').strip()
+        if prom and not prom.startswith('http'):
+            prom = f'http://{prom}' if '://' not in prom else prom
+    if not prom:
+        pc_ip = testbed_info.get('pc_ip', '')
+        if pc_ip:
+            candidate = f'https://{pc_ip}:30546'
+            test_result = _fetch_prometheus_cpu_memory(candidate)
+            if test_result is not None:
+                prom = candidate
+                logger.info(f"🔍 Auto-discovered Prometheus at {prom}")
+            else:
+                logger.warning(f"⚠️ Prometheus not reachable at {candidate}")
+    if prom:
+        logger.info(f"📈 Prometheus URL for AI loop: {prom}")
+    else:
+        logger.warning("⚠️ No Prometheus URL available — will use synthetic metrics")
+
     t0 = time.monotonic()
+    op_index = 0
+    force_diverse = False
+
     for i in range(max_iterations):
         if ai_engine.emergency_stop:
             ai_engine.end_execution(reason='Emergency stop')
-            return
+            break
         if time.monotonic() - t0 > max_seconds:
             logger.warning('AI engine: max duration reached')
             ai_engine.phase = 'COMPLETED'
             ai_engine.end_execution(reason='Max duration')
-            return
+            break
 
+        # Get REAL metrics from Prometheus (fallback to synthetic if unreachable)
         metrics = _resolve_metrics_for_ai_loop(i, ai_engine, prom)
+
+        # --- Stagnation detection ---
+        cpu_history_window.append(metrics.get('cpu', 0))
+        if len(cpu_history_window) > STAGNATION_WINDOW:
+            cpu_history_window.pop(0)
+
+        is_stagnant = False
+        current_cpu = metrics.get('cpu', 0)
+        current_memory = metrics.get('memory', 0)
+        target_cpu = ai_engine.target_config.get('cpu_threshold', 90)
+        target_memory = ai_engine.target_config.get('memory_threshold', 75)
+        cpu_gap = target_cpu - current_cpu
+        mem_gap = target_memory - current_memory
+
+        if len(cpu_history_window) >= STAGNATION_WINDOW and i >= STAGNATION_WINDOW:
+            window_min = min(cpu_history_window)
+            window_max = max(cpu_history_window)
+            cpu_far_from_target = (target_cpu - max(cpu_history_window)) > 10
+            first_half_avg = sum(cpu_history_window[:STAGNATION_WINDOW // 2]) / max(len(cpu_history_window[:STAGNATION_WINDOW // 2]), 1)
+            second_half_avg = sum(cpu_history_window[STAGNATION_WINDOW // 2:]) / max(len(cpu_history_window[STAGNATION_WINDOW // 2:]), 1)
+            no_upward_trend = (second_half_avg - first_half_avg) < STAGNATION_MIN_IMPROVEMENT
+            if cpu_far_from_target and (
+                (window_max - window_min) < STAGNATION_MIN_IMPROVEMENT
+                or no_upward_trend
+            ):
+                is_stagnant = True
+
+        # --- Diversity check ---
+        unique_recent_types = set(recent_entity_types[-DIVERSITY_WINDOW:])
+        lacks_diversity = len(unique_recent_types) < DIVERSITY_MIN_TYPES and i >= DIVERSITY_WINDOW
+
+        if is_stagnant and not force_diverse:
+            logger.warning(f"⚠️ Iteration {i+1}: CPU stagnant at ~{cpu_history_window[-1]:.1f}% "
+                           f"(range {min(cpu_history_window):.1f}-{max(cpu_history_window):.1f}% "
+                           f"over last {STAGNATION_WINDOW} iters). Forcing diverse load-generating ops.")
+            force_diverse = True
+            # Progressively increase ops per iteration when stagnant
+            old_max = max_ops_per_iter
+            max_ops_per_iter = min(max_ops_per_iter + 5, OPS_PER_ITER_CAP)
+            if max_ops_per_iter != old_max:
+                logger.info(f"📈 Stagnation escalation: ops/iter {old_max} → {max_ops_per_iter}")
+
+        if lacks_diversity and not force_diverse:
+            logger.warning(f"⚠️ Iteration {i+1}: Low diversity — only {unique_recent_types} used "
+                           f"in last {DIVERSITY_WINDOW} iters. Forcing rotation.")
+            force_diverse = True
+
+        # --- Stress-pod escalation via the standard controller ---
+        # Sync metrics into the controller so its stagnation detector works
+        controller.metrics_history.append({
+            'cpu_percent': current_cpu,
+            'memory_percent': current_memory,
+            'iteration': i,
+            'timestamp': time.time(),
+        })
+        if len(controller.metrics_history) > 50:
+            controller.metrics_history = controller.metrics_history[-50:]
+        try:
+            controller._check_stagnation_and_escalate(current_cpu, current_memory)
+        except Exception as esc_err:
+            logger.debug(f"Stress-pod escalation skipped: {esc_err}")
+
+        # AI brain decides what to do
         action = ai_engine.calculate_next_action(metrics)
 
-        ops_this_iter = action.get('recommended_operations') or []
-        for rec in ops_this_iter[:8]:
-            et = rec.get('entity_type', 'vm')
-            op = rec.get('operation', 'create')
-            mb = {'cpu': metrics['cpu'], 'memory': metrics['memory'], 'cluster_size': metrics.get('cluster_size', 1)}
-            ma = {
-                'cpu': min(100.0, mb['cpu'] + random.uniform(0, 1.2)),
-                'memory': min(100.0, mb['memory'] + random.uniform(0, 1.0)),
-                'cluster_size': 1,
-            }
-            ai_engine.record_operation_result(et, op, mb, ma, True, random.uniform(0.15, 2.5))
-        if ai_engine.phase == 'sustaining' and len(ops_this_iter) > 0:
-            ai_engine._sustain_stats['ops_during_sustain'] = ai_engine._sustain_stats.get('ops_during_sustain', 0) + min(len(ops_this_iter), 8)
-
         if action.get('should_stop'):
-            logger.info('AI engine: control loop stopped — sustain complete, target reached')
+            logger.info('AI engine: control loop stopped — target reached + sustain complete')
             ai_engine.phase = 'COMPLETED'
             ai_engine.end_execution(reason='Target reached + sustain complete')
-            return
+            break
 
+        # When stop_condition="all", use the LAGGING metric's gap for scaling
+        # so that operations keep driving the weaker metric toward target
+        stop_cond = ai_engine.target_config.get('stop_condition', 'any')
+        if stop_cond == 'all':
+            effective_gap = max(cpu_gap, mem_gap)
+        else:
+            effective_gap = min(cpu_gap, mem_gap)
+
+        # Override PID ops/min when one metric is above target but the other
+        # is still far below — prevent the PID from starving the lagging metric
+        if stop_cond == 'all' and effective_gap > 10:
+            ops_floor = 20.0 if effective_gap > 30 else 15.0
+            if action.get('operations_per_minute', 0) < ops_floor:
+                action['operations_per_minute'] = ops_floor
+                if ai_engine.adaptive_controller:
+                    ai_engine.adaptive_controller.operations_per_minute = ops_floor
+
+        # --- Determine how many ops to run this iteration ---
+        if effective_gap > 40:
+            desired_ops = int(max_ops_per_iter * 2.0)
+        elif effective_gap > 20:
+            desired_ops = int(max_ops_per_iter * 1.5)
+        elif effective_gap > 10:
+            desired_ops = max_ops_per_iter
+        elif effective_gap > 0:
+            desired_ops = max(max_ops_per_iter // 2, user_ops_per_iter)
+        else:
+            desired_ops = max(user_ops_per_iter // 2, 3)
+        desired_ops = max(desired_ops, 1)
+
+        # --- Build operations list with adaptive safeguards ---
+        ops_to_run = []
+
+        # Over-request to compensate for blacklisted entities being filtered
+        request_count = desired_ops + len(blacklisted_entities) * 2
+
+        if force_diverse:
+            available_load_ops = [(e, o) for e, o in load_gen_ops if e not in blacklisted_entities]
+            if not available_load_ops:
+                available_load_ops = [(e, o) for e, o in entity_ops if e not in blacklisted_entities]
+            if not available_load_ops:
+                blacklisted_entities.clear()
+                logger.info("🔄 All entities were blacklisted — resetting blacklist")
+                available_load_ops = load_gen_ops or entity_ops
+
+            for j in range(min(request_count, len(available_load_ops) * 3)):
+                et, op = available_load_ops[(op_index + j) % len(available_load_ops)]
+                ops_to_run.append({'entity_type': et, 'operation': op})
+                if len(ops_to_run) >= desired_ops:
+                    break
+            op_index += len(ops_to_run)
+
+            force_diverse = False
+        else:
+            ml_ops = action.get('recommended_operations') or []
+
+            if ml_ops:
+                ml_ops = [r for r in ml_ops if r.get('entity_type', '') not in blacklisted_entities]
+
+                ml_entity_types = set(r.get('entity_type', '') for r in ml_ops)
+                if len(ml_entity_types) <= 1 and ml_ops:
+                    stuck_type = ml_ops[0].get('entity_type', '')
+                    stats = entity_stats[stuck_type]
+                    if stats['attempts'] >= BLACKLIST_THRESHOLD and stats['successes'] == 0:
+                        logger.info(f"🔄 ML stuck on failing entity '{stuck_type}' — injecting diverse ops")
+                        ml_ops = []
+
+                    elif i >= DIVERSITY_WINDOW:
+                        diverse_inject = []
+                        available = [(e, o) for e, o in entity_ops
+                                     if e != stuck_type and e not in blacklisted_entities
+                                     and o in ('CREATE', 'EXECUTE', 'LIST')]
+                        if available:
+                            inject_count = min(desired_ops // 3, len(available))
+                            for j in range(inject_count):
+                                de, do = available[(op_index + j) % len(available)]
+                                diverse_inject.append({'entity_type': de, 'operation': do})
+                            op_index += len(diverse_inject)
+                            ml_ops = ml_ops[:desired_ops - len(diverse_inject)] + diverse_inject
+
+                ops_to_run = ml_ops[:desired_ops]
+
+            if not ops_to_run:
+                ops_pm = float(action.get('operations_per_minute') or 10.0)
+                num_ops = max(desired_ops, int(ops_pm / 12))
+                attempts = 0
+                while len(ops_to_run) < desired_ops and attempts < num_ops + len(blacklisted_entities) * 2:
+                    et, op = entity_ops[op_index % len(entity_ops)]
+                    op_index += 1
+                    attempts += 1
+                    if et in blacklisted_entities:
+                        continue
+                    ops_to_run.append({'entity_type': et, 'operation': op})
+
+        # --- Execute operations (adaptive count, not hard-capped) ---
+        iter_entity_types = set()
+
+        for rec in ops_to_run:
+            if ai_engine.emergency_stop:
+                break
+
+            et = rec.get('entity_type', 'vm')
+            op = rec.get('operation', 'CREATE').upper()
+            iter_entity_types.add(et)
+
+            metrics_before = {
+                'cpu': metrics['cpu'],
+                'memory': metrics['memory'],
+                'cluster_size': metrics.get('cluster_size', 1),
+            }
+
+            op_start = time.monotonic()
+            success = False
+            entity_name = ''
+            result = {}
+            try:
+                result = loop.run_until_complete(
+                    controller._execute_single_operation(et, op, iteration=i)
+                )
+                success = result.get('status') == 'SUCCESS'
+                duration = result.get('duration_seconds', time.monotonic() - op_start)
+                entity_name = result.get('entity_name', '')
+                if not success:
+                    logger.warning(f"⚠️ {et}.{op} failed: {result.get('error', 'unknown')}")
+            except Exception as e:
+                logger.error(f"❌ {et}.{op} exception: {e}")
+                duration = time.monotonic() - op_start
+
+            # --- Update entity tracking ---
+            stats = entity_stats[et]
+            stats['attempts'] += 1
+            if success:
+                stats['successes'] += 1
+                stats['consecutive_fails'] = 0
+                blacklisted_entities.discard(et)
+            else:
+                stats['consecutive_fails'] += 1
+                if stats['consecutive_fails'] >= BLACKLIST_THRESHOLD and stats['successes'] == 0:
+                    if et not in blacklisted_entities:
+                        blacklisted_entities.add(et)
+                        logger.warning(f"🚫 Blacklisted entity '{et}' after {stats['consecutive_fails']} "
+                                       f"consecutive failures (0/{stats['attempts']} success)")
+
+            metrics_after_raw = _fetch_prometheus_cpu_memory(prom)
+            if metrics_after_raw:
+                metrics_after = {
+                    'cpu': metrics_after_raw[0],
+                    'memory': metrics_after_raw[1],
+                    'cluster_size': metrics.get('cluster_size', 1),
+                }
+            else:
+                metrics_after = metrics_before.copy()
+
+            ai_engine.record_operation_result(et, op, metrics_before, metrics_after, success, duration, entity_name=entity_name)
+
+            if ai_engine.phase == 'sustaining':
+                ai_engine._sustain_stats['ops_during_sustain'] = \
+                    ai_engine._sustain_stats.get('ops_during_sustain', 0) + 1
+
+        # Track which entity types were used this iteration
+        recent_entity_types.extend(iter_entity_types)
+        if len(recent_entity_types) > DIVERSITY_WINDOW * 2:
+            recent_entity_types[:] = recent_entity_types[-DIVERSITY_WINDOW * 2:]
+
+        _sync_created_entities(controller, ai_engine)
+
+        if (i + 1) % 20 == 0:
+            bl_str = ', '.join(sorted(blacklisted_entities)) if blacklisted_entities else 'none'
+            top_types = sorted(entity_stats.items(), key=lambda x: x[1]['attempts'], reverse=True)[:5]
+            stats_str = ', '.join(f"{k}:{v['successes']}/{v['attempts']}" for k, v in top_types)
+            logger.info(f"📊 Adaptive state @iter {i+1}: ops/iter={max_ops_per_iter}, "
+                        f"blacklisted=[{bl_str}], stats=[{stats_str}]")
+
+        # Sleep between iterations — faster when far from target
         ops_pm = float(action.get('operations_per_minute') or 10.0)
-        sleep_s = min(8.0, max(0.4, 60.0 / max(ops_pm, 0.5)))
+        if effective_gap > 30:
+            sleep_s = max(1.0, 60.0 / max(ops_pm, 1.0) * 0.3)
+        elif effective_gap > 15:
+            sleep_s = max(2.0, 60.0 / max(ops_pm, 1.0) * 0.5)
+        else:
+            sleep_s = min(10.0, max(1.0, 60.0 / max(ops_pm, 0.5)))
         time.sleep(sleep_s)
 
-    logger.warning('AI engine: max iterations reached')
-    ai_engine.phase = 'COMPLETED'
-    ai_engine.end_execution(reason='Max iterations')
+    # Final sync of created entities + testbed info for cleanup
+    _sync_created_entities(controller, ai_engine)
+    ai_engine._testbed_info = testbed_info
+
+    # Store the resolved Prometheus URL so it's available at DB-persist time
+    ai_engine._prometheus_url = prom if prom else None
+
+    # Capture cluster health snapshot before tunnel is cleaned up
+    if hasattr(controller, '_capture_cluster_health_before_teardown'):
+        controller._capture_cluster_health_before_teardown()
+    if hasattr(controller, '_cluster_health_snapshot'):
+        ai_engine._cluster_health_snapshot = controller._cluster_health_snapshot
+
+    # If controller didn't produce a snapshot, collect directly via enhanced report service
+    if not getattr(ai_engine, '_cluster_health_snapshot', None) and prom:
+        try:
+            from services.enhanced_report_service import EnhancedReportService
+            ers = EnhancedReportService(prometheus_url=prom)
+            snapshot = ers._collect_cluster_health()
+            if snapshot.get('collection_status') == 'success':
+                ai_engine._cluster_health_snapshot = snapshot
+                logger.info(f"📊 Captured cluster health snapshot via Prometheus: {prom}")
+            else:
+                logger.debug(f"Cluster health snapshot not usable: {snapshot.get('collection_reason')}")
+        except Exception as ch_err:
+            logger.debug(f"Cluster health snapshot collection failed: {ch_err}")
+
+    loop.close()
+
+    if ai_engine.phase not in ('COMPLETED', 'failed', 'emergency_stop'):
+        ai_engine.phase = 'COMPLETED'
+        ai_engine.end_execution(reason='Max iterations')
 
 
 @smart_execution_ai_bp.route('/api/smart-execution/start-ai', methods=['POST'])
@@ -221,9 +646,14 @@ def start_ai_execution():
         if not data.get('target_config'):
             return jsonify({'success': False, 'error': 'target_config required'}), 400
         
-        if not data.get('entities_config'):
-            return jsonify({'success': False, 'error': 'entities_config required'}), 400
-        
+        # Auto-fill entities_config with comprehensive defaults when missing or empty
+        raw_ec = data.get('entities_config') or {}
+        usable = {k: v for k, v in raw_ec.items()
+                  if k not in ('ai_enabled', 'ml_enabled') and isinstance(v, list) and v}
+        if not usable:
+            logger.info("ℹ️ No entity-operation pairs in request — using default entities_config")
+            data['entities_config'] = dict(DEFAULT_ENTITIES_CONFIG)
+
         # Get testbed info
         from database import SessionLocal
         from models.testbed import Testbed
@@ -304,9 +734,13 @@ def start_ai_execution():
             'thread': None,
             'start_time': datetime.now(timezone.utc).isoformat(),
             'testbed_id': data['testbed_id'],
-            'execution_name': data.get('execution_name', ''),
+            'execution_name': data.get('execution_name', '') or f"AI Execution - {testbed_info.get('testbed_label', 'Unknown')}",
             'execution_description': data.get('execution_description', '')
         }
+        
+        # Save to DB immediately so execution appears in history even if
+        # the background thread crashes before reaching _save_execution_to_db
+        _save_execution_to_db(execution_id, testbed_info, data, ai_engine)
         
         # Start execution in background thread
         def run_execution():
@@ -314,8 +748,8 @@ def start_ai_execution():
             try:
                 ai_engine.start_execution()
                 
-                # Mark execution started in database
-                _save_execution_to_db(execution_id, testbed_info, data, ai_engine)
+                # Update DB status from STARTING → RUNNING
+                _update_execution_status(execution_id, 'RUNNING')
                 
                 logger.info(f"🚀 AI execution {execution_id} started — entering control loop")
                 _run_ai_control_loop(ai_engine, testbed_info)
@@ -418,6 +852,9 @@ def monitor_ai_execution(execution_id):
                     'sustain_elapsed_seconds': (dt.now(tz.utc) - engine._sustain_start_time).total_seconds() if engine._sustain_start_time else 0,
                     'stats': engine._sustain_stats,
                 }
+
+            if hasattr(engine, '_get_pod_restart_tracking'):
+                status_data['pod_restart_tracking'] = engine._get_pod_restart_tracking()
             
             return jsonify(status_data), 200
         
@@ -433,7 +870,7 @@ def monitor_ai_execution(execution_id):
                 'execution_id': execution_id,
                 'status': status.get('status', 'UNKNOWN'),
                 'phase': status.get('status', 'UNKNOWN'),
-                'iteration': status.get('iteration', 0),
+                'iteration': len(status.get('metrics_history', [])),
                 'total_operations': status.get('total_operations', 0),
                 'operations_per_minute': status.get('operations_per_minute', 0),
                 'current_metrics': {
@@ -449,8 +886,22 @@ def monitor_ai_execution(execution_id):
                     for m in status.get('metrics_history', [])[-20:]
                 ],
                 'pid_stats': status.get('pid_stats'),
+                'recent_operations': [
+                    {
+                        'entity_type': op.get('entity_type'),
+                        'operation': op.get('operation'),
+                        'success': op.get('status') == 'SUCCESS',
+                        'duration': op.get('duration_seconds', 0),
+                        'timestamp': op.get('start_time', ''),
+                        'error': op.get('error')
+                    }
+                    for op in status.get('operations_history', [])
+                ],
+                'execution_config': status.get('execution_config', {}),
+                'entity_breakdown': status.get('entity_breakdown', {}),
                 'emergency_stop': False,
-                'circuit_breaker_trips': 0
+                'circuit_breaker_trips': 0,
+                'pod_restart_tracking': status.get('pod_restart_tracking', {}),
             }), 200
 
         # Otherwise check database
@@ -466,11 +917,16 @@ def monitor_ai_execution(execution_id):
             
             fm = execution.final_metrics or {}
             tc = execution.target_config or {}
+            db_status = (execution.status or '').upper()
+            is_done = db_status in ('COMPLETED', 'FAILED', 'STOPPED')
+            fed = execution.full_execution_data if hasattr(execution, 'full_execution_data') else {}
+            if not isinstance(fed, dict):
+                fed = {}
             return jsonify({
                 'success': True,
                 'execution_id': execution_id,
-                'status': execution.status,
-                'phase': execution.status,
+                'status': db_status,
+                'phase': db_status.lower(),
                 'total_operations': execution.total_operations or 0,
                 'operations_per_minute': execution.operations_per_minute or 0,
                 'current_metrics': {
@@ -484,7 +940,8 @@ def monitor_ai_execution(execution_id):
                 'metrics_history': [],
                 'emergency_stop': False,
                 'circuit_breaker_trips': 0,
-                'completed': True
+                'completed': is_done,
+                'pod_restart_tracking': fed.get('pod_restart_tracking', {}),
             }), 200
             
         finally:
@@ -574,14 +1031,39 @@ def _get_default_namespaces_pods():
         'monitoring',
         'logging'
     ]
-    
+
+    default_pods = [
+        'prism-central',
+        'ncm-api-server',
+        'ncm-controller',
+        'ncm-scheduler',
+        'calm-server',
+        'epsilon-server',
+        'nucalm',
+        'insights-server',
+        'alert-manager',
+        'metrics-server',
+        'coredns',
+        'etcd',
+        'kube-apiserver',
+        'kube-controller-manager',
+        'kube-scheduler',
+    ]
+
+    default_pods_by_ns = {
+        'ntnx-system': ['prism-central', 'ncm-api-server', 'ncm-controller', 'ncm-scheduler',
+                         'calm-server', 'epsilon-server', 'nucalm', 'insights-server', 'alert-manager'],
+        'kube-system': ['coredns', 'etcd', 'kube-apiserver', 'kube-controller-manager', 'kube-scheduler', 'metrics-server'],
+        'monitoring': ['metrics-server'],
+    }
+
     return jsonify({
         'success': True,
         'namespaces': default_namespaces,
-        'pods': [],
-        'pods_by_namespace': {},
+        'pods': default_pods,
+        'pods_by_namespace': default_pods_by_ns,
         'source': 'defaults',
-        'note': 'Prometheus not available, using default namespaces'
+        'note': 'Prometheus not available, using default values'
     }), 200
 
 
@@ -628,11 +1110,20 @@ def get_available_pods():
                 return jsonify({'success': False, 'error': 'Testbed not found'}), 404
             
             # Get Prometheus URL from testbed_json
-            testbed_json = testbed.testbed_json or {}
+            raw = testbed.testbed_json or {}
+            if isinstance(raw, str):
+                import json as _json
+                try:
+                    testbed_json = _json.loads(raw)
+                except (ValueError, TypeError):
+                    testbed_json = {}
+            else:
+                testbed_json = raw
             prometheus_url = testbed_json.get('prometheus_url') or testbed_json.get('prometheus_endpoint')
             
             if not prometheus_url:
-                return jsonify({'success': False, 'error': 'Prometheus URL not configured for this testbed'}), 400
+                logger.info(f"Prometheus not configured for testbed {testbed_id}, returning defaults")
+                return _get_default_namespaces_pods()
             
             # Query Prometheus for pod info
             prom_query_url = f"{prometheus_url}/api/v1/query"
@@ -792,21 +1283,49 @@ def get_ai_report(execution_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _update_execution_status(execution_id: str, status: str):
+    """Update execution status in DB."""
+    try:
+        from database import SessionLocal
+        from models.smart_execution import SmartExecution
+
+        session = SessionLocal()
+        try:
+            execution = session.query(SmartExecution).filter_by(
+                execution_id=execution_id
+            ).first()
+            if execution:
+                execution.status = status
+                session.commit()
+                logger.info(f"✅ Updated {execution_id} status → {status}")
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"❌ Failed to update execution status: {e}")
+
+
 def _save_execution_to_db(execution_id, testbed_info, config, engine):
-    """Save AI execution to database"""
+    """Save AI execution to database (idempotent — skips if already exists)."""
     try:
         from database import SessionLocal
         from models.smart_execution import SmartExecution
         
         session = SessionLocal()
         try:
+            existing = session.query(SmartExecution).filter_by(
+                execution_id=execution_id
+            ).first()
+            if existing:
+                logger.info(f"ℹ️ Execution {execution_id} already in DB — skipping duplicate save")
+                return
+            
+            exec_name = config.get('execution_name', '') or f"AI Execution - {testbed_info.get('testbed_label', 'Unknown')}"
             execution = SmartExecution(
                 execution_id=execution_id,
-                execution_name=config.get('execution_name', ''),
+                execution_name=exec_name,
                 execution_description=config.get('execution_description', ''),
                 testbed_id=testbed_info['unique_testbed_id'],
-                pc_ip=testbed_info['pc_ip'],
-                ncm_ip=testbed_info['ncm_ip'],
+                unique_testbed_id=testbed_info['unique_testbed_id'],
                 testbed_label=testbed_info['testbed_label'],
                 target_config=config['target_config'],
                 entities_config={
@@ -815,7 +1334,9 @@ def _save_execution_to_db(execution_id, testbed_info, config, engine):
                     'ml_enabled': config.get('ai_settings', {}).get('enable_ml', True)
                 },
                 rule_config=config.get('rule_config', {}),
-                status='running',
+                ai_enabled=config.get('ai_settings', {}).get('enable_ai', True),
+                status='STARTING',
+                is_running=True,
                 start_time=datetime.now(timezone.utc)
             )
             
@@ -902,7 +1423,79 @@ def _complete_execution_in_db(execution_id, engine, testbed_info):
                         'model_trained': True,
                         'training_samples': len(engine.training_data)
                     }
-                
+
+                # Persist metrics_history, operations_history, success_rate, duration
+                if engine.metrics_history:
+                    execution.metrics_history = [
+                        {**m,
+                         'cpu_percent': m.get('cpu_percent') or m.get('cpu', 0),
+                         'memory_percent': m.get('memory_percent') or m.get('memory', 0)}
+                        for m in engine.metrics_history
+                    ]
+                if engine.operation_history:
+                    execution.operations_history = engine.operation_history
+
+                total_ops = execution.total_operations or 0
+                succ_ops = execution.successful_operations or 0
+                execution.success_rate = round((succ_ops / max(total_ops, 1)) * 100, 2)
+
+                if engine.start_time and execution.end_time:
+                    delta = (execution.end_time - engine.start_time).total_seconds()
+                    execution.duration_minutes = round(delta / 60, 2)
+                    execution.operations_per_minute = round(total_ops / max(delta / 60, 0.1), 1) if delta > 0 else 0
+
+                # Persist full execution data (cluster health, anomalies, prometheus URL, etc.)
+                full_data = execution.full_execution_data or {}
+                if not isinstance(full_data, dict):
+                    full_data = {}
+                ch = getattr(engine, '_cluster_health_snapshot', None)
+                if ch and isinstance(ch, dict):
+                    full_data['cluster_health_snapshot'] = ch
+                prom_url = getattr(engine, '_prometheus_url', None)
+                if prom_url:
+                    full_data['prometheus_url'] = prom_url
+
+                # Store operation effectiveness (most effective operations)
+                op_effectiveness = {}
+                for op in engine.operation_history:
+                    key = f"{op.get('entity_type', '?')}.{op.get('operation', '?')}"
+                    if key not in op_effectiveness:
+                        op_effectiveness[key] = {'count': 0, 'successes': 0, 'total_cpu_impact': 0.0, 'total_mem_impact': 0.0}
+                    bucket = op_effectiveness[key]
+                    bucket['count'] += 1
+                    if op.get('success'):
+                        bucket['successes'] += 1
+                    bucket['total_cpu_impact'] += abs(op.get('cpu_impact', 0))
+                    bucket['total_mem_impact'] += abs(op.get('memory_impact', 0))
+                full_data['operation_effectiveness'] = [
+                    {'entity_operation': k, **v,
+                     'avg_cpu_impact': round(v['total_cpu_impact'] / max(v['count'], 1), 3),
+                     'avg_mem_impact': round(v['total_mem_impact'] / max(v['count'], 1), 3)}
+                    for k, v in sorted(op_effectiveness.items(), key=lambda x: -x[1]['total_cpu_impact'])
+                ]
+
+                # Store entity breakdown with success/fail stats
+                entity_breakdown = {}
+                for op in engine.operation_history:
+                    et = op.get('entity_type', 'unknown')
+                    if et not in entity_breakdown:
+                        entity_breakdown[et] = {'total': 0, 'success': 0, 'failed': 0}
+                    entity_breakdown[et]['total'] += 1
+                    if op.get('success'):
+                        entity_breakdown[et]['success'] += 1
+                    else:
+                        entity_breakdown[et]['failed'] += 1
+                execution.entity_breakdown = entity_breakdown
+
+                execution.full_execution_data = full_data
+
+                # Persist created entities so cleanup can delete them later
+                created = getattr(engine, '_created_entities', {})
+                if created:
+                    execution.created_entities = created
+                    total_created = sum(len(v) for v in created.values())
+                    logger.info(f"📦 Saved {total_created} created entities for cleanup")
+
                 session.commit()
                 logger.info(f"✅ Marked execution {execution_id} as completed")
 

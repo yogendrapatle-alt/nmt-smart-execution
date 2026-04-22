@@ -2,6 +2,8 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactApexChart from 'react-apexcharts';
 import { getApiBase } from '../utils/backendUrl';
+import { PageHeader, MetricCard, EmptyState } from '../components/ui';
+import { SkeletonMetricRow, SkeletonCard } from '../components/ui/LoadingSkeleton';
 
 interface Overview {
   period: { start: string; end: string; days: number };
@@ -30,7 +32,7 @@ const AnalyticsDashboard: React.FC = () => {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [trends, setTrends] = useState<TrendPoint[]>([]);
   const [loading, setLoading] = useState(true);
-  const [dateRange, setDateRange] = useState('30');
+  const [dateRange, setDateRange] = useState('365');
   const [selectedMetric, setSelectedMetric] = useState('executions');
 
   const loadAnalytics = useCallback(async () => {
@@ -63,13 +65,13 @@ const AnalyticsDashboard: React.FC = () => {
 
   useEffect(() => { loadAnalytics(); }, [loadAnalytics]);
 
+  /* ── Loading skeleton ──────────────────────────────────── */
   if (loading) {
     return (
       <div className="main-content">
-        <div className="text-center py-5">
-          <div className="spinner-border text-primary" role="status" style={{ width: '3rem', height: '3rem' }}><span className="visually-hidden">Loading...</span></div>
-          <p className="mt-3 text-muted">Loading analytics...</p>
-        </div>
+        <PageHeader icon="insights" iconGradient="linear-gradient(135deg, #667eea, #764ba2)" title="Analytics Dashboard" subtitle="Loading performance data…" />
+        <SkeletonMetricRow count={6} />
+        <SkeletonCard lines={8} />
       </div>
     );
   }
@@ -81,87 +83,95 @@ const AnalyticsDashboard: React.FC = () => {
   const trendValues = trends.map(t => Math.round(t.value * 100) / 100);
   const mi = metricInfo[selectedMetric] || metricInfo.executions;
 
+  const cpuVariant: 'success' | 'warning' | 'danger' = overview
+    ? overview.resource_utilization.avg_cpu_percent > 80 ? 'danger' : overview.resource_utilization.avg_cpu_percent > 60 ? 'warning' : 'success'
+    : 'success';
+  const memVariant: 'success' | 'warning' | 'danger' = overview
+    ? overview.resource_utilization.avg_memory_percent > 80 ? 'danger' : overview.resource_utilization.avg_memory_percent > 60 ? 'warning' : 'success'
+    : 'success';
+  const successVariant: 'success' | 'warning' | 'danger' = overview
+    ? overview.executions.success_rate >= 80 ? 'success' : overview.executions.success_rate >= 50 ? 'warning' : 'danger'
+    : 'success';
+
   return (
     <div className="main-content">
-      {/* Header */}
-      <div className="d-flex justify-content-between align-items-start mb-4 flex-wrap gap-3">
-        <div>
-          <h2 className="fw-bold mb-1 d-flex align-items-center gap-2">
-            <div className="d-inline-flex align-items-center justify-content-center rounded-3" style={{ width: 48, height: 48, background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' }}>
-              <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>insights</i>
-            </div>
-            Analytics Dashboard
-          </h2>
-          <p className="text-muted mb-0" style={{ maxWidth: 600 }}>
-            Track Smart Execution performance across all testbeds. Monitor execution counts, success rates, operation throughput, and resource usage trends over time.
-          </p>
-        </div>
-        <div className="d-flex gap-2 align-items-center flex-wrap">
-          <select className="form-select form-select-sm rounded-3" style={{ width: 'auto' }} value={dateRange} onChange={e => setDateRange(e.target.value)}>
-            <option value="7">Last 7 days</option>
-            <option value="30">Last 30 days</option>
-            <option value="60">Last 60 days</option>
-            <option value="90">Last 90 days</option>
-          </select>
-          <button className="btn btn-outline-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={loadAnalytics}>
-            <i className="material-icons-outlined" style={{ fontSize: 18 }}>refresh</i>Refresh
-          </button>
-        </div>
-      </div>
+      <PageHeader
+        icon="insights"
+        iconGradient="linear-gradient(135deg, #667eea, #764ba2)"
+        title="Analytics Dashboard"
+        subtitle="Track Smart Execution performance across all testbeds — execution counts, success rates, operation throughput, and resource usage trends."
+        actions={
+          <div className="d-flex gap-2 align-items-center flex-wrap">
+            <select className="form-select form-select-sm rounded-3" style={{ width: 'auto' }} value={dateRange} onChange={e => setDateRange(e.target.value)}>
+              <option value="7">Last 7 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="60">Last 60 days</option>
+              <option value="90">Last 90 days</option>
+              <option value="180">Last 6 months</option>
+              <option value="365">Last 1 year</option>
+            </select>
+            <button className="btn btn-outline-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={loadAnalytics}>
+              <i className="material-icons-outlined" style={{ fontSize: 18 }}>refresh</i>Refresh
+            </button>
+          </div>
+        }
+      />
 
-      {/* Metric Cards */}
+      {/* ── Metric Cards ──────────────────────────────────── */}
       {overview && (
-        <div className="row g-3 mb-4">
-          {[
-            { icon: 'rocket_launch', label: 'Total Executions', value: overview.executions.total, sub: `${overview.executions.completed} completed, ${overview.executions.failed} failed`, color: '#3b82f6' },
-            { icon: 'check_circle', label: 'Operation Success Rate', value: `${overview.executions.success_rate.toFixed(1)}%`, sub: overview.executions.success_rate >= 80 ? 'Healthy — above 80% target' : overview.executions.success_rate >= 50 ? 'Moderate — room for improvement' : 'Below 50% — review failing operations', color: overview.executions.success_rate >= 80 ? '#22c55e' : overview.executions.success_rate >= 50 ? '#f59e0b' : '#ef4444' },
-            { icon: 'settings', label: 'Total Operations', value: overview.operations.total.toLocaleString(), sub: `${overview.operations.success_rate.toFixed(1)}% op success rate`, color: '#8b5cf6' },
-            { icon: 'timer', label: 'Avg Execution Time', value: `${overview.performance.avg_duration_minutes.toFixed(1)}m`, sub: `${overview.performance.avg_operations_per_minute.toFixed(1)} ops/min throughput`, color: '#f59e0b' },
-            { icon: 'memory', label: 'Avg CPU Usage', value: `${overview.resource_utilization.avg_cpu_percent.toFixed(1)}%`, sub: overview.resource_utilization.avg_cpu_percent > 80 ? 'High — monitor closely' : 'Within normal range', color: '#06b6d4' },
-            { icon: 'storage', label: 'Avg Memory Usage', value: `${overview.resource_utilization.avg_memory_percent.toFixed(1)}%`, sub: overview.resource_utilization.avg_memory_percent > 80 ? 'High — monitor closely' : 'Within normal range', color: '#ec4899' },
-          ].map((c, i) => (
-            <div className="col-md-4 col-xl-2" key={i}>
-              <div className="card rounded-4 border shadow-none h-100">
-                <div className="card-body d-flex align-items-center gap-3 p-3">
-                  <div className="d-flex align-items-center justify-content-center rounded-3 flex-shrink-0" style={{ width: 44, height: 44, background: `${c.color}15` }}>
-                    <i className="material-icons-outlined" style={{ fontSize: 24, color: c.color }}>{c.icon}</i>
-                  </div>
-                  <div>
-                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>{c.label}</div>
-                    <div className="fw-bold fs-5">{c.value}</div>
-                    <div className="text-muted" style={{ fontSize: '0.68rem' }}>{c.sub}</div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          ))}
+        <div className="row row-cols-1 row-cols-md-3 row-cols-xl-6 g-3 mb-4">
+          <div className="col">
+            <MetricCard icon="rocket_launch" variant="default" label="Total Executions" value={overview.executions.total}
+              detail={`${overview.executions.completed} completed, ${overview.executions.failed} failed`} />
+          </div>
+          <div className="col">
+            <MetricCard icon="check_circle" variant={successVariant} label="Success Rate" value={`${overview.executions.success_rate.toFixed(1)}`} suffix="%"
+              detail={overview.executions.success_rate >= 80 ? 'Healthy — above 80%' : overview.executions.success_rate >= 50 ? 'Moderate — room for improvement' : 'Below 50% — review failures'} />
+          </div>
+          <div className="col">
+            <MetricCard icon="settings" iconGradient="linear-gradient(135deg, #8b5cf6, #7c3aed)" label="Total Operations" value={overview.operations.total.toLocaleString()}
+              detail={`${overview.operations.success_rate.toFixed(1)}% op success`} />
+          </div>
+          <div className="col">
+            <MetricCard icon="timer" variant="warning" label="Avg Exec Time" value={`${overview.performance.avg_duration_minutes.toFixed(1)}`} suffix="m"
+              detail={`${overview.performance.avg_operations_per_minute.toFixed(1)} ops/min`} />
+          </div>
+          <div className="col">
+            <MetricCard icon="memory" variant={cpuVariant} label="Avg CPU" value={`${overview.resource_utilization.avg_cpu_percent.toFixed(1)}`} suffix="%"
+              detail={overview.resource_utilization.avg_cpu_percent > 80 ? 'High — monitor closely' : 'Within normal range'} />
+          </div>
+          <div className="col">
+            <MetricCard icon="storage" variant={memVariant} label="Avg Memory" value={`${overview.resource_utilization.avg_memory_percent.toFixed(1)}`} suffix="%"
+              detail={overview.resource_utilization.avg_memory_percent > 80 ? 'High — monitor closely' : 'Within normal range'} />
+          </div>
         </div>
       )}
 
-      {/* Trend Chart */}
-      <div className="card rounded-4 border shadow-none mb-4">
-        <div className="card-header bg-transparent border-bottom p-4 d-flex justify-content-between align-items-start">
-          <div>
-            <h5 className="mb-0 fw-semibold d-flex align-items-center gap-2">
-              <i className="material-icons-outlined text-primary" style={{ fontSize: 24 }}>show_chart</i>
-              {mi.label} Trend
-            </h5>
-            <p className="text-muted small mb-0 mt-1">{mi.desc}</p>
-          </div>
-          <select className="form-select form-select-sm rounded-3" style={{ width: 'auto' }} value={selectedMetric} onChange={e => setSelectedMetric(e.target.value)}>
-            {Object.entries(metricInfo).map(([key, info]) => (
-              <option key={key} value={key}>{info.label}</option>
-            ))}
-          </select>
-        </div>
+      {/* ── Trend Chart ───────────────────────────────────── */}
+      <div className="card border-0 rounded-3 mb-4" style={{ boxShadow: 'var(--shadow-sm)' }}>
         <div className="card-body p-4">
+          <div className="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
+            <div>
+              <h6 className="mb-0 fw-semibold d-flex align-items-center gap-2" style={{ fontSize: 'var(--text-md)' }}>
+                <i className="material-icons-outlined" style={{ fontSize: 20, color: 'var(--color-primary)' }}>show_chart</i>
+                {mi.label} Trend
+              </h6>
+              <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }} className="mb-0 mt-1">{mi.desc}</p>
+            </div>
+            <select className="form-select form-select-sm rounded-3" style={{ width: 'auto' }} value={selectedMetric} onChange={e => setSelectedMetric(e.target.value)}>
+              {Object.entries(metricInfo).map(([key, info]) => (
+                <option key={key} value={key}>{info.label}</option>
+              ))}
+            </select>
+          </div>
+
           {trends.length > 0 ? (
             <ReactApexChart
               type="area"
               height={300}
               series={[{ name: mi.label, data: trendValues }]}
               options={{
-                chart: { toolbar: { show: false }, zoom: { enabled: false }, fontFamily: 'inherit' },
+                chart: { toolbar: { show: false }, zoom: { enabled: false }, fontFamily: 'var(--font-sans)' },
                 colors: ['#667eea'],
                 stroke: { curve: 'smooth', width: 2 },
                 fill: { type: 'gradient', gradient: { shadeIntensity: 1, opacityFrom: 0.4, opacityTo: 0.05 } },
@@ -173,44 +183,39 @@ const AnalyticsDashboard: React.FC = () => {
               }}
             />
           ) : (
-            <div className="text-center py-5 text-muted">
-              <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>bar_chart</i>
-              <div>No trend data for this period. Run some Smart Executions to see data here.</div>
-            </div>
+            <EmptyState icon="bar_chart" title="No trend data" description={`No data for this period. Run some Smart Executions to see ${mi.label.toLowerCase()} trends.`} />
           )}
         </div>
       </div>
 
-      {/* Quick Links */}
+      {/* ── Quick Links ───────────────────────────────────── */}
       <div className="row g-3">
-        <div className="col-md-6">
-          <div className="card rounded-4 border shadow-none h-100" role="button" onClick={() => navigate('/analytics/comparison')} style={{ cursor: 'pointer', transition: 'transform 0.15s' }} onMouseEnter={e => (e.currentTarget.style.transform = 'translateY(-2px)')} onMouseLeave={e => (e.currentTarget.style.transform = 'none')}>
-            <div className="card-body d-flex align-items-center gap-3 p-4">
-              <div className="d-flex align-items-center justify-content-center rounded-3" style={{ width: 48, height: 48, background: 'linear-gradient(135deg, #3b82f6, #2563eb)' }}>
-                <i className="material-icons-outlined text-white" style={{ fontSize: 24 }}>compare</i>
+        {[
+          { path: '/analytics/comparison', icon: 'compare', gradient: 'linear-gradient(135deg, #3b82f6, #2563eb)', title: 'Execution Comparison', desc: 'Compare multiple executions side by side to see which performed best' },
+          { path: '/analytics/executive-summary', icon: 'summarize', gradient: 'linear-gradient(135deg, #8b5cf6, #7c3aed)', title: 'Executive Summary', desc: 'High-level insights and key metrics to share with stakeholders' },
+        ].map(link => (
+          <div className="col-md-6" key={link.path}>
+            <div
+              className="card border-0 rounded-3 h-100"
+              style={{ boxShadow: 'var(--shadow-sm)', cursor: 'pointer', transition: 'transform var(--transition-fast), box-shadow var(--transition-fast)' }}
+              role="button"
+              onClick={() => navigate(link.path)}
+              onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = 'var(--shadow-md)'; }}
+              onMouseLeave={e => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = 'var(--shadow-sm)'; }}
+            >
+              <div className="card-body d-flex align-items-center gap-3 p-4">
+                <div className="d-flex align-items-center justify-content-center rounded-3 flex-shrink-0" style={{ width: 44, height: 44, background: link.gradient }}>
+                  <i className="material-icons-outlined text-white" style={{ fontSize: 24 }}>{link.icon}</i>
+                </div>
+                <div style={{ minWidth: 0 }}>
+                  <h6 className="fw-bold mb-0" style={{ fontSize: 'var(--text-base)' }}>{link.title}</h6>
+                  <p className="mb-0" style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{link.desc}</p>
+                </div>
+                <i className="material-icons-outlined ms-auto" style={{ color: 'var(--color-text-muted)' }}>chevron_right</i>
               </div>
-              <div>
-                <h6 className="fw-bold mb-0">Execution Comparison</h6>
-                <p className="text-muted mb-0 small">Compare multiple executions side by side to see which performed best</p>
-              </div>
-              <i className="material-icons-outlined ms-auto text-muted">chevron_right</i>
             </div>
           </div>
-        </div>
-        <div className="col-md-6">
-          <div className="card rounded-4 border shadow-none h-100" role="button" onClick={() => navigate('/analytics/executive-summary')} style={{ cursor: 'pointer', transition: 'transform 0.15s' }} onMouseEnter={e => (e.currentTarget.style.transform = 'translateY(-2px)')} onMouseLeave={e => (e.currentTarget.style.transform = 'none')}>
-            <div className="card-body d-flex align-items-center gap-3 p-4">
-              <div className="d-flex align-items-center justify-content-center rounded-3" style={{ width: 48, height: 48, background: 'linear-gradient(135deg, #8b5cf6, #7c3aed)' }}>
-                <i className="material-icons-outlined text-white" style={{ fontSize: 24 }}>summarize</i>
-              </div>
-              <div>
-                <h6 className="fw-bold mb-0">Executive Summary</h6>
-                <p className="text-muted mb-0 small">High-level insights and key metrics to share with stakeholders</p>
-              </div>
-              <i className="material-icons-outlined ms-auto text-muted">chevron_right</i>
-            </div>
-          </div>
-        </div>
+        ))}
       </div>
     </div>
   );

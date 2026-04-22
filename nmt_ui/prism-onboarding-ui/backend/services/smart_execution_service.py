@@ -49,26 +49,53 @@ def broadcast_log(execution_id: str, log_level: str, message: str, data: Dict = 
             logger.debug(f"Failed to broadcast log: {e}")
 
 
-def get_slack_webhook_for_testbed(unique_testbed_id: Optional[str]) -> Optional[str]:
-    """Resolve Slack incoming webhook URL from first rule config for this testbed (if any)."""
-    if not unique_testbed_id:
-        return None
-    try:
-        from database import SessionLocal
-        from models.config import Config
-        session = SessionLocal()
+def get_slack_webhook_for_testbed(unique_testbed_id: Optional[str] = None) -> Optional[str]:
+    """Resolve Slack incoming webhook URL for a testbed.
+
+    Lookup order (first non-empty URL wins):
+      1. testbed.alert_config  ->  slack.webhook_url  (Alert Config page)
+      2. configs table         ->  config_json.alert_destination.value  (Rule Builder)
+      3. SLACK_WEBHOOK_URL env var  (global fallback for all testbeds)
+    """
+    def _is_valid_url(u: Any) -> bool:
+        return bool(u) and isinstance(u, str) and u.startswith('https://hooks.slack.com/')
+
+    if unique_testbed_id:
         try:
-            row = session.query(Config).filter_by(unique_testbed_id=unique_testbed_id).first()
-            if row and row.config_json and isinstance(row.config_json, dict):
-                ad = row.config_json.get('alert_destination') or {}
-                if isinstance(ad, dict):
-                    url = ad.get('value')
-                    if url and isinstance(url, str) and url.startswith('http'):
-                        return url.strip()
-        finally:
-            session.close()
-    except Exception as e:
-        logger.debug(f"Could not resolve Slack webhook for testbed: {e}")
+            from database import SessionLocal
+            session = SessionLocal()
+            try:
+                # Strategy 1: testbed.alert_config (set via PUT /api/alerts/config)
+                from models.testbed import Testbed
+                tb = session.query(Testbed).filter_by(unique_testbed_id=unique_testbed_id).first()
+                if tb:
+                    ac = tb.alert_config if hasattr(tb, 'alert_config') else None
+                    if isinstance(ac, dict):
+                        slack_cfg = ac.get('slack') or {}
+                        if isinstance(slack_cfg, dict) and slack_cfg.get('enabled'):
+                            url = (slack_cfg.get('webhook_url') or '').strip()
+                            if _is_valid_url(url):
+                                return url
+
+                # Strategy 2: configs table (set via Rule Builder / save-config)
+                from models.config import Config
+                row = session.query(Config).filter_by(unique_testbed_id=unique_testbed_id).first()
+                if row and row.config_json and isinstance(row.config_json, dict):
+                    ad = row.config_json.get('alert_destination') or {}
+                    if isinstance(ad, dict):
+                        url = (ad.get('value') or '').strip()
+                        if _is_valid_url(url):
+                            return url
+            finally:
+                session.close()
+        except Exception as e:
+            logger.debug(f"Could not resolve Slack webhook from DB for testbed: {e}")
+
+    # Strategy 3: global fallback from environment variable
+    env_url = (os.environ.get('SLACK_WEBHOOK_URL') or '').strip()
+    if _is_valid_url(env_url):
+        return env_url
+
     return None
 
 
@@ -312,6 +339,13 @@ class SmartExecutionController:
         self._last_checkpoint_time = None
         self._checkpoint_reports: List[Dict] = []
         self._entity_parity_snapshots: List[Dict] = []
+        
+        # Pod restart tracking (continuous during execution)
+        self._pod_restart_baseline: Dict[str, int] = {}  # {pod/ns/container: restart_count}
+        self._pod_restart_events: List[Dict] = []  # individual restart events with timestamps
+        self._pod_restart_summary: Dict[str, Dict] = {}  # per-pod aggregated restart info
+        self._last_pod_restart_check: Optional[datetime] = None
+        self._pod_restart_check_interval = 300  # check every 5 minutes
         
         # Control parameters
         self.poll_interval = 15  # seconds between metric checks
@@ -783,9 +817,10 @@ class SmartExecutionController:
         """
         Auto-discover a working Prometheus endpoint for this testbed.
         Strategy:
-          1. Use explicit prometheus_url/prometheus_endpoint from testbed_json
-          2. Try NCM Prometheus (ncm_ip:node_port)
-          3. Set up SSH tunnel to PC's internal Prometheus (K8s ClusterIP)
+          1. Try direct HTTPS to PC IP on standard NCM NodePort (30546)
+          2. Use explicit prometheus_url/prometheus_endpoint from testbed_json
+          3. Try NCM Prometheus on various ports
+          4. SSH tunnel to PC's internal Prometheus (last resort)
         """
         import subprocess, socket
         
@@ -809,14 +844,16 @@ class SmartExecutionController:
                 pass
             return False
         
-        # Strategy 1: SSH tunnel to PC's internal Prometheus (preferred — monitors
-        # the management plane where stress pods run)
+        # Strategy 1: Direct HTTPS to PC on standard NCM Prometheus NodePort
         if pc_ip:
-            tunnel_url = self._setup_pc_prometheus_tunnel(pc_ip)
-            if tunnel_url:
-                return tunnel_url
+            for port in [30546, 31943, 30560]:
+                for proto in ['https', 'http']:
+                    url = f"{proto}://{pc_ip}:{port}"
+                    if _test_prometheus(url, timeout=8.0):
+                        logger.info(f"✅ Prometheus reachable directly at {url}")
+                        return url
         
-        # Strategy 2: Try explicit URL from testbed_json (HTTP→HTTPS resolution for TLS-only endpoints)
+        # Strategy 2: Try explicit URL from testbed_json
         for key in ('prometheus_url', 'prometheus_endpoint'):
             url = testbed_info.get(key, '')
             if url and not url.startswith('http://localhost:'):
@@ -825,20 +862,24 @@ class SmartExecutionController:
                     logger.info(f"✅ Prometheus reachable at stored {key}: {resolved}")
                     return resolved
         
-        # Strategy 3: Try NCM Prometheus (HTTPS on node_port)
-        if ncm_ip:
-            node_port = testbed_info.get('node_port', 30560)
-            for port in [node_port, 30560, 31943]:
+        # Strategy 3: Try NCM IP on various ports
+        if ncm_ip and ncm_ip != pc_ip:
+            for port in [30546, 31943, 30560]:
                 for proto in ['https', 'http']:
                     url = f"{proto}://{ncm_ip}:{port}"
-                    if _test_prometheus(url, timeout=4.0):
+                    if _test_prometheus(url, timeout=5.0):
                         logger.info(f"✅ NCM Prometheus reachable: {url}")
                         return url
         
-        # Strategy 4: Fallback to NCM HTTPS
-        if ncm_ip:
-            node_port = testbed_info.get('node_port', 30560)
-            fallback = f"https://{ncm_ip}:{node_port}"
+        # Strategy 4: SSH tunnel to PC's internal Prometheus (last resort)
+        if pc_ip:
+            tunnel_url = self._setup_pc_prometheus_tunnel(pc_ip)
+            if tunnel_url:
+                return tunnel_url
+        
+        # Fallback
+        if pc_ip:
+            fallback = f"https://{pc_ip}:30546"
             logger.warning(f"⚠️ No Prometheus reachable, falling back to: {fallback}")
             return fallback
         
@@ -929,6 +970,126 @@ class SmartExecutionController:
         except Exception as e:
             logger.debug(f"Could not collect cluster health snapshot: {e}")
 
+    # ── Pod restart continuous monitoring ──────────────────────────────
+
+    def _query_prometheus_multi(self, query: str) -> List[Dict]:
+        """Query Prometheus and return all result entries (not just the first scalar)."""
+        if getattr(self, '_prometheus_dead', False):
+            return []
+        urls_to_try = [self.prometheus_url]
+        if self.prometheus_url_https:
+            urls_to_try.append(self.prometheus_url_https)
+        for url_base in urls_to_try:
+            try:
+                url = urljoin(url_base, '/api/v1/query')
+                resp = requests.get(url, params={'query': query}, verify=False, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get('status') == 'success':
+                        return data.get('data', {}).get('result', [])
+            except Exception:
+                continue
+        return []
+
+    def _capture_pod_restart_baseline(self):
+        """Snapshot current cumulative restart counts as baseline before execution begins."""
+        if not self.prometheus_url:
+            return
+        try:
+            query = 'kube_pod_container_status_restarts_total{container!=""}'
+            results = self._query_prometheus_multi(query)
+            for r in results:
+                m = r.get('metric', {})
+                count = float(r.get('value', [0, 0])[1])
+                key = f"{m.get('pod','')}/{m.get('namespace','')}/{m.get('container','')}"
+                self._pod_restart_baseline[key] = int(count)
+            logger.info(f"📊 Pod restart baseline captured: {len(self._pod_restart_baseline)} containers tracked")
+            self._last_pod_restart_check = datetime.now(timezone.utc)
+        except Exception as e:
+            logger.debug(f"Could not capture pod restart baseline: {e}")
+
+    def _check_pod_restarts(self):
+        """Poll Prometheus for restart counts and detect new restarts since baseline."""
+        if not self.prometheus_url:
+            return
+        now = datetime.now(timezone.utc)
+        if self._last_pod_restart_check:
+            elapsed = (now - self._last_pod_restart_check).total_seconds()
+            if elapsed < self._pod_restart_check_interval:
+                return
+        self._last_pod_restart_check = now
+
+        try:
+            query = 'kube_pod_container_status_restarts_total{container!=""}'
+            results = self._query_prometheus_multi(query)
+            for r in results:
+                m = r.get('metric', {})
+                pod = m.get('pod', '')
+                namespace = m.get('namespace', '')
+                container = m.get('container', '')
+                current_count = int(float(r.get('value', [0, 0])[1]))
+                key = f"{pod}/{namespace}/{container}"
+                baseline = self._pod_restart_baseline.get(key, 0)
+                delta = current_count - baseline
+
+                if delta > 0:
+                    prev = self._pod_restart_summary.get(key, {}).get('delta', 0)
+                    new_restarts = delta - prev
+                    if new_restarts > 0:
+                        event = {
+                            'pod': pod,
+                            'namespace': namespace,
+                            'container': container,
+                            'new_restarts': new_restarts,
+                            'total_since_start': delta,
+                            'cumulative_total': current_count,
+                            'detected_at': now.isoformat(),
+                            'execution_elapsed_min': round(
+                                (now - self.start_time).total_seconds() / 60, 1
+                            ) if self.start_time else 0,
+                        }
+                        self._pod_restart_events.append(event)
+                        self._log_event(
+                            'WARNING',
+                            f'🔄 Pod restart detected: {pod}/{container} in {namespace} '
+                            f'(+{new_restarts}, total since start: {delta})'
+                        )
+
+                    self._pod_restart_summary[key] = {
+                        'pod': pod,
+                        'namespace': namespace,
+                        'container': container,
+                        'delta': delta,
+                        'baseline': baseline,
+                        'current': current_count,
+                        'last_seen': now.isoformat(),
+                    }
+
+            total_restarts = sum(s.get('delta', 0) for s in self._pod_restart_summary.values())
+            self._sustain_stats['stress_pod_restarts'] = total_restarts
+            if total_restarts > 0:
+                logger.info(f"🔄 Pod restart check: {total_restarts} total restarts detected across "
+                           f"{len(self._pod_restart_summary)} pods since execution start")
+        except Exception as e:
+            logger.debug(f"Pod restart check failed: {e}")
+
+    def _get_pod_restart_tracking(self) -> Dict:
+        """Return pod restart tracking data for status / persistence."""
+        summary_list = sorted(
+            self._pod_restart_summary.values(),
+            key=lambda x: x.get('delta', 0),
+            reverse=True,
+        )
+        total_restarts = sum(s.get('delta', 0) for s in summary_list)
+        return {
+            'total_restarts_during_execution': total_restarts,
+            'pods_restarted': len(summary_list),
+            'restart_events': self._pod_restart_events[-100:],
+            'pod_summary': summary_list[:30],
+            'baseline_containers_tracked': len(self._pod_restart_baseline),
+            'last_check': self._last_pod_restart_check.isoformat() if self._last_pod_restart_check else None,
+        }
+
     def _cleanup_ssh_tunnel(self):
         """Clean up the SSH tunnel process."""
         if self._ssh_tunnel_proc:
@@ -965,6 +1126,8 @@ class SmartExecutionController:
             self.baseline_metrics = await self._get_current_metrics()
             baseline_cpu = self.baseline_metrics.get('cpu_percent', 0)
             baseline_mem = self.baseline_metrics.get('memory_percent', 0)
+            
+            self._capture_pod_restart_baseline()
             
             target_cpu = self.target_config.get('cpu_threshold', 80)
             target_mem = self.target_config.get('memory_threshold', 80)
@@ -1165,13 +1328,22 @@ class SmartExecutionController:
                 await asyncio.sleep(2)
                 continue
             
-            # Execution timeout safety check
+            # Execution timeout / longevity duration check
             if timeout_minutes and timeout_minutes > 0 and self.start_time:
                 elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds() / 60
                 if elapsed >= timeout_minutes:
-                    logger.warning(f"Execution timeout reached ({elapsed:.1f} >= {timeout_minutes} min)")
-                    self._log_event('WARNING', f'Execution timeout reached after {elapsed:.1f} minutes')
-                    self.status = "TIMEOUT"
+                    if self._longevity_enabled and self.status == "LONGEVITY_SUSTAINING":
+                        hours = elapsed / 60
+                        logger.info(f"✅ Longevity run completed after {hours:.1f}h ({elapsed:.1f} min)")
+                        self._log_event('SUCCESS', f'✅ Longevity run completed after {hours:.1f} hours. '
+                                       f'CPU range: {self._sustain_stats["min_cpu"]:.1f}-{self._sustain_stats["max_cpu"]:.1f}%, '
+                                       f'Memory range: {self._sustain_stats["min_memory"]:.1f}-{self._sustain_stats["max_memory"]:.1f}%, '
+                                       f'Re-escalations: {self._sustain_stats.get("reescalations", 0)}')
+                        self.status = "COMPLETED"
+                    else:
+                        logger.warning(f"Execution timeout reached ({elapsed:.1f} >= {timeout_minutes} min)")
+                        self._log_event('WARNING', f'Execution timeout reached after {elapsed:.1f} minutes')
+                        self.status = "TIMEOUT"
                     self._cleanup_stress_pods()
                     self._capture_cluster_health_before_teardown()
                     self._cleanup_ssh_tunnel()
@@ -1365,6 +1537,9 @@ class SmartExecutionController:
                 if iteration % 5 == 0:
                     self._persist_to_database()
                     self._save_checkpoint(iteration, cpu, memory)
+                
+                # Periodic pod restart check (interval-gated internally)
+                self._check_pod_restarts()
                 
                 # Memory trimming: prevent unbounded growth of in-memory lists
                 if iteration % 10 == 0:
@@ -2181,7 +2356,7 @@ class SmartExecutionController:
             duration = (end_time - start_time).total_seconds()
             
             # Track created entities for cleanup (only if operation was successful and is a create operation)
-            if result.get('status') == 'SUCCESS' and operation == 'create' and result.get('uuid'):
+            if result.get('status') == 'SUCCESS' and operation.lower() == 'create' and result.get('uuid'):
                 if entity_type not in self.created_entities:
                     self.created_entities[entity_type] = []
                 self.created_entities[entity_type].append({
@@ -2192,7 +2367,7 @@ class SmartExecutionController:
                 logger.info(f"📝 Tracked entity for cleanup: {entity_type}/{entity_name} ({result.get('uuid')})")
             
             # Remove deleted entity from tracking so future deletes don't target a ghost UUID
-            if result.get('status') == 'SUCCESS' and operation == 'delete' and result.get('uuid'):
+            if result.get('status') == 'SUCCESS' and operation.lower() == 'delete' and result.get('uuid'):
                 tracked = self.created_entities.get(entity_type, [])
                 self.created_entities[entity_type] = [
                     e for e in tracked if e.get('uuid') != result['uuid']
@@ -6195,6 +6370,8 @@ spec:
         for key in list(self.operation_effectiveness.keys()):
             if len(self.operation_effectiveness[key]) > 100:
                 self.operation_effectiveness[key] = self.operation_effectiveness[key][-100:]
+        if len(self._pod_restart_events) > 500:
+            self._pod_restart_events = self._pod_restart_events[-500:]
 
     def get_live_logs(self, since: Optional[str] = None, limit: int = 100) -> List[Dict]:
         """Get live logs, optionally since a specific timestamp"""
@@ -6534,6 +6711,7 @@ spec:
 
             full_execution_data = dict(self.get_status())
             full_execution_data['cluster_health_snapshot'] = getattr(self, '_cluster_health_snapshot', {})
+            full_execution_data['pod_restart_tracking'] = self._get_pod_restart_tracking()
             
             # Prepare execution data
             execution_data = {
@@ -6895,6 +7073,9 @@ spec:
                 'checkpoint_reports': self._checkpoint_reports,
                 'entity_parity': self._entity_parity_snapshots,
             },
+            
+            # Pod restart tracking (continuous during execution)
+            'pod_restart_tracking': self._get_pod_restart_tracking(),
         }
     
     def _calculate_predictions(self) -> Optional[Dict]:
@@ -7178,6 +7359,9 @@ spec:
             },
             # Prometheus cluster snapshot (end of run); used when live Prom is unreachable at report time
             'cluster_health_snapshot': getattr(self, '_cluster_health_snapshot', {}),
+            
+            # Pod restart tracking (continuous monitoring during execution)
+            'pod_restart_tracking': self._get_pod_restart_tracking(),
         }
     
     def _generate_analysis(self) -> Dict[str, Any]:
@@ -7914,6 +8098,10 @@ def get_all_smart_executions() -> list:
                     continue
                 
                 execution_ids_seen.add(execution_id)
+                # Fill empty execution_name with testbed label
+                if not exec_data.get('execution_name'):
+                    label = exec_data.get('testbed_label', 'Unknown')
+                    exec_data['execution_name'] = f"AI Execution - {label}" if exec_data.get('ai_enabled') else f"Execution - {label}"
                 # Ensure duration_minutes is calculated if missing
                 if exec_data.get('duration_minutes') is None and exec_data.get('start_time') and exec_data.get('end_time'):
                     try:
@@ -7973,9 +8161,28 @@ def cleanup_completed_executions():
 
 
 def delete_smart_execution(execution_id: str) -> bool:
-    """Delete a smart execution from memory"""
+    """Delete a smart execution from memory and/or database"""
+    deleted = False
+
     if execution_id in _active_smart_executions:
         del _active_smart_executions[execution_id]
+        deleted = True
+
+    try:
+        from database import SessionLocal
+        from models.smart_execution import SmartExecution
+        session = SessionLocal()
+        try:
+            row = session.query(SmartExecution).filter_by(execution_id=execution_id).first()
+            if row:
+                session.delete(row)
+                session.commit()
+                deleted = True
+        finally:
+            session.close()
+    except Exception as e:
+        logger.warning(f"DB delete failed for {execution_id}: {e}")
+
+    if deleted:
         logger.info(f"🗑️ Deleted smart execution: {execution_id}")
-        return True
-    return False
+    return deleted

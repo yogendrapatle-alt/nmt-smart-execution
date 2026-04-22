@@ -716,7 +716,7 @@ const RuleBuilderExperimental: React.FC<RuleBuilderExperimentalProps> = ({ onSav
     }
   );
     if (ruleUploadResponse.ok) {
-      const ruleUploadResult = await ruleUploadResponse.json();
+      await ruleUploadResponse.json();
     } else {
       console.error("Failed to save rule config to submitted-rules folder");
     }

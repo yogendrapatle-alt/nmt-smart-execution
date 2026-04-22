@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import ReactApexChart from 'react-apexcharts';
 import { getApiBase } from '../utils/backendUrl';
+import { SkeletonMetricRow, SkeletonCard } from '../components/ui/LoadingSkeleton';
 
 interface ModelInfo {
   model_id: string;
@@ -160,10 +161,8 @@ const MLInsights: React.FC = () => {
   if (loading) {
     return (
       <div className="main-content">
-        <div className="text-center py-5">
-          <div className="spinner-border text-primary" role="status" style={{ width: '3rem', height: '3rem' }}><span className="visually-hidden">Loading...</span></div>
-          <p className="mt-3 text-muted">Loading ML insights...</p>
-        </div>
+        <SkeletonMetricRow count={4} />
+        <SkeletonCard lines={8} />
       </div>
     );
   }

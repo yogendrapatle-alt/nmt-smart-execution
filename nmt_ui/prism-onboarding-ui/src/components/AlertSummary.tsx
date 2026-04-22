@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
 import type { Alert, AlertDigest } from '../types/onboarding';
 import { PDFExportButton } from './PDFExportButton';
 import { sortAlerts, SORTABLE_COLUMNS } from '../utils/summary_sort';
@@ -9,7 +8,6 @@ import { useAlertSearch } from '../hooks/useAlertSearch';
 import { getApiBase } from '../utils/backendUrl';
 
 const AlertSummary: React.FC = () => {
-  const navigate = useNavigate();
   const [alertDigests, setAlertDigests] = useState<AlertDigest[]>([]);
   const [selectedDate, setSelectedDate] = useState<string>('');
   const [selectedTestbed, setSelectedTestbed] = useState<string>('');

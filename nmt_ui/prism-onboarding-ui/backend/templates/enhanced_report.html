@@ -540,6 +540,84 @@
     </div>
     {% endif %}
 
+    <!-- POD RESTARTS DURING EXECUTION (Continuous Monitoring) -->
+    {% if pod_restart_tracking and pod_restart_tracking.total_restarts_during_execution is defined and pod_restart_tracking.total_restarts_during_execution > 0 %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">🔄</div>
+            <h2>Pod Restarts During Execution</h2>
+        </div>
+        <div class="card-body">
+            <div style="display:flex; gap:24px; flex-wrap:wrap; margin-bottom:20px;">
+                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#fef2f2;">
+                    <div style="font-size:28px;font-weight:700;color:#dc2626;">{{ pod_restart_tracking.total_restarts_during_execution }}</div>
+                    <div style="font-size:12px;color:#64748b;font-weight:600;">Total Restarts</div>
+                </div>
+                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#fff7ed;">
+                    <div style="font-size:28px;font-weight:700;color:#ea580c;">{{ pod_restart_tracking.pods_restarted }}</div>
+                    <div style="font-size:12px;color:#64748b;font-weight:600;">Pods Affected</div>
+                </div>
+                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#f0fdf4;">
+                    <div style="font-size:28px;font-weight:700;color:#16a34a;">{{ pod_restart_tracking.baseline_containers_tracked }}</div>
+                    <div style="font-size:12px;color:#64748b;font-weight:600;">Containers Monitored</div>
+                </div>
+            </div>
+
+            {% if pod_restart_tracking.pod_summary %}
+            <div class="section-title">Restart Summary Per Pod</div>
+            <table style="margin-bottom:24px;">
+                <thead>
+                    <tr>
+                        <th>Pod</th><th>Namespace</th><th>Container</th>
+                        <th>Restarts During Execution</th><th>Baseline</th><th>Current Total</th><th>Last Seen</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for ps in pod_restart_tracking.pod_summary %}
+                    <tr>
+                        <td><code>{{ ps.pod[:40] }}</code></td>
+                        <td>{{ ps.namespace }}</td>
+                        <td>{{ ps.container }}</td>
+                        <td>
+                            <span class="badge {% if ps.delta > 3 %}badge-fail{% elif ps.delta > 1 %}badge-warn{% else %}badge-info{% endif %}">+{{ ps.delta }}</span>
+                        </td>
+                        <td style="color:#64748b;">{{ ps.baseline }}</td>
+                        <td><strong>{{ ps.current }}</strong></td>
+                        <td style="font-size:0.85em;color:#64748b;">{{ ps.last_seen[:19] }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% endif %}
+
+            {% if pod_restart_tracking.restart_events %}
+            <div class="section-title">Restart Event Timeline</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th><th>Pod</th><th>Namespace</th><th>Container</th>
+                        <th>New Restarts</th><th>Total Since Start</th><th>Execution Elapsed</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for ev in pod_restart_tracking.restart_events %}
+                    <tr>
+                        <td style="font-size:0.85em;">{{ ev.detected_at[:19] }}</td>
+                        <td><code>{{ ev.pod[:35] }}</code></td>
+                        <td>{{ ev.namespace }}</td>
+                        <td>{{ ev.container }}</td>
+                        <td><span class="badge badge-warn">+{{ ev.new_restarts }}</span></td>
+                        <td>{{ ev.total_since_start }}</td>
+                        <td>{{ ev.execution_elapsed_min }} min</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
     <!-- NODE STABILITY SCORES -->
     {% if node_stability %}
     <div class="card">

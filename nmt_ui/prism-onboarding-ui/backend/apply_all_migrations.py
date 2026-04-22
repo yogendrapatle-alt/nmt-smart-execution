@@ -52,6 +52,10 @@ def run_all():
     from migrations.add_execution_templates_table import migrate_execution_templates
     migrate_execution_templates()
 
+    logger.info("\n[7/7] add_missing_columns (smart_executions + alert_summaries)")
+    from migrations.add_missing_columns import add_missing_columns
+    add_missing_columns()
+
     logger.info("\n" + "=" * 60)
     logger.info("All migrations complete.")
     logger.info("=" * 60)

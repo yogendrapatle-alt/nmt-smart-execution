@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import ReactApexChart from 'react-apexcharts';
 import { getApiBase } from '../utils/backendUrl';
+import { SkeletonMetricRow, SkeletonTable, SkeletonCard } from '../components/ui/LoadingSkeleton';
 
 /** Actionable copy when cluster health cannot be loaded (Phase 1 empty states). */
 function clusterHealthUnavailableCopy(
@@ -84,15 +85,7 @@ interface EnhancedReport {
     high_risk_count: number;
     medium_risk_count: number;
   };
-  cluster_health: {
-    cpu_throttling: any[];
-    container_restarts: any[];
-    oom_killed: any[];
-    node_conditions: any[];
-    pvc_health: any[];
-    collection_status: string;
-    collection_reason?: string;
-  };
+  cluster_health: Record<string, any>;
   failure_analysis: {
     groups: any[];
     total_failures: number;
@@ -191,6 +184,12 @@ interface EnhancedReport {
     baseline?: { cpu_percent?: number; memory_percent?: number };
     final?: { cpu_percent?: number; memory_percent?: number };
     resolution_note?: string;
+  };
+  health_assessment?: {
+    overall_status: string;
+    critical_count: number;
+    warning_count: number;
+    findings: Array<{ severity: string; category: string; message: string; detail?: string }>;
   };
 }
 
@@ -444,12 +443,9 @@ const SmartExecutionReport: React.FC = () => {
   if (loading) {
     return (
       <div className="main-content">
-        <div className="text-center py-5">
-          <div className="spinner-border text-primary" role="status" style={{ width: '3rem', height: '3rem' }}>
-            <span className="visually-hidden">Loading...</span>
-          </div>
-          <p className="mt-3 text-muted">Loading execution report...</p>
-        </div>
+        <SkeletonMetricRow count={4} />
+        <SkeletonCard lines={6} />
+        <div className="mt-3"><SkeletonTable rows={5} cols={5} /></div>
       </div>
     );
   }
@@ -685,7 +681,7 @@ const SmartExecutionReport: React.FC = () => {
                   {' '}CPU reached <strong>{cpuFinal}%</strong> against a target of {cpuTarget}%, and memory reached <strong>{memFinal}%</strong> against a target of {memTarget}%.
                   {spikeCount > 0 && <> The cluster experienced <strong>{spikeCount} resource spike{spikeCount > 1 ? 's' : ''}</strong>.</>}
                   {thresholdHit && <> The <strong>resource threshold was reached</strong>.</>}
-                  {enhanced?.health_assessment?.findings?.length > 0 && <> {enhanced.health_assessment.findings.length} health finding{enhanced.health_assessment.findings.length > 1 ? 's' : ''} were recorded.</>}
+                  {(enhanced?.health_assessment?.findings?.length ?? 0) > 0 && <> {enhanced!.health_assessment!.findings.length} health finding{enhanced!.health_assessment!.findings.length > 1 ? 's' : ''} were recorded.</>}
                 </p>
               </div>
             </div>
@@ -1277,26 +1273,28 @@ const SmartExecutionReport: React.FC = () => {
                     <span>Cluster health data from Prometheus: CPU throttling, container restarts, OOM kills, node conditions, and PVC health. Scores below 50 indicate serious issues.</span>
                   </div>
                   {/* QA Health Assessment */}
-                  {enhanced.health_assessment?.findings?.length > 0 && (
+                  {enhanced.health_assessment && enhanced.health_assessment.findings?.length > 0 && (() => {
+                    const ha = enhanced.health_assessment!;
+                    return (
                     <div className="mb-4">
                       <div className="d-flex align-items-center gap-3 mb-3">
                         <h6 className="fw-bold mb-0">QA Health Assessment</h6>
                         <span className={`badge ${
-                          enhanced.health_assessment.overall_status === 'CRITICAL' ? 'bg-danger' :
-                          enhanced.health_assessment.overall_status === 'DEGRADED' ? 'bg-warning text-dark' :
-                          enhanced.health_assessment.overall_status === 'ATTENTION' ? 'bg-warning text-dark' :
+                          ha.overall_status === 'CRITICAL' ? 'bg-danger' :
+                          ha.overall_status === 'DEGRADED' ? 'bg-warning text-dark' :
+                          ha.overall_status === 'ATTENTION' ? 'bg-warning text-dark' :
                           'bg-success'
                         } fs-6`}>
-                          {enhanced.health_assessment.overall_status}
+                          {ha.overall_status}
                         </span>
-                        {enhanced.health_assessment.critical_count > 0 && <span className="badge bg-danger">{enhanced.health_assessment.critical_count} Critical</span>}
-                        {enhanced.health_assessment.warning_count > 0 && <span className="badge bg-warning text-dark">{enhanced.health_assessment.warning_count} Warning</span>}
+                        {ha.critical_count > 0 && <span className="badge bg-danger">{ha.critical_count} Critical</span>}
+                        {ha.warning_count > 0 && <span className="badge bg-warning text-dark">{ha.warning_count} Warning</span>}
                       </div>
                       <div className="table-responsive">
                         <table className="table table-sm table-bordered">
                           <thead className="table-light"><tr><th style={{width: 90}}>Severity</th><th style={{width: 120}}>Category</th><th>Finding</th><th>Recommendation</th></tr></thead>
                           <tbody>
-                            {enhanced.health_assessment.findings.map((f: any, i: number) => (
+                            {ha.findings.map((f: any, i: number) => (
                               <tr key={i}>
                                 <td>
                                   <span className={`badge ${f.severity === 'critical' ? 'bg-danger' : f.severity === 'warning' ? 'bg-warning text-dark' : 'bg-info'}`}>
@@ -1312,7 +1310,8 @@ const SmartExecutionReport: React.FC = () => {
                         </table>
                       </div>
                     </div>
-                  )}
+                    );
+                  })()}
 
                   {enhanced.report_metadata?.cluster_health_source && (
                     <div className={`alert ${enhanced.report_metadata.cluster_health_source === 'live_prometheus' ? 'alert-success' : 'alert-info'} rounded-3 mb-3 d-flex align-items-center gap-2`}>

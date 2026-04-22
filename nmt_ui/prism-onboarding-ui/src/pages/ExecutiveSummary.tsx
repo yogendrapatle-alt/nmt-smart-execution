@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactApexChart from 'react-apexcharts';
 import { getApiBase } from '../utils/backendUrl';
+import { SkeletonMetricRow, SkeletonCard } from '../components/ui/LoadingSkeleton';
 
 interface Insight {
   type: 'positive' | 'warning' | 'info';
@@ -23,7 +24,7 @@ const ExecutiveSummary: React.FC = () => {
   const navigate = useNavigate();
   const [summary, setSummary] = useState<SummaryData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [dateRange, setDateRange] = useState('30');
+  const [dateRange, setDateRange] = useState('365');
 
   const load = useCallback(async () => {
     try {
@@ -64,10 +65,8 @@ const ExecutiveSummary: React.FC = () => {
   if (loading) {
     return (
       <div className="main-content">
-        <div className="text-center py-5">
-          <div className="spinner-border text-primary" role="status" style={{ width: '3rem', height: '3rem' }}><span className="visually-hidden">Loading...</span></div>
-          <p className="mt-3 text-muted">Loading executive summary...</p>
-        </div>
+        <SkeletonMetricRow count={4} />
+        <SkeletonCard lines={6} />
       </div>
     );
   }
@@ -113,6 +112,8 @@ const ExecutiveSummary: React.FC = () => {
             <option value="30">Last 30 days</option>
             <option value="60">Last 60 days</option>
             <option value="90">Last 90 days</option>
+            <option value="180">Last 6 months</option>
+            <option value="365">Last 1 year</option>
           </select>
           <button className="btn btn-outline-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={exportJson}>
             <i className="material-icons-outlined" style={{ fontSize: 18 }}>download</i>Export

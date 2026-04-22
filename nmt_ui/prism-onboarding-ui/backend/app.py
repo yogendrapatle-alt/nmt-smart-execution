@@ -2582,7 +2582,7 @@ def get_execution_html_report(execution_id):
         response.headers['Content-Disposition'] = f'attachment; filename="NMT_Execution_Report_{execution_id}.html"'
         
         return response
-        
+
     except Exception as e:
         logging.exception("Error generating HTML report")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -3581,7 +3581,7 @@ def get_ncm_deployment_status():
     except Exception as e:
         logging.error(f"Failed to read deployment status: {str(e)}")
         return jsonify({'success': False, 'error': f'Failed to read deployment status: {str(e)}'}), 500
-
+    
 
 # =============================================================================
 # ALERT API ENDPOINTS
@@ -3668,6 +3668,85 @@ def check_prometheus_status():
 # =============================================================================
 # SLACK ALERT API ENDPOINTS
 # =============================================================================
+
+@app.route('/api/slack/global-config', methods=['GET'])
+def get_global_slack_config():
+    """Get the global Slack webhook configuration (from env var)."""
+    url = (os.environ.get('SLACK_WEBHOOK_URL') or '').strip()
+    channel = (os.environ.get('SLACK_CHANNEL') or '#ncm_monitoring').strip()
+    return jsonify({
+        'success': True,
+        'configured': bool(url and url.startswith('https://hooks.slack.com/')),
+        'channel': channel,
+        'webhook_masked': f"{url[:45]}..." if url and len(url) > 45 else ('(not set)' if not url else url),
+    })
+
+
+@app.route('/api/slack/global-config', methods=['PUT'])
+def set_global_slack_config():
+    """Set the global Slack webhook URL (writes to .env and updates os.environ)."""
+    data = request.get_json() or {}
+    url = (data.get('webhook_url') or '').strip()
+    channel = (data.get('channel') or '#ncm_monitoring').strip()
+
+    if not url or not url.startswith('https://hooks.slack.com/'):
+        return jsonify({'success': False, 'error': 'Invalid Slack webhook URL'}), 400
+
+    os.environ['SLACK_WEBHOOK_URL'] = url
+    os.environ['SLACK_CHANNEL'] = channel
+
+    # Persist to .env so it survives restarts
+    try:
+        env_path = os.path.join(os.path.dirname(__file__), '.env')
+        lines = []
+        found_url = False
+        found_channel = False
+        if os.path.exists(env_path):
+            with open(env_path, 'r') as f:
+                for line in f:
+                    if line.strip().startswith('SLACK_WEBHOOK_URL='):
+                        lines.append(f'SLACK_WEBHOOK_URL={url}\n')
+                        found_url = True
+                    elif line.strip().startswith('SLACK_CHANNEL='):
+                        lines.append(f'SLACK_CHANNEL={channel}\n')
+                        found_channel = True
+                    else:
+                        lines.append(line)
+        if not found_url:
+            lines.append(f'SLACK_WEBHOOK_URL={url}\n')
+        if not found_channel:
+            lines.append(f'SLACK_CHANNEL={channel}\n')
+        with open(env_path, 'w') as f:
+            f.writelines(lines)
+    except Exception as e:
+        logging.warning(f"Could not persist Slack config to .env: {e}")
+
+    logging.info(f"✅ Global Slack webhook configured (channel: {channel})")
+    return jsonify({
+        'success': True,
+        'message': f'Slack webhook configured for {channel}',
+    })
+
+
+@app.route('/api/slack/test', methods=['POST'])
+def test_global_slack():
+    """Send a test alert using the global Slack webhook."""
+    from services.smart_execution_service import get_slack_webhook_for_testbed, post_slack_incoming_webhook
+    webhook = get_slack_webhook_for_testbed()
+    if not webhook:
+        return jsonify({'success': False, 'error': 'No Slack webhook configured. Set SLACK_WEBHOOK_URL in .env or configure per-testbed.'}), 400
+
+    text = (
+        ":test_tube: *NMT Monitoring Tool — Test Alert*\n"
+        f"Channel: {os.environ.get('SLACK_CHANNEL', '#ncm_monitoring')}\n"
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "If you see this, Slack integration is working! :white_check_mark:"
+    )
+    if post_slack_incoming_webhook(webhook, text):
+        return jsonify({'success': True, 'message': 'Test alert sent to Slack!'})
+    else:
+        return jsonify({'success': False, 'error': 'Slack webhook returned non-200 or timed out'}), 500
+
 
 @app.route('/api/test-slack-alert', methods=['POST'])
 def test_slack_alert():
@@ -4335,55 +4414,548 @@ def get_smart_execution_logs_api(execution_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+_cleanup_status = {}
+
 @app.route('/api/smart-execution/cleanup/<execution_id>', methods=['POST'])
 def cleanup_smart_execution_entities(execution_id):
     """
-    Cleanup (delete) all entities created during a smart execution
-    
-    Optional body:
-    {
-        "entity_types": ["VM", "Project"]  # Optional: specific types to cleanup
-    }
-    
-    Response:
-    {
-        "success": true,
-        "cleanup_summary": {
-            "total": 10,
-            "success": 8,
-            "failed": 1,
-            "skipped": 1,
-            "results": {...}
-        }
-    }
+    Cleanup (delete) all entities created during a smart execution.
+    Runs in background for large cleanups; poll GET /cleanup/<id>/status.
     """
     try:
         from services.smart_execution_service import get_smart_execution
         import asyncio
-        
+
         controller = get_smart_execution(execution_id)
-        if not controller:
+
+        if controller:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            cleanup_summary = loop.run_until_complete(controller.cleanup_entities())
+            logging.info(f"🧹 Cleanup complete for {execution_id}: {cleanup_summary['success']}/{cleanup_summary['total']} deleted")
+            return jsonify({'success': True, 'cleanup_summary': cleanup_summary}), 200
+
+        created_entities, testbed_info = _load_cleanup_data_from_db(execution_id)
+
+        if created_entities is None:
             return jsonify({'success': False, 'error': 'Execution not found'}), 404
-        
-        # Run cleanup in asyncio event loop
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        cleanup_summary = loop.run_until_complete(controller.cleanup_entities())
-        
-        logging.info(f"🧹 Cleanup complete for {execution_id}: {cleanup_summary['success']}/{cleanup_summary['total']} deleted")
-        
-        return jsonify({
-            'success': True,
-            'cleanup_summary': cleanup_summary
-        }), 200
-        
+
+        total_entities = sum(len(v) for v in created_entities.values()) if created_entities else 0
+        if total_entities == 0:
+            # Still try to clean stress pods even if no tracked entities
+            _cleanup_stress_pods_for_testbed(testbed_info)
+            return jsonify({
+                'success': True,
+                'message': 'No created entities to clean up. Stress pods cleaned.',
+                'cleanup_summary': {'total': 0, 'success': 0, 'failed': 0, 'skipped': 0}
+            }), 200
+
+        # For large cleanups, run in background to avoid HTTP timeout
+        if total_entities > 20:
+            import threading
+            _cleanup_status[execution_id] = {
+                'status': 'running', 'total': total_entities,
+                'success': 0, 'failed': 0, 'skipped': 0, 'message': 'Cleanup in progress...'
+            }
+
+            def _bg_cleanup():
+                try:
+                    summary = _perform_entity_cleanup(execution_id, created_entities, testbed_info)
+                    if summary.get('success', 0) > 0:
+                        _clear_created_entities_in_db(execution_id)
+                    _cleanup_stress_pods_for_testbed(testbed_info)
+                    summary['status'] = 'completed'
+                    summary['message'] = f"Deleted {summary['success']}/{summary['total']} entities"
+                    _cleanup_status[execution_id] = summary
+                except Exception as e:
+                    _cleanup_status[execution_id] = {
+                        'status': 'failed', 'total': total_entities,
+                        'success': 0, 'failed': total_entities, 'skipped': 0,
+                        'message': str(e)
+                    }
+
+            threading.Thread(target=_bg_cleanup, daemon=True).start()
+            return jsonify({
+                'success': True,
+                'message': f'Cleanup started in background for {total_entities} entities. Poll /api/smart-execution/cleanup/{execution_id}/status for progress.',
+                'cleanup_summary': {'total': total_entities, 'success': 0, 'failed': 0, 'skipped': 0, 'status': 'running'}
+            }), 202
+
+        cleanup_summary = _perform_entity_cleanup(execution_id, created_entities, testbed_info)
+        if cleanup_summary.get('success', 0) > 0:
+            _clear_created_entities_in_db(execution_id)
+        _cleanup_stress_pods_for_testbed(testbed_info)
+        return jsonify({'success': True, 'cleanup_summary': cleanup_summary}), 200
+
     except Exception as e:
         logging.exception(f"Error cleaning up entities for execution {execution_id}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/smart-execution/cleanup/<execution_id>/status', methods=['GET'])
+def cleanup_status(execution_id):
+    """Poll background cleanup progress."""
+    status = _cleanup_status.get(execution_id)
+    if not status:
+        return jsonify({'success': True, 'status': 'not_found', 'message': 'No active cleanup for this execution'}), 200
+    return jsonify({'success': True, 'cleanup_summary': status}), 200
+
+
+def _cleanup_stress_pods_for_testbed(testbed_info):
+    """Remove all stress pods from the testbed's Kubernetes cluster."""
+    if not testbed_info or not testbed_info.get('pc_ip'):
+        return
+    try:
+        import subprocess
+        pc_ip = testbed_info['pc_ip']
+        ssh_password = testbed_info.get('ssh_password', 'nutanix/4u')
+        kubeconfig = '/var/nutanix/etc/kubernetes/kubectl-kubeconfig.yaml'
+        result = subprocess.run(
+            ['sshpass', '-p', ssh_password, 'ssh',
+             '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
+             f'nutanix@{pc_ip}',
+             f'sudo kubectl --kubeconfig {kubeconfig} delete pods -l app=smart-exec-stress --grace-period=0 --force --all-namespaces 2>&1 || true'],
+            capture_output=True, text=True, timeout=30
+        )
+        output = result.stdout.strip()
+        if 'deleted' in output.lower():
+            logging.info(f"🧹 Stress pods cleaned on {pc_ip}: {output}")
+        else:
+            logging.debug(f"Stress pod cleanup output: {output}")
+    except Exception as e:
+        logging.warning(f"⚠️ Stress pod cleanup failed for {testbed_info.get('pc_ip')}: {e}")
+
+
+def _load_cleanup_data_from_db(execution_id):
+    """Load created_entities and testbed credentials from the DB for cleanup."""
+    from database import SessionLocal
+    from models.smart_execution import SmartExecution
+    from models.testbed import Testbed
+
+    session = SessionLocal()
+    try:
+        row = session.query(SmartExecution).filter_by(execution_id=execution_id).first()
+        if not row:
+            # Also check active AI executions in memory
+            try:
+                from routes.smart_execution_ai_routes import active_ai_executions
+                ai_entry = active_ai_executions.get(execution_id)
+                if ai_entry:
+                    engine = ai_entry.get('engine')
+                    created = getattr(engine, '_created_entities', {})
+                    tb_info = getattr(engine, '_testbed_info', None)
+                    if not tb_info:
+                        tb_id = ai_entry.get('testbed_id')
+                        tb = session.query(Testbed).filter_by(unique_testbed_id=tb_id).first()
+                        if tb:
+                            tb_info = {'pc_ip': tb.pc_ip, 'username': tb.username, 'password': tb.password}
+                    return created, tb_info
+            except ImportError:
+                pass
+            return None, None
+
+        created_entities = row.created_entities or {}
+
+        # Resolve testbed credentials
+        tb = session.query(Testbed).filter_by(unique_testbed_id=row.unique_testbed_id or row.testbed_id).first()
+        if not tb:
+            logging.warning(f"Testbed not found for {execution_id}, cannot connect to PC")
+            return created_entities, None
+
+        testbed_info = {
+            'pc_ip': tb.pc_ip,
+            'username': tb.username,
+            'password': tb.password,
+        }
+        return created_entities, testbed_info
+    finally:
+        session.close()
+
+
+def _perform_entity_cleanup(execution_id, created_entities, testbed_info):
+    """Connect to Prism Central and delete all created entities."""
+    import asyncio
+
+    total = sum(len(v) for v in created_entities.values())
+    results = {'success': [], 'failed': [], 'skipped': []}
+
+    if not testbed_info or not testbed_info.get('pc_ip'):
+        logging.warning(f"No testbed credentials for cleanup of {execution_id}")
+        return {'total': total, 'success': 0, 'failed': 0, 'skipped': total,
+                'results': results, 'message': 'Testbed credentials not available'}
+
+    try:
+        from services.smart_execution_service import NCMClient, LOADGEN_AVAILABLE
+    except ImportError:
+        LOADGEN_AVAILABLE = False
+
+    if not LOADGEN_AVAILABLE:
+        return {'total': total, 'success': 0, 'failed': 0, 'skipped': total,
+                'results': results, 'message': 'NCMClient not available'}
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        pc = NCMClient(
+            host=testbed_info['pc_ip'],
+            username=testbed_info['username'],
+            password=testbed_info['password'],
+            port=9440,
+            verify_ssl=False,
+            execution_id=execution_id,
+            enable_dns_discovery=False,
+        )
+
+        ENTITY_DELETE_ENDPOINTS = {
+            'VM': '/vms', 'vm': '/vms',
+            'Project': '/projects', 'project': '/projects',
+            'Category': '/categories', 'category': '/categories',
+            'Subnet': '/subnets', 'subnet': '/subnets',
+            'Image': '/images', 'image': '/images',
+            'VM Snapshot': '/vm_snapshots', 'vm_snapshot': '/vm_snapshots',
+            'Blueprint': '/blueprints', 'blueprint': '/blueprints',
+            'Blueprint (Single VM)': '/blueprints', 'blueprint_single_vm': '/blueprints',
+            'Blueprint (Multi VM)': '/blueprints', 'blueprint_multi_vm': '/blueprints',
+            'Playbook': '/action_rules', 'playbook': '/action_rules',
+            'Endpoint': '/endpoints', 'endpoint': '/endpoints',
+            'Runbook': '/runbooks', 'runbook': '/runbooks',
+            'Application': '/apps', 'application': '/apps',
+            'VPC': '/vpcs', 'vpc': '/vpcs',
+            'Address Group': '/address_groups', 'address_group': '/address_groups',
+            'Service Group': '/service_groups', 'service_group': '/service_groups',
+            'Security Policy': '/network_security_rules', 'security_policy': '/network_security_rules',
+            'Protection Policy': '/protection_rules', 'protection_policy': '/protection_rules',
+            'Recovery Plan': '/recovery_plans', 'recovery_plan': '/recovery_plans',
+        }
+
+        for entity_type, entities in created_entities.items():
+            endpoint_base = ENTITY_DELETE_ENDPOINTS.get(entity_type)
+            if not endpoint_base:
+                for ent in entities:
+                    results['skipped'].append({
+                        'entity_type': entity_type,
+                        'entity_uuid': ent.get('uuid'),
+                        'entity_name': ent.get('name'),
+                        'reason': f'No delete endpoint for {entity_type}'
+                    })
+                continue
+
+            for ent in entities:
+                uuid = ent.get('uuid')
+                name = ent.get('name', 'unknown')
+                if not uuid:
+                    results['skipped'].append({
+                        'entity_type': entity_type, 'entity_name': name,
+                        'reason': 'No UUID'
+                    })
+                    continue
+
+                try:
+                    resp = loop.run_until_complete(
+                        asyncio.wait_for(
+                            pc.v3_request(endpoint=f"{endpoint_base}/{uuid}", method="DELETE"),
+                            timeout=30.0
+                        )
+                    )
+                    if resp and resp[0].status in (200, 202, 204):
+                        logging.info(f"🗑️ Deleted {entity_type}/{name} ({uuid})")
+                        results['success'].append({
+                            'entity_type': entity_type, 'entity_uuid': uuid, 'entity_name': name
+                        })
+                    else:
+                        status = resp[0].status if resp else 'no-response'
+                        logging.warning(f"⚠️ Delete {entity_type}/{name} returned {status}")
+                        results['failed'].append({
+                            'entity_type': entity_type, 'entity_uuid': uuid, 'entity_name': name,
+                            'error': f'HTTP {status}'
+                        })
+                except Exception as e:
+                    logging.warning(f"⚠️ Delete {entity_type}/{name} failed: {e}")
+                    results['failed'].append({
+                        'entity_type': entity_type, 'entity_uuid': uuid, 'entity_name': name,
+                        'error': str(e)
+                    })
+    finally:
+        loop.close()
+
+    summary = {
+        'total': total,
+        'success': len(results['success']),
+        'failed': len(results['failed']),
+        'skipped': len(results['skipped']),
+        'results': results
+    }
+    logging.info(f"🧹 Cleanup for {execution_id}: {summary['success']}/{total} deleted, "
+                 f"{summary['failed']} failed, {summary['skipped']} skipped")
+    return summary
+
+
+def _clear_created_entities_in_db(execution_id):
+    """Remove created_entities from DB after successful cleanup."""
+    try:
+        from database import SessionLocal
+        from models.smart_execution import SmartExecution
+        session = SessionLocal()
+        try:
+            row = session.query(SmartExecution).filter_by(execution_id=execution_id).first()
+            if row:
+                row.created_entities = {}
+                session.commit()
+        finally:
+            session.close()
+    except Exception as e:
+        logging.warning(f"Failed to clear created_entities for {execution_id}: {e}")
+
+
+@app.route('/api/smart-execution/deep-clean/<testbed_id>', methods=['POST'])
+def deep_clean_testbed(testbed_id):
+    """
+    Deep clean: scan testbed for ALL smart-* entities and stress pods,
+    regardless of tracking. Accepts unique_testbed_id or pc_ip.
+    Optional body: { "dry_run": true }  — preview without deleting.
+    """
+    import threading
+    body = request.get_json(silent=True) or {}
+    dry_run = body.get('dry_run', False)
+
+    try:
+        from database import SessionLocal
+        from models.testbed import Testbed
+        session = SessionLocal()
+        try:
+            tb = session.query(Testbed).filter_by(unique_testbed_id=testbed_id).first()
+            if not tb:
+                tb = session.query(Testbed).filter(Testbed.pc_ip == testbed_id).first()
+            if not tb:
+                return jsonify({'success': False, 'error': f'Testbed {testbed_id} not found'}), 404
+            testbed_info = {'pc_ip': tb.pc_ip, 'username': tb.username, 'password': tb.password}
+        finally:
+            session.close()
+
+        clean_key = f"deep-clean-{testbed_info['pc_ip']}"
+
+        if dry_run:
+            scan = _deep_scan_testbed(testbed_info)
+            return jsonify({'success': True, 'dry_run': True, 'scan_results': scan}), 200
+
+        _cleanup_status[clean_key] = {
+            'status': 'running', 'message': 'Deep clean scanning testbed...',
+            'total': 0, 'success': 0, 'failed': 0, 'skipped': 0
+        }
+
+        def _bg_deep_clean():
+            try:
+                result = _deep_clean_all_smart_entities(testbed_info)
+                result['status'] = 'completed'
+                _cleanup_status[clean_key] = result
+            except Exception as e:
+                logging.exception(f"Deep clean failed for {testbed_info['pc_ip']}")
+                _cleanup_status[clean_key] = {
+                    'status': 'failed', 'message': str(e),
+                    'total': 0, 'success': 0, 'failed': 0, 'skipped': 0
+                }
+
+        threading.Thread(target=_bg_deep_clean, daemon=True).start()
+        return jsonify({
+            'success': True,
+            'message': f"Deep clean started for {testbed_info['pc_ip']}. Poll /api/smart-execution/deep-clean/{testbed_id}/status",
+            'status_key': clean_key
+        }), 202
+
+    except Exception as e:
+        logging.exception(f"Deep clean error for {testbed_id}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/smart-execution/deep-clean/<testbed_id>/status', methods=['GET'])
+def deep_clean_status(testbed_id):
+    """Poll deep-clean progress."""
+    from database import SessionLocal
+    from models.testbed import Testbed
+    session = SessionLocal()
+    try:
+        tb = session.query(Testbed).filter_by(unique_testbed_id=testbed_id).first()
+        if not tb:
+            tb = session.query(Testbed).filter(Testbed.pc_ip == testbed_id).first()
+        pc_ip = tb.pc_ip if tb else testbed_id
+    finally:
+        session.close()
+
+    clean_key = f"deep-clean-{pc_ip}"
+    status = _cleanup_status.get(clean_key)
+    if not status:
+        return jsonify({'success': True, 'status': 'not_found', 'message': 'No active deep clean'}), 200
+    return jsonify({'success': True, 'cleanup_summary': status}), 200
+
+
+def _deep_scan_testbed(testbed_info):
+    """Scan testbed for all smart-* entities without deleting. Returns dict of found entities."""
+    import asyncio
+
+    pc_ip = testbed_info['pc_ip']
+    found = {'VMs': [], 'VM Snapshots': [], 'Images': [], 'Projects': [], 'Subnets': [], 'Categories': [], 'Stress Pods': []}
+
+    try:
+        from services.smart_execution_service import NCMClient
+    except ImportError:
+        return {'error': 'NCMClient not available', 'found': found}
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        pc = NCMClient(
+            host=pc_ip, username=testbed_info['username'],
+            password=testbed_info['password'], port=9440,
+            verify_ssl=False, execution_id='deep-scan', enable_dns_discovery=False,
+        )
+
+        SCAN_TARGETS = [
+            ('VMs', '/vms/list', 'vm'),
+            ('VM Snapshots', '/vm_snapshots/list', 'vm_snapshot'),
+            ('Images', '/images/list', 'image'),
+            ('Projects', '/projects/list', 'project'),
+            ('Subnets', '/subnets/list', 'subnet'),
+            ('Categories', '/categories/list', 'category'),
+        ]
+
+        for label, endpoint, kind in SCAN_TARGETS:
+            try:
+                resp = loop.run_until_complete(asyncio.wait_for(
+                    pc.v3_request(endpoint=endpoint, method="POST",
+                                  payload={"kind": kind, "length": 500}),
+                    timeout=30.0
+                ))
+                if resp and resp[0].status in (200, 202) and isinstance(resp[0].body, dict):
+                    for ent in resp[0].body.get('entities', []):
+                        name = (ent.get('spec', {}).get('name', '') or
+                                ent.get('status', {}).get('name', ''))
+                        if name.lower().startswith('smart-'):
+                            found[label].append({
+                                'uuid': ent.get('metadata', {}).get('uuid', ''),
+                                'name': name
+                            })
+            except Exception as e:
+                logging.debug(f"Deep scan {label} failed: {e}")
+
+        # Scan stress pods via SSH
+        try:
+            import subprocess
+            ssh_password = testbed_info.get('ssh_password', 'nutanix/4u')
+            kubeconfig = '/var/nutanix/etc/kubernetes/kubectl-kubeconfig.yaml'
+            result = subprocess.run(
+                ['sshpass', '-p', ssh_password, 'ssh',
+                 '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
+                 f'nutanix@{pc_ip}',
+                 f'sudo kubectl --kubeconfig {kubeconfig} get pods -l app=smart-exec-stress --all-namespaces -o jsonpath="{{range .items[*]}}{{.metadata.name}}|{{.metadata.namespace}}\\n{{end}}" 2>/dev/null || true'],
+                capture_output=True, text=True, timeout=30
+            )
+            for line in result.stdout.strip().split('\n'):
+                if '|' in line:
+                    pname, pns = line.split('|', 1)
+                    found['Stress Pods'].append({'name': pname.strip(), 'namespace': pns.strip()})
+        except Exception as e:
+            logging.debug(f"Deep scan stress pods failed: {e}")
+    finally:
+        loop.close()
+
+    total = sum(len(v) for v in found.values())
+    return {'total_found': total, 'found': found}
+
+
+def _deep_clean_all_smart_entities(testbed_info):
+    """Scan and delete ALL smart-* entities from a testbed."""
+    import asyncio
+
+    pc_ip = testbed_info['pc_ip']
+    results = {'success': [], 'failed': [], 'skipped': []}
+
+    try:
+        from services.smart_execution_service import NCMClient
+    except ImportError:
+        return {'total': 0, 'success': 0, 'failed': 0, 'skipped': 0,
+                'results': results, 'message': 'NCMClient not available'}
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        pc = NCMClient(
+            host=pc_ip, username=testbed_info['username'],
+            password=testbed_info['password'], port=9440,
+            verify_ssl=False, execution_id='deep-clean', enable_dns_discovery=False,
+        )
+
+        # Delete order: VMs first, then snapshots, images, subnets, projects, categories
+        CLEAN_TARGETS = [
+            ('VM', '/vms/list', '/vms', 'vm'),
+            ('VM Snapshot', '/vm_snapshots/list', '/vm_snapshots', 'vm_snapshot'),
+            ('Image', '/images/list', '/images', 'image'),
+            ('Subnet', '/subnets/list', '/subnets', 'subnet'),
+            ('Project', '/projects/list', '/projects', 'project'),
+            ('Category', '/categories/list', '/categories', 'category'),
+        ]
+
+        for entity_type, list_ep, delete_ep, kind in CLEAN_TARGETS:
+            try:
+                resp = loop.run_until_complete(asyncio.wait_for(
+                    pc.v3_request(endpoint=list_ep, method="POST",
+                                  payload={"kind": kind, "length": 500}),
+                    timeout=30.0
+                ))
+                if not (resp and resp[0].status in (200, 202) and isinstance(resp[0].body, dict)):
+                    continue
+
+                for ent in resp[0].body.get('entities', []):
+                    name = (ent.get('spec', {}).get('name', '') or
+                            ent.get('status', {}).get('name', ''))
+                    uuid = ent.get('metadata', {}).get('uuid', '')
+                    if not name.lower().startswith('smart-') or not uuid:
+                        continue
+
+                    try:
+                        del_resp = loop.run_until_complete(asyncio.wait_for(
+                            pc.v3_request(endpoint=f"{delete_ep}/{uuid}", method="DELETE"),
+                            timeout=30.0
+                        ))
+                        if del_resp and del_resp[0].status in (200, 202, 204):
+                            logging.info(f"🗑️ Deep clean deleted {entity_type}/{name} ({uuid})")
+                            results['success'].append({
+                                'entity_type': entity_type, 'entity_uuid': uuid, 'entity_name': name
+                            })
+                        else:
+                            status_code = del_resp[0].status if del_resp else 'no-response'
+                            results['failed'].append({
+                                'entity_type': entity_type, 'entity_uuid': uuid, 'entity_name': name,
+                                'error': f'HTTP {status_code}'
+                            })
+                    except Exception as de:
+                        results['failed'].append({
+                            'entity_type': entity_type, 'entity_uuid': uuid, 'entity_name': name,
+                            'error': str(de)
+                        })
+            except Exception as e:
+                logging.warning(f"Deep clean scan {entity_type} failed: {e}")
+    finally:
+        loop.close()
+
+    # Clean stress pods
+    _cleanup_stress_pods_for_testbed(testbed_info)
+
+    total = len(results['success']) + len(results['failed']) + len(results['skipped'])
+    summary = {
+        'total': total,
+        'success': len(results['success']),
+        'failed': len(results['failed']),
+        'skipped': len(results['skipped']),
+        'results': results,
+        'message': f"Deep clean: {len(results['success'])}/{total} entities deleted, stress pods cleaned"
+    }
+    logging.info(f"🧹 Deep clean for {pc_ip}: {summary['message']}")
+    return summary
 
 
 @app.route('/api/smart-execution/stop-all', methods=['POST'])
@@ -4920,13 +5492,20 @@ def get_rerun_config(execution_id):
         if not db_data:
             return jsonify({'success': False, 'error': 'Execution not found'}), 404
 
+        # Filter out non-array keys (ai_enabled, ml_enabled) from entities_config
+        raw_entities = db_data.get('entities_config', {})
+        if isinstance(raw_entities, dict):
+            entities_config = {k: v for k, v in raw_entities.items() if isinstance(v, list)}
+        else:
+            entities_config = raw_entities
+
         return jsonify({
             'success': True,
             'config': {
                 'testbed_id': db_data.get('testbed_id'),
                 'testbed_label': db_data.get('testbed_label'),
                 'target_config': db_data.get('target_config', {}),
-                'entities_config': db_data.get('entities_config', {}),
+                'entities_config': entities_config,
                 'rule_config': db_data.get('rule_config', {}),
                 'tags': db_data.get('tags', []),
                 'alert_thresholds': db_data.get('alert_thresholds', {}),
@@ -4964,12 +5543,33 @@ def get_enhanced_smart_execution_report(execution_id):
         report_data = None
         prometheus_url = None
 
-        controller = get_smart_execution(execution_id)
-        if controller:
-            status = controller.get_status()
-            report_data = controller.get_report()
-            prometheus_url = getattr(controller, 'prometheus_url', None)
-        else:
+        # Check AI active executions first
+        try:
+            from routes.smart_execution_ai_routes import active_ai_executions
+            if execution_id in active_ai_executions:
+                exec_data = active_ai_executions[execution_id]
+                engine = exec_data['engine']
+                summary = engine.get_execution_summary()
+                report_data = summary
+                status = {
+                    'status': engine.phase,
+                    'total_operations': engine.total_operations_executed,
+                    'metrics_history': [{'cpu_percent': m.get('cpu',0), 'memory_percent': m.get('memory',0), 'timestamp': m.get('timestamp','')} for m in engine.metrics_history[-50:]],
+                    'operations_history': engine.operation_history[-100:],
+                    'target_config': summary.get('target_config', {}),
+                    'current_metrics': summary.get('current_metrics', {}),
+                }
+        except ImportError:
+            pass
+
+        if not report_data:
+            controller = get_smart_execution(execution_id)
+            if controller:
+                status = controller.get_status()
+                report_data = controller.get_report()
+                prometheus_url = getattr(controller, 'prometheus_url', None)
+
+        if not report_data:
             db_data = None
             try:
                 db_data = load_smart_execution(execution_id)
@@ -5001,7 +5601,12 @@ def get_enhanced_smart_execution_report(execution_id):
                 'baseline_metrics': db_data.get('baseline_metrics') or {},
                 'current_metrics': db_data.get('final_metrics') or {},
                 'operations_history': db_data.get('operations_history') or [],
-                'metrics_history': db_data.get('metrics_history') or [],
+                'metrics_history': [
+                    {**m,
+                     'cpu_percent': m.get('cpu_percent') or m.get('cpu', 0),
+                     'memory_percent': m.get('memory_percent') or m.get('memory', 0)}
+                    for m in (db_data.get('metrics_history') or [])
+                ],
                 'threshold_reached': db_data.get('threshold_reached') or False,
                 'entity_breakdown': db_data.get('entity_breakdown') or {},
                 'testbed_info': {
@@ -5012,31 +5617,36 @@ def get_enhanced_smart_execution_report(execution_id):
                 'operation_effectiveness': full_execution_data.get('operation_effectiveness', []),
                 'pod_operation_correlation': full_execution_data.get('pod_operation_correlation', {}),
                 'cluster_health_snapshot': full_execution_data.get('cluster_health_snapshot') or {},
+                'pod_restart_tracking': full_execution_data.get('pod_restart_tracking') or {},
             }
             report_data = status
 
-            prometheus_url = None
-            tid = (db_data.get('testbed_id') or '').strip()
-            if tid:
-                try:
-                    tb = fetch_testbed_by_unique_id(g.db, tid)
-                    if not tb:
-                        tb = fetch_testbed_by_uuid(g.db, tid)
-                    if tb:
-                        tj = tb.testbed_json or {}
-                        if isinstance(tj, str):
-                            import json as _json
-                            try:
-                                tj = _json.loads(tj) if tj else {}
-                            except Exception:
-                                tj = {}
-                        prometheus_url = (tj.get('prometheus_url') or tj.get('prometheus_endpoint') or '').strip() or None
-                        ncm_ip = tj.get('ncm_ip') or getattr(tb, 'ncm_ip', None)
-                        node_port = tj.get('node_port') or 30560
-                        if not prometheus_url and ncm_ip:
-                            prometheus_url = f'https://{ncm_ip}:{node_port}'
-                except Exception as ex:
-                    logging.debug('Enhanced report: could not resolve Prometheus from testbed %s: %s', tid, ex)
+            # Resolve Prometheus URL: prefer the one persisted during execution
+            prometheus_url = (full_execution_data.get('prometheus_url') or '').strip() or None
+            if not prometheus_url:
+                tid = (db_data.get('testbed_id') or '').strip()
+                if tid:
+                    try:
+                        tb = fetch_testbed_by_unique_id(g.db, tid)
+                        if not tb:
+                            tb = fetch_testbed_by_uuid(g.db, tid)
+                        if tb:
+                            tj = tb.testbed_json or {}
+                            if isinstance(tj, str):
+                                import json as _json
+                                try:
+                                    tj = _json.loads(tj) if tj else {}
+                                except Exception:
+                                    tj = {}
+                            prometheus_url = (tj.get('prometheus_url') or tj.get('prometheus_endpoint') or '').strip() or None
+                            pc_ip = getattr(tb, 'pc_ip', None) or tj.get('pc_ip')
+                            ncm_ip = tj.get('ncm_ip') or getattr(tb, 'ncm_ip', None)
+                            if not prometheus_url and pc_ip:
+                                prometheus_url = f'https://{pc_ip}:30546'
+                            if not prometheus_url and ncm_ip:
+                                prometheus_url = f'https://{ncm_ip}:30546'
+                    except Exception as ex:
+                        logging.debug('Enhanced report: could not resolve Prometheus from testbed %s: %s', tid, ex)
             if not prometheus_url:
                 testbed_ip = str(db_data.get('testbed_id') or '').strip()
                 if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', testbed_ip):
@@ -5098,11 +5708,66 @@ def get_enhanced_smart_execution_report(execution_id):
         entity_breakdown = status.get('entity_breakdown') or report_data.get('entity_breakdown') or {}
         operation_effectiveness = status.get('operation_effectiveness') or report_data.get('operation_effectiveness') or []
 
+        # Recompute entity_breakdown from operations_history if stored keys
+        # have entity.operation format instead of plain entity type
+        if entity_breakdown and operations_history:
+            sample_key = next(iter(entity_breakdown), '')
+            if '.' in str(sample_key):
+                eb = {}
+                for op in operations_history:
+                    et = op.get('entity_type', 'unknown')
+                    if et not in eb:
+                        eb[et] = {'total': 0, 'success': 0, 'failed': 0}
+                    eb[et]['total'] += 1
+                    if op.get('success') or op.get('status') == 'SUCCESS':
+                        eb[et]['success'] += 1
+                    else:
+                        eb[et]['failed'] += 1
+                entity_breakdown = eb
+
+        # Compute entity_breakdown from operations_history when empty
+        if not entity_breakdown and operations_history:
+            eb = {}
+            for op in operations_history:
+                et = op.get('entity_type', 'unknown')
+                if et not in eb:
+                    eb[et] = {'total': 0, 'success': 0, 'failed': 0}
+                eb[et]['total'] += 1
+                if op.get('success') or op.get('status') == 'SUCCESS':
+                    eb[et]['success'] += 1
+                else:
+                    eb[et]['failed'] += 1
+            entity_breakdown = eb
+
+        # Compute operation_effectiveness from operations_history when empty
+        if not operation_effectiveness and operations_history:
+            eff_map = {}
+            for op in operations_history:
+                key = f"{op.get('entity_type', '?')}.{op.get('operation', '?')}"
+                if key not in eff_map:
+                    eff_map[key] = {'key': key, 'count': 0, 'successes': 0, 'total_cpu_impact': 0.0, 'total_mem_impact': 0.0}
+                b = eff_map[key]
+                b['count'] += 1
+                if op.get('success') or op.get('status') == 'SUCCESS':
+                    b['successes'] += 1
+                b['total_cpu_impact'] += abs(float(op.get('cpu_impact', 0) or 0))
+                b['total_mem_impact'] += abs(float(op.get('memory_impact', 0) or 0))
+            operation_effectiveness = sorted([
+                {**v,
+                 'avg_cpu_delta': round(v['total_cpu_impact'] / max(v['count'], 1), 3),
+                 'avg_memory_delta': round(v['total_mem_impact'] / max(v['count'], 1), 3),
+                 'impact_score': round(v['total_cpu_impact'] + v['total_mem_impact'], 2)}
+                for v in eff_map.values()
+            ], key=lambda x: -x['impact_score'])
+
         testbed_label = 'Unknown'
-        if isinstance(testbed_info, dict):
-            testbed_label = testbed_info.get('testbed_label', 'Unknown')
+        testbed_info_local = status.get('testbed_info') or {}
+        if isinstance(testbed_info_local, dict):
+            testbed_label = testbed_info_local.get('testbed_label', 'Unknown')
         if testbed_label == 'Unknown':
-            testbed_label = report_data.get('testbed', 'Unknown') if isinstance(report_data, dict) else 'Unknown'
+            testbed_label = report_data.get('testbed_label') or report_data.get('testbed', 'Unknown') if isinstance(report_data, dict) else 'Unknown'
+        if testbed_label == 'Unknown':
+            testbed_label = status.get('testbed_label', 'Unknown')
 
         template_path = os.path.join(os.path.dirname(__file__), 'templates', 'enhanced_report.html')
         with open(template_path, 'r') as f:
@@ -5140,6 +5805,7 @@ def get_enhanced_smart_execution_report(execution_id):
             entity_operation_counts=enhanced_data.get('entity_operation_counts') or [],
             report_metadata=enhanced_data.get('report_metadata') or {},
             metrics_resolution_note=effm.get('resolution_note') or 'stored',
+            pod_restart_tracking=enhanced_data.get('pod_restart_tracking') or {},
             # JSON for charts
             metrics_history_json=json_mod.dumps(metrics_history),
             operations_history_json=json_mod.dumps(operations_history),
@@ -5620,6 +6286,23 @@ def get_smart_execution_children(execution_id):
         logging.error(f"Error fetching children: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+def _build_entity_breakdown(operation_history: list) -> dict:
+    """Build entity breakdown stats from operation history."""
+    breakdown = {}
+    for op in operation_history:
+        et = op.get('entity_type', 'unknown')
+        oper = op.get('operation', 'unknown')
+        key = f"{et}.{oper}"
+        if key not in breakdown:
+            breakdown[key] = {'total': 0, 'success': 0, 'failed': 0, 'entity_type': et, 'operation': oper}
+        breakdown[key]['total'] += 1
+        if op.get('success'):
+            breakdown[key]['success'] += 1
+        else:
+            breakdown[key]['failed'] += 1
+    return breakdown
+
+
 @app.route('/api/smart-execution/report/<execution_id>', methods=['GET'])
 def get_smart_execution_report(execution_id):
     """
@@ -5648,15 +6331,66 @@ def get_smart_execution_report(execution_id):
         from services.smart_execution_service import get_smart_execution
         from services.smart_execution_db import load_smart_execution
         
+        # Check AI active executions first
+        try:
+            from routes.smart_execution_ai_routes import active_ai_executions
+            if execution_id in active_ai_executions:
+                exec_data = active_ai_executions[execution_id]
+                engine = exec_data['engine']
+                summary = engine.get_execution_summary()
+                summary['success'] = True
+                summary['execution_id'] = execution_id
+                summary['execution_name'] = exec_data.get('execution_name', '')
+                summary['execution_description'] = exec_data.get('execution_description', '')
+                summary['ai_enabled'] = True
+                summary['testbed'] = engine.testbed_info.get('testbed_label', 'Unknown')
+                summary['testbed_label'] = engine.testbed_info.get('testbed_label', 'Unknown')
+                summary['start_time'] = engine.start_time.isoformat() if engine.start_time else exec_data.get('start_time')
+                summary['end_time'] = engine.end_time.isoformat() if engine.end_time else None
+                dur_sec = summary.get('duration_seconds')
+                summary['duration_minutes'] = round(dur_sec / 60, 2) if dur_sec else None
+                summary['operations_per_minute'] = engine.adaptive_controller.operations_per_minute if engine.adaptive_controller else 0
+                summary['target_config'] = engine.target_config
+
+                # Normalize metrics to include both 'cpu'/'memory' and 'cpu_percent'/'memory_percent'
+                fm = summary.get('final_metrics', {})
+                summary['current_metrics'] = {
+                    'cpu_percent': fm.get('cpu', fm.get('cpu_percent', 0)),
+                    'memory_percent': fm.get('memory', fm.get('memory_percent', 0)),
+                    'cpu': fm.get('cpu', fm.get('cpu_percent', 0)),
+                    'memory': fm.get('memory', fm.get('memory_percent', 0)),
+                }
+                bm = engine.metrics_history[0] if engine.metrics_history else {}
+                summary['baseline_metrics'] = {
+                    'cpu_percent': bm.get('cpu', bm.get('cpu_percent', 0)),
+                    'memory_percent': bm.get('memory', bm.get('memory_percent', 0)),
+                    'cpu': bm.get('cpu', bm.get('cpu_percent', 0)),
+                    'memory': bm.get('memory', bm.get('memory_percent', 0)),
+                }
+                summary['metrics_history'] = engine.metrics_history[-200:]
+
+                # Normalize operations to include 'status' field expected by frontend
+                normalized_ops = []
+                for op in engine.operation_history[-200:]:
+                    nop = op.copy()
+                    if 'status' not in nop or nop['status'] is None:
+                        nop['status'] = 'SUCCESS' if nop.get('success') else 'FAILED'
+                    if 'duration_seconds' not in nop and 'duration' in nop:
+                        nop['duration_seconds'] = nop['duration']
+                    normalized_ops.append(nop)
+                summary['operations_history'] = normalized_ops
+                summary['entity_breakdown'] = _build_entity_breakdown(engine.operation_history)
+                return jsonify(summary), 200
+        except ImportError:
+            pass
+        
         controller = get_smart_execution(execution_id)
         
         if controller:
             report = controller.get_report()
             report['success'] = True
-            # Ensure testbed_label is always set for frontend
             if not report.get('testbed_label'):
                 report['testbed_label'] = report.get('testbed', report.get('execution_context', {}).get('testbed_label', 'Unknown'))
-            # Ensure current_metrics is always set (fallback to final_metrics)
             if not report.get('current_metrics'):
                 report['current_metrics'] = report.get('final_metrics', {'cpu_percent': 0, 'memory_percent': 0})
             return jsonify(report), 200
@@ -6175,7 +6909,7 @@ if __name__ == '__main__':
             name='Background JITA Job Monitor',
             replace_existing=True
         )
-        
+    
         # Add background Prometheus job monitoring (runs every 30 seconds)
         scheduler_service.scheduler.add_job(
             monitor_prometheus_jobs_background,

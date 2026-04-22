@@ -1,19 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { IS_FAKE_MODE } from '../config/fakeMode';
-import { getFakeTestbeds, getFakeAlerts } from '../fake-data';
-import { getApiBase } from '../utils/backendUrl';
-
-interface DashboardStats {
-  totalTestbeds: number;
-  savedRules: number;
-  alertsToday: number;
-  alertsBySeverity: {
-    Critical: number;
-    Moderate: number;
-    Low: number;
-  };
-}
+import { useTestbeds, useExecutions } from '../hooks';
+import { useApi } from '../hooks/useApi';
+import { fetchAlerts, type AlertDTO } from '../services/api';
+import { PageHeader, MetricCard, EmptyState, StatusBadge } from '../components/ui';
+import { SkeletonMetricRow, SkeletonTable } from '../components/ui/LoadingSkeleton';
 
 interface RecentActivity {
   type: 'testbed' | 'alert';
@@ -24,630 +15,294 @@ interface RecentActivity {
   color: string;
 }
 
-interface ExecutionSummary {
-  execution_id: string;
-  execution_name?: string;
-  testbed_label: string;
-  status: string;
-  start_time: string;
-  duration_minutes?: number;
-  success_rate?: number;
-  total_operations?: number;
-}
+const alertsFetcher = () => fetchAlerts();
 
 const DashboardHome: React.FC = () => {
   const navigate = useNavigate();
-  const [stats, setStats] = useState<DashboardStats>({
-    totalTestbeds: 0,
-    savedRules: 0,
-    alertsToday: 0,
-    alertsBySeverity: { Critical: 0, Moderate: 0, Low: 0 }
+
+  const { testbeds, loading: tbLoading, error: tbError, refetch: refetchTb } = useTestbeds();
+  const { data: alerts, loading: alLoading, error: alError, refetch: refetchAl } = useApi<AlertDTO[]>({
+    fetcher: alertsFetcher, key: 'alerts:all',
   });
-  const [recentActivity, setRecentActivity] = useState<RecentActivity[]>([]);
-  const [recentExecutions, setRecentExecutions] = useState<ExecutionSummary[]>([]);
-  const [executionStats, setExecutionStats] = useState({ running: 0, last24h: 0, avgSuccessRate: 0, total: 0 });
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { executions, loading: exLoading, error: exError, refetch: refetchEx } = useExecutions();
 
-  useEffect(() => {
-    fetchDashboardData();
-  }, []);
+  const loading = tbLoading || alLoading || exLoading;
+  const error = tbError || alError || exError;
+  const refetchAll = () => { refetchTb(); refetchAl(); refetchEx(); };
 
-  const fetchDashboardData = async () => {
-    setLoading(true);
-    setError(null);
-    
-    try {
-      // FAKE DATA MODE
-      if (IS_FAKE_MODE) {
-        await new Promise(resolve => setTimeout(resolve, 600));
-        const testbedsData = getFakeTestbeds();
-        const alertsData = getFakeAlerts();
-        
-        const today = new Date().toISOString().split('T')[0];
-        const allAlerts = alertsData.alerts || [];
-        const alertsToday = allAlerts.filter((alert: any) => {
-          if (!alert.triggered_at) return false;
-          const alertDate = new Date(alert.triggered_at).toISOString().split('T')[0];
-          return alertDate === today;
-        });
-        
-        const severityCounts = { Critical: 0, Moderate: 0, Low: 0 };
-        allAlerts.forEach((alert: any) => {
-          const sev = alert.severity === 'critical' ? 'Critical' : alert.severity === 'warning' ? 'Moderate' : 'Low';
-          severityCounts[sev as keyof typeof severityCounts]++;
-        });
-        
-        setStats({
-          totalTestbeds: testbedsData.testbeds.length,
-          savedRules: 10, // From fake rules
-          alertsToday: alertsToday.length,
-          alertsBySeverity: severityCounts
-        });
-        
-        const activities: RecentActivity[] = [];
-        testbedsData.testbeds.slice(0, 3).forEach((tb: any) => {
-          activities.push({
-            type: 'testbed',
-            title: `Testbed Configured: ${tb.testbed_label}`,
-            subtitle: `PC IP: ${tb.pc_ip}`,
-            timestamp: new Date(tb.timestamp),
-            icon: 'dns',
-            color: '#0078d4'
-          });
-        });
-        allAlerts.slice(0, 3).forEach((alert: any) => {
-          activities.push({
-            type: 'alert',
-            title: alert.alert_name,
-            subtitle: alert.message,
-            timestamp: new Date(alert.triggered_at),
-            icon: 'warning',
-            color: alert.severity === 'critical' ? '#d83b01' : '#ff8c00'
-          });
-        });
-        setRecentActivity(activities);
-        setLoading(false);
-        return;
-      }
+  const allAlerts = alerts ?? [];
 
-      // Always use localhost:5000 for backend in development
-      const backendUrl = getApiBase();
-      
-      const testbedsRes = await fetch(`${backendUrl}/api/get-testbeds`);
-      
-      if (!testbedsRes.ok) {
-        throw new Error(`Testbeds API returned ${testbedsRes.status}`);
-      }
-      
-      const testbedsData = await testbedsRes.json();
-      
-      const alertsRes = await fetch(`${backendUrl}/api/alerts`);
-      
-      if (!alertsRes.ok) {
-        throw new Error(`Alerts API returned ${alertsRes.status}`);
-      }
-      
-      const alertsData = await alertsRes.json();
+  const stats = useMemo(() => {
+    const today = new Date().toISOString().split('T')[0];
+    const alertsToday = allAlerts.filter(a => {
+      const ts = a.timestamp || a.triggered_at;
+      if (!ts) return false;
+      return new Date(ts).toISOString().split('T')[0] === today;
+    });
+    const sev = { Critical: 0, Moderate: 0, Low: 0 };
+    allAlerts.forEach(a => {
+      const s = a.severity === 'critical' ? 'Critical' : a.severity === 'warning' ? 'Moderate' : a.severity in sev ? a.severity as keyof typeof sev : 'Low';
+      sev[s as keyof typeof sev]++;
+    });
+    return { totalTestbeds: testbeds.length, savedRules: testbeds.length || 0, alertsToday: alertsToday.length, alertsBySeverity: sev };
+  }, [testbeds, allAlerts]);
 
-      // Calculate today's date in UTC
-      const today = new Date().toISOString().split('T')[0];
-      const allAlerts = alertsData.alerts || [];
-      const alertsToday = allAlerts.filter((alert: any) => {
-        if (!alert.timestamp) return false;
-        const alertDate = new Date(alert.timestamp).toISOString().split('T')[0];
-        return alertDate === today;
+  const executionStats = useMemo(() => {
+    const now = Date.now();
+    const h24 = 86_400_000;
+    const running = executions.filter(e => ['RUNNING', 'LONGEVITY_SUSTAINING', 'SUSTAINING'].includes(e.status));
+    const last24 = executions.filter(e => {
+      const ts = e.start_time || e.started_at;
+      return ts && (now - new Date(ts).getTime()) < h24;
+    });
+    const rates = executions.slice(0, 10).map(e => e.success_rate ?? 0);
+    const avg = rates.length ? rates.reduce((a, b) => a + b, 0) / rates.length : 0;
+    return { running: running.length, last24h: last24.length, avgSuccessRate: avg, total: executions.length };
+  }, [executions]);
+
+  const recentExecutions = useMemo(() => executions.slice(0, 5), [executions]);
+
+  const recentActivity = useMemo(() => {
+    const items: RecentActivity[] = [];
+    [...testbeds]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, 3)
+      .forEach(tb => {
+        items.push({ type: 'testbed', title: `Testbed Configured: ${tb.testbed_label}`, subtitle: `PC IP: ${tb.pc_ip || 'N/A'}`, timestamp: new Date(tb.timestamp), icon: 'dns', color: '#0078d4' });
       });
-
-      // Calculate severity distribution
-      const severityCounts = {
-        Critical: 0,
-        Moderate: 0,
-        Low: 0
-      };
-      allAlerts.forEach((alert: any) => {
-        if (alert.severity in severityCounts) {
-          severityCounts[alert.severity as keyof typeof severityCounts]++;
-        }
-      });
-
-      // Count unique rules (from testbeds or separate endpoint if available)
-      const allTestbeds = testbedsData.testbeds || [];
-      const uniqueRuleCount = allTestbeds.length;
-
-
-      setStats({
-        totalTestbeds: allTestbeds.length,
-        savedRules: uniqueRuleCount,
-        alertsToday: alertsToday.length,
-        alertsBySeverity: severityCounts
-      });
-
-      // Build recent activity (last 5 testbeds + last 5 alerts)
-      const activities: RecentActivity[] = [];
-
-      // Add testbeds
-      const sortedTestbeds = [...allTestbeds]
-        .sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-        .slice(0, 3);
-
-      sortedTestbeds.forEach((testbed: any) => {
-        activities.push({
-          type: 'testbed',
-          title: `Testbed Configured: ${testbed.testbed_label}`,
-          subtitle: `PC IP: ${testbed.pc_ip || 'N/A'}`,
-          timestamp: new Date(testbed.timestamp),
-          icon: 'dns',
-          color: '#0078d4'
-        });
-      });
-
-      // Add alerts
-      const sortedAlerts = [...allAlerts]
-        .sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-        .slice(0, 3);
-
-      sortedAlerts.forEach((alert: any) => {
-        activities.push({
+    [...allAlerts]
+      .sort((a, b) => new Date(b.timestamp || b.triggered_at || 0).getTime() - new Date(a.timestamp || a.triggered_at || 0).getTime())
+      .slice(0, 3)
+      .forEach(alert => {
+        const sev = alert.severity;
+        items.push({
           type: 'alert',
-          title: `Alert: ${alert.ruleName}`,
-          subtitle: `${alert.severity} - ${alert.testbed || 'Unknown testbed'}`,
-          timestamp: new Date(alert.timestamp),
+          title: `Alert: ${alert.ruleName || alert.alert_name || 'Unknown'}`,
+          subtitle: `${sev} - ${alert.testbed || 'Unknown testbed'}`,
+          timestamp: new Date(alert.timestamp || alert.triggered_at || Date.now()),
           icon: 'notifications_active',
-          color: alert.severity === 'Critical' ? '#dc3545' : alert.severity === 'Moderate' ? '#fd7e14' : '#28a745'
+          color: sev === 'Critical' || sev === 'critical' ? '#dc3545' : sev === 'Moderate' || sev === 'warning' ? '#fd7e14' : '#28a745',
         });
       });
-
-      // Sort combined activities by timestamp
-      activities.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
-      setRecentActivity(activities.slice(0, 5));
-
-      // Fetch smart execution data
-      try {
-        const execRes = await fetch(`${backendUrl}/api/smart-execution/history`);
-        if (execRes.ok) {
-          const execData = await execRes.json();
-          const allExecs: ExecutionSummary[] = execData.executions || [];
-          const now = Date.now();
-          const h24 = 24 * 60 * 60 * 1000;
-          const running = allExecs.filter(e => e.status === 'RUNNING' || e.status === 'LONGEVITY_SUSTAINING' || e.status === 'SUSTAINING');
-          const last24 = allExecs.filter(e => e.start_time && (now - new Date(e.start_time).getTime()) < h24);
-          const ratesArr = allExecs.slice(0, 10).map(e => e.success_rate ?? 0);
-          const avgRate = ratesArr.length ? ratesArr.reduce((a, b) => a + b, 0) / ratesArr.length : 0;
-          setExecutionStats({ running: running.length, last24h: last24.length, avgSuccessRate: avgRate, total: allExecs.length });
-          setRecentExecutions(allExecs.slice(0, 5));
-        }
-      } catch {
-        // Non-critical; execution stats are optional
-      }
-
-    } catch (err) {
-      console.error('Error fetching dashboard data:', err);
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-      setError(`Failed to load dashboard data: ${errorMessage}. Ensure the backend is reachable (same host as this page, or set VITE_API_BASE_URL).`);
-    } finally {
-      setLoading(false);
-    }
-  };
+    return items.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime()).slice(0, 5);
+  }, [testbeds, allAlerts]);
 
   const formatTimestamp = (date: Date) => {
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
+    const diffMs = Date.now() - date.getTime();
     const diffMins = Math.floor(diffMs / 60000);
     const diffHours = Math.floor(diffMs / 3600000);
     const diffDays = Math.floor(diffMs / 86400000);
-
     if (diffMins < 1) return 'Just now';
-    if (diffMins < 60) return `${diffMins} min${diffMins > 1 ? 's' : ''} ago`;
-    if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
-    return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    return `${diffDays}d ago`;
   };
 
+  const statusVariant = (status: string) => {
+    if (['RUNNING', 'SUSTAINING', 'LONGEVITY_SUSTAINING'].includes(status)) return 'primary';
+    if (status === 'COMPLETED') return 'success';
+    if (status === 'FAILED') return 'danger';
+    return 'neutral';
+  };
+
+  /* ── Loading skeleton ──────────────────────────────────── */
   if (loading) {
     return (
-      <div className="d-flex justify-content-center align-items-center" style={{ minHeight: '80vh' }}>
-        <div className="spinner-border text-primary" role="status" style={{ width: '3rem', height: '3rem' }}>
-          <span className="visually-hidden">Loading...</span>
-        </div>
+      <div className="main-content">
+        <PageHeader icon="dashboard" title="Dashboard" subtitle="Loading your workspace…" />
+        <SkeletonMetricRow count={4} />
+        <SkeletonMetricRow count={4} />
+        <SkeletonTable rows={4} cols={5} />
       </div>
     );
   }
 
+  /* ── Error state ───────────────────────────────────────── */
   if (error) {
     return (
-      <div className="container mt-5">
-        <div className="alert alert-danger d-flex align-items-center" role="alert">
-          <i className="material-icons-outlined me-3">error_outline</i>
-          <div>
-            <h5 className="alert-heading">Connection Error</h5>
-            <p className="mb-0">{error}</p>
-            <button className="btn btn-sm btn-danger mt-2" onClick={fetchDashboardData}>
-              <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle' }}>refresh</i> Retry
-            </button>
+      <div className="main-content">
+        <PageHeader icon="dashboard" title="Dashboard" />
+        <div className="card border-0 rounded-3" style={{ boxShadow: 'var(--shadow-sm)' }}>
+          <div className="card-body d-flex align-items-start gap-3 p-4">
+            <div className="d-flex align-items-center justify-content-center flex-shrink-0" style={{ width: 44, height: 44, borderRadius: 'var(--radius-sm)', background: 'var(--color-danger-light)' }}>
+              <i className="material-icons-outlined" style={{ color: 'var(--color-danger)', fontSize: 24 }}>error_outline</i>
+            </div>
+            <div>
+              <h6 className="fw-semibold mb-1">Connection Error</h6>
+              <p className="mb-2" style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-base)' }}>{error}</p>
+              <button className="btn btn-sm btn-outline-danger rounded-3" onClick={refetchAll}>
+                <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle' }}>refresh</i> Retry
+              </button>
+            </div>
           </div>
         </div>
       </div>
     );
   }
+
+  const totalAlerts = stats.alertsBySeverity.Critical + stats.alertsBySeverity.Moderate + stats.alertsBySeverity.Low;
+  const successRateVariant = executionStats.avgSuccessRate >= 80 ? 'success' : executionStats.avgSuccessRate >= 50 ? 'warning' : 'danger';
 
   return (
     <div className="main-content">
-      {/* Breadcrumb */}
-      <div className="d-flex align-items-center mb-4">
-        <div>
-          <nav aria-label="breadcrumb">
-            <ol className="breadcrumb mb-0">
-              <li className="breadcrumb-item">
-                <a href="#" onClick={(e) => { e.preventDefault(); navigate('/dashboard'); }}>
-                  <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle' }}>home</i>
-                </a>
-              </li>
-              <li className="breadcrumb-item active">Dashboard</li>
-            </ol>
-          </nav>
-        </div>
-      </div>
+      <PageHeader
+        icon="dashboard"
+        iconGradient="linear-gradient(135deg, #667eea, #764ba2)"
+        title="Dashboard"
+        subtitle="Your NCM monitoring workspace at a glance"
+        actions={
+          <button className="btn btn-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={() => navigate('/smart-execution')}>
+            <i className="material-icons-outlined" style={{ fontSize: 18 }}>psychology</i>
+            Start Execution
+          </button>
+        }
+      />
 
-      {/* Summary Statistics Cards */}
-      <div className="row row-cols-1 row-cols-md-2 row-cols-xl-4 g-3 mb-4">
-        {/* Total Testbeds Card */}
-        <div className="col">
-          <div className="card rounded-4 border-0 shadow-sm">
-            <div className="card-body">
-              <div className="d-flex align-items-center gap-3">
-                <div className="flex-shrink-0">
-                  <div style={{
-                    width: 50,
-                    height: 50,
-                    borderRadius: 12,
-                    background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center'
-                  }}>
-                    <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>dns</i>
-                  </div>
-                </div>
-                <div className="flex-grow-1">
-                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Total Testbeds</p>
-                  <h3 className="mb-0 mt-1" style={{ fontWeight: 700 }}>{stats.totalTestbeds}</h3>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Saved Rules Card */}
-        <div className="col">
-          <div className="card rounded-4 border-0 shadow-sm">
-            <div className="card-body">
-              <div className="d-flex align-items-center gap-3">
-                <div className="flex-shrink-0">
-                  <div style={{
-                    width: 50,
-                    height: 50,
-                    borderRadius: 12,
-                    background: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center'
-                  }}>
-                    <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>rule</i>
-                  </div>
-                </div>
-                <div className="flex-grow-1">
-                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Saved Rules</p>
-                  <h3 className="mb-0 mt-1" style={{ fontWeight: 700 }}>{stats.savedRules}</h3>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Alerts Today Card */}
-        <div className="col">
-          <div className="card rounded-4 border-0 shadow-sm">
-            <div className="card-body">
-              <div className="d-flex align-items-center gap-3">
-                <div className="flex-shrink-0">
-                  <div style={{
-                    width: 50,
-                    height: 50,
-                    borderRadius: 12,
-                    background: 'linear-gradient(135deg, #fa709a 0%, #fee140 100%)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center'
-                  }}>
-                    <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>notifications_active</i>
-                  </div>
-                </div>
-                <div className="flex-grow-1">
-                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Alerts Today</p>
-                  <h3 className="mb-0 mt-1" style={{ fontWeight: 700 }}>{stats.alertsToday}</h3>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Total Alerts Card */}
-        <div className="col">
-          <div className="card rounded-4 border-0 shadow-sm">
-            <div className="card-body">
-              <div className="d-flex align-items-center gap-3">
-                <div className="flex-shrink-0">
-                  <div style={{
-                    width: 50,
-                    height: 50,
-                    borderRadius: 12,
-                    background: 'linear-gradient(135deg, #30cfd0 0%, #330867 100%)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center'
-                  }}>
-                    <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>notification_important</i>
-                  </div>
-                </div>
-                <div className="flex-grow-1">
-                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Total Alerts</p>
-                  <h3 className="mb-0 mt-1" style={{ fontWeight: 700 }}>
-                    {stats.alertsBySeverity.Critical + stats.alertsBySeverity.Moderate + stats.alertsBySeverity.Low}
-                  </h3>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Execution Overview Cards */}
+      {/* ── Platform KPIs ──────────────────────────────────── */}
       <div className="row row-cols-1 row-cols-md-2 row-cols-xl-4 g-3 mb-4">
         <div className="col">
-          <div className="card rounded-4 border-0 shadow-sm h-100">
-            <div className="card-body">
-              <div className="d-flex align-items-center gap-3">
-                <div style={{ width: 50, height: 50, borderRadius: 12, background: 'linear-gradient(135deg, #22c55e, #16a34a)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>play_circle</i>
-                </div>
-                <div>
-                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Running Now</p>
-                  <h3 className="mb-0 mt-1 fw-bold">{executionStats.running}</h3>
-                </div>
-                {executionStats.running > 0 && (
-                  <button className="btn btn-sm btn-outline-success ms-auto rounded-pill" onClick={() => navigate('/smart-execution/history')}>View</button>
-                )}
-              </div>
-            </div>
-          </div>
+          <MetricCard icon="dns" iconGradient="linear-gradient(135deg, #667eea, #764ba2)" label="Total Testbeds" value={stats.totalTestbeds} />
         </div>
         <div className="col">
-          <div className="card rounded-4 border-0 shadow-sm h-100">
-            <div className="card-body">
-              <div className="d-flex align-items-center gap-3">
-                <div style={{ width: 50, height: 50, borderRadius: 12, background: 'linear-gradient(135deg, #3b82f6, #2563eb)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>schedule</i>
-                </div>
-                <div>
-                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Last 24h</p>
-                  <h3 className="mb-0 mt-1 fw-bold">{executionStats.last24h}</h3>
-                </div>
-              </div>
-            </div>
-          </div>
+          <MetricCard icon="rule" iconGradient="linear-gradient(135deg, #f093fb, #f5576c)" label="Saved Rules" value={stats.savedRules} />
         </div>
         <div className="col">
-          <div className="card rounded-4 border-0 shadow-sm h-100">
-            <div className="card-body">
-              <div className="d-flex align-items-center gap-3">
-                <div style={{ width: 50, height: 50, borderRadius: 12, background: `linear-gradient(135deg, ${executionStats.avgSuccessRate >= 90 ? '#22c55e' : executionStats.avgSuccessRate >= 70 ? '#f59e0b' : '#ef4444'}, ${executionStats.avgSuccessRate >= 90 ? '#16a34a' : executionStats.avgSuccessRate >= 70 ? '#d97706' : '#dc2626'})`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>trending_up</i>
-                </div>
-                <div>
-                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Avg Success Rate</p>
-                  <h3 className="mb-0 mt-1 fw-bold">{executionStats.avgSuccessRate.toFixed(1)}%</h3>
-                </div>
-              </div>
-            </div>
-          </div>
+          <MetricCard icon="notifications_active" iconGradient="linear-gradient(135deg, #fa709a, #fee140)" label="Alerts Today" value={stats.alertsToday} />
         </div>
         <div className="col">
-          <div className="card rounded-4 border-0 shadow-sm h-100">
-            <div className="card-body">
-              <div className="d-flex align-items-center gap-3">
-                <div style={{ width: 50, height: 50, borderRadius: 12, background: 'linear-gradient(135deg, #8b5cf6, #7c3aed)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <i className="material-icons-outlined text-white" style={{ fontSize: 28 }}>science</i>
-                </div>
-                <div>
-                  <p className="mb-0 text-muted" style={{ fontSize: 13 }}>Total Executions</p>
-                  <h3 className="mb-0 mt-1 fw-bold">{executionStats.total}</h3>
-                </div>
-              </div>
-            </div>
-          </div>
+          <MetricCard icon="notification_important" iconGradient="linear-gradient(135deg, #30cfd0, #330867)" label="Total Alerts" value={totalAlerts} />
         </div>
       </div>
 
-      {/* Recent Executions Timeline */}
+      {/* ── Execution KPIs ─────────────────────────────────── */}
+      <div className="row row-cols-1 row-cols-md-2 row-cols-xl-4 g-3 mb-4">
+        <div className="col">
+          <MetricCard icon="play_circle" variant="success" label="Running Now" value={executionStats.running}
+            detail={executionStats.running > 0 ? 'Active executions in progress' : 'No active executions'} />
+        </div>
+        <div className="col">
+          <MetricCard icon="schedule" variant="default" label="Last 24h" value={executionStats.last24h} />
+        </div>
+        <div className="col">
+          <MetricCard icon="trending_up" variant={successRateVariant} label="Avg Success Rate" value={`${executionStats.avgSuccessRate.toFixed(1)}`} suffix="%" />
+        </div>
+        <div className="col">
+          <MetricCard icon="science" iconGradient="linear-gradient(135deg, #8b5cf6, #7c3aed)" label="Total Executions" value={executionStats.total} />
+        </div>
+      </div>
+
+      {/* ── Recent Executions ──────────────────────────────── */}
       {recentExecutions.length > 0 && (
-        <div className="row g-3 mb-4">
-          <div className="col-12">
-            <div className="card rounded-4 border-0 shadow-sm">
-              <div className="card-body">
-                <div className="d-flex align-items-center justify-content-between mb-3">
-                  <h5 className="mb-0 fw-bold">Recent Executions</h5>
-                  <button className="btn btn-sm btn-outline-primary rounded-pill" onClick={() => navigate('/smart-execution/history')}>View All</button>
-                </div>
-                <div className="table-responsive">
-                  <table className="table table-sm table-hover mb-0 align-middle">
-                    <thead className="table-light">
-                      <tr>
-                        <th>Execution</th>
-                        <th>Testbed</th>
-                        <th className="text-center">Status</th>
-                        <th className="text-center">Duration</th>
-                        <th className="text-center">Success</th>
-                        <th className="text-center">Ops</th>
-                        <th></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {recentExecutions.map(exec => {
-                        const sColor = exec.status === 'COMPLETED' ? 'success' : exec.status === 'RUNNING' || exec.status === 'SUSTAINING' || exec.status === 'LONGEVITY_SUSTAINING' ? 'primary' : exec.status === 'FAILED' ? 'danger' : 'secondary';
-                        return (
-                          <tr key={exec.execution_id} style={{ cursor: 'pointer' }} onClick={() => navigate(`/smart-execution/report/${exec.execution_id}`)}>
-                            <td>
-                              {exec.execution_name ? (
-                                <span className="fw-semibold">{exec.execution_name}</span>
-                              ) : (
-                                <code className="small text-muted">{exec.execution_id.substring(0, 18)}...</code>
-                              )}
-                            </td>
-                            <td><span className="badge bg-secondary bg-opacity-10 text-secondary rounded-pill">{exec.testbed_label}</span></td>
-                            <td className="text-center"><span className={`badge bg-${sColor} bg-opacity-10 text-${sColor} rounded-pill`}>{exec.status}</span></td>
-                            <td className="text-center text-muted small">{exec.duration_minutes ? `${exec.duration_minutes.toFixed(0)}m` : '-'}</td>
-                            <td className="text-center fw-semibold">{exec.success_rate != null ? `${exec.success_rate.toFixed(0)}%` : '-'}</td>
-                            <td className="text-center text-muted">{exec.total_operations ?? '-'}</td>
-                            <td className="text-end"><i className="material-icons-outlined text-muted" style={{ fontSize: 16 }}>chevron_right</i></td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+        <div className="card border-0 rounded-3 mb-4" style={{ boxShadow: 'var(--shadow-sm)' }}>
+          <div className="card-body p-4">
+            <div className="d-flex align-items-center justify-content-between mb-3">
+              <h6 className="mb-0 fw-bold" style={{ fontSize: 'var(--text-md)' }}>Recent Executions</h6>
+              <button className="btn btn-sm btn-outline-primary rounded-pill" onClick={() => navigate('/smart-execution/history')}>View All</button>
+            </div>
+            <div className="table-responsive">
+              <table className="table table-sm table-hover mb-0 align-middle">
+                <thead><tr style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>
+                  <th className="fw-semibold border-0 pb-2">Execution</th>
+                  <th className="fw-semibold border-0 pb-2">Testbed</th>
+                  <th className="fw-semibold border-0 pb-2 text-center">Status</th>
+                  <th className="fw-semibold border-0 pb-2 text-center">Duration</th>
+                  <th className="fw-semibold border-0 pb-2 text-center">Success</th>
+                  <th className="fw-semibold border-0 pb-2 text-center">Ops</th>
+                  <th className="border-0"></th>
+                </tr></thead>
+                <tbody>
+                  {recentExecutions.map(exec => (
+                    <tr key={exec.execution_id} style={{ cursor: 'pointer' }} onClick={() => navigate(`/smart-execution/report/${exec.execution_id}`)}>
+                      <td className="border-0">
+                        {exec.execution_name
+                          ? <span className="fw-semibold">{exec.execution_name}</span>
+                          : <code className="small" style={{ color: 'var(--color-text-secondary)' }}>{exec.execution_id.substring(0, 18)}…</code>
+                        }
+                      </td>
+                      <td className="border-0"><StatusBadge label={exec.testbed_label || 'N/A'} variant="neutral" /></td>
+                      <td className="border-0 text-center"><StatusBadge label={exec.status} variant={statusVariant(exec.status)} dot /></td>
+                      <td className="border-0 text-center" style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-sm)' }}>{exec.duration_minutes ? `${exec.duration_minutes.toFixed(0)}m` : '–'}</td>
+                      <td className="border-0 text-center fw-semibold">{exec.success_rate != null ? `${exec.success_rate.toFixed(0)}%` : '–'}</td>
+                      <td className="border-0 text-center" style={{ color: 'var(--color-text-secondary)' }}>{exec.total_operations ?? '–'}</td>
+                      <td className="border-0 text-end"><i className="material-icons-outlined" style={{ fontSize: 16, color: 'var(--color-text-muted)' }}>chevron_right</i></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           </div>
         </div>
       )}
 
-      {/* Main Content Row */}
-      <div className="row g-3">
-        {/* Recent Activity */}
+      {/* ── Activity + Alert Distribution ──────────────────── */}
+      <div className="row g-3 mb-4">
         <div className="col-12 col-xl-8">
-          <div className="card rounded-4 border-0 shadow-sm">
-            <div className="card-body">
+          <div className="card border-0 rounded-3" style={{ boxShadow: 'var(--shadow-sm)' }}>
+            <div className="card-body p-4">
               <div className="d-flex align-items-center justify-content-between mb-3">
-                <h5 className="mb-0 fw-bold">Recent Activity</h5>
-                <button className="btn btn-sm btn-outline-primary" onClick={fetchDashboardData}>
-                  <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle' }}>refresh</i>
+                <h6 className="mb-0 fw-bold" style={{ fontSize: 'var(--text-md)' }}>Recent Activity</h6>
+                <button className="btn btn-sm btn-outline-secondary rounded-3" onClick={refetchAll} style={{ padding: '4px 10px' }}>
+                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>refresh</i>
                 </button>
               </div>
 
               {recentActivity.length === 0 ? (
-                <div className="text-center py-5">
-                  <i className="material-icons-outlined text-muted" style={{ fontSize: 64 }}>inbox</i>
-                  <p className="text-muted mt-3 mb-0">No recent activity yet</p>
-                  <p className="text-muted small">Start by onboarding a testbed or configuring rules</p>
-                  <button className="btn btn-primary mt-3" onClick={() => navigate('/onboarding')}>
-                    <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', marginRight: 4 }}>add_circle</i>
-                    Onboard Now
-                  </button>
-                </div>
+                <EmptyState icon="inbox" title="No recent activity" description="Start by onboarding a testbed or configuring rules"
+                  action={<button className="btn btn-primary btn-sm rounded-3" onClick={() => navigate('/onboarding')}>Onboard Now</button>} />
               ) : (
-                <ul className="list-group list-group-flush">
-                  {recentActivity.map((activity, idx) => (
-                    <li key={idx} className="list-group-item px-0 bg-transparent">
-                      <div className="d-flex align-items-center gap-3">
-                        <div style={{
-                          width: 42,
-                          height: 42,
-                          borderRadius: 8,
-                          background: `${activity.color}20`,
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center'
-                        }}>
-                          <i className="material-icons-outlined" style={{ color: activity.color, fontSize: 24 }}>
-                            {activity.icon}
-                          </i>
-                        </div>
-                        <div className="flex-grow-1">
-                          <h6 className="mb-0" style={{ fontSize: 14, fontWeight: 600 }}>{activity.title}</h6>
-                          <p className="mb-0 text-muted" style={{ fontSize: 13 }}>{activity.subtitle}</p>
-                        </div>
-                        <div className="text-muted" style={{ fontSize: 12 }}>
-                          {formatTimestamp(activity.timestamp)}
-                        </div>
+                <div className="d-flex flex-column gap-2">
+                  {recentActivity.map((a, idx) => (
+                    <div key={idx} className="d-flex align-items-center gap-3 p-2 rounded-3" style={{ transition: 'background var(--transition-fast)' }}
+                      onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-muted)')}
+                      onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
+                      <div className="flex-shrink-0 d-flex align-items-center justify-content-center"
+                        style={{ width: 38, height: 38, borderRadius: 'var(--radius-sm)', background: `${a.color}15` }}>
+                        <i className="material-icons-outlined" style={{ color: a.color, fontSize: 20 }}>{a.icon}</i>
                       </div>
-                    </li>
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div className="fw-semibold text-truncate" style={{ fontSize: 'var(--text-base)' }}>{a.title}</div>
+                        <div className="text-truncate" style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }}>{a.subtitle}</div>
+                      </div>
+                      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>{formatTimestamp(a.timestamp)}</div>
+                    </div>
                   ))}
-                </ul>
+                </div>
               )}
             </div>
           </div>
         </div>
 
-        {/* Alert Severity Distribution */}
         <div className="col-12 col-xl-4">
-          <div className="card rounded-4 border-0 shadow-sm">
-            <div className="card-body">
-              <h5 className="mb-3 fw-bold">Alert Distribution</h5>
-              
-              {(stats.alertsBySeverity.Critical + stats.alertsBySeverity.Moderate + stats.alertsBySeverity.Low) === 0 ? (
-                <div className="text-center py-4">
-                  <i className="material-icons-outlined text-success" style={{ fontSize: 64 }}>check_circle</i>
-                  <p className="text-muted mt-3 mb-0">No alerts recorded</p>
-                  <p className="text-muted small">Your system is healthy!</p>
-                </div>
+          <div className="card border-0 rounded-3" style={{ boxShadow: 'var(--shadow-sm)' }}>
+            <div className="card-body p-4">
+              <h6 className="mb-3 fw-bold" style={{ fontSize: 'var(--text-md)' }}>Alert Distribution</h6>
+
+              {totalAlerts === 0 ? (
+                <EmptyState icon="check_circle" title="All Clear" description="No alerts recorded — your system is healthy!" />
               ) : (
                 <div className="d-flex flex-column gap-3">
-                  {/* Critical */}
-                  <div>
-                    <div className="d-flex align-items-center justify-content-between mb-2">
-                      <span className="d-flex align-items-center gap-2">
-                        <i className="material-icons-outlined text-danger" style={{ fontSize: 18 }}>fiber_manual_record</i>
-                        <span style={{ fontWeight: 500 }}>Critical</span>
-                      </span>
-                      <span className="fw-bold">{stats.alertsBySeverity.Critical}</span>
-                    </div>
-                    <div className="progress" style={{ height: 8 }}>
-                      <div 
-                        className="progress-bar bg-danger" 
-                        style={{ 
-                          width: `${(stats.alertsBySeverity.Critical / (stats.alertsBySeverity.Critical + stats.alertsBySeverity.Moderate + stats.alertsBySeverity.Low)) * 100}%` 
-                        }}
-                      ></div>
-                    </div>
-                  </div>
-
-                  {/* Moderate */}
-                  <div>
-                    <div className="d-flex align-items-center justify-content-between mb-2">
-                      <span className="d-flex align-items-center gap-2">
-                        <i className="material-icons-outlined text-warning" style={{ fontSize: 18 }}>fiber_manual_record</i>
-                        <span style={{ fontWeight: 500 }}>Moderate</span>
-                      </span>
-                      <span className="fw-bold">{stats.alertsBySeverity.Moderate}</span>
-                    </div>
-                    <div className="progress" style={{ height: 8 }}>
-                      <div 
-                        className="progress-bar bg-warning" 
-                        style={{ 
-                          width: `${(stats.alertsBySeverity.Moderate / (stats.alertsBySeverity.Critical + stats.alertsBySeverity.Moderate + stats.alertsBySeverity.Low)) * 100}%` 
-                        }}
-                      ></div>
-                    </div>
-                  </div>
-
-                  {/* Low */}
-                  <div>
-                    <div className="d-flex align-items-center justify-content-between mb-2">
-                      <span className="d-flex align-items-center gap-2">
-                        <i className="material-icons-outlined text-success" style={{ fontSize: 18 }}>fiber_manual_record</i>
-                        <span style={{ fontWeight: 500 }}>Low</span>
-                      </span>
-                      <span className="fw-bold">{stats.alertsBySeverity.Low}</span>
-                    </div>
-                    <div className="progress" style={{ height: 8 }}>
-                      <div 
-                        className="progress-bar bg-success" 
-                        style={{ 
-                          width: `${(stats.alertsBySeverity.Low / (stats.alertsBySeverity.Critical + stats.alertsBySeverity.Moderate + stats.alertsBySeverity.Low)) * 100}%` 
-                        }}
-                      ></div>
-                    </div>
-                  </div>
+                  {([
+                    { key: 'Critical', color: 'var(--color-danger)', bg: 'var(--color-danger)' },
+                    { key: 'Moderate', color: 'var(--color-warning)', bg: 'var(--color-warning)' },
+                    { key: 'Low', color: 'var(--color-success)', bg: 'var(--color-success)' },
+                  ] as const).map(s => {
+                    const count = stats.alertsBySeverity[s.key];
+                    const pct = totalAlerts > 0 ? (count / totalAlerts) * 100 : 0;
+                    return (
+                      <div key={s.key}>
+                        <div className="d-flex align-items-center justify-content-between mb-1">
+                          <span className="d-flex align-items-center gap-2">
+                            <span style={{ width: 8, height: 8, borderRadius: '50%', background: s.color, display: 'inline-block' }} />
+                            <span style={{ fontWeight: 500, fontSize: 'var(--text-base)' }}>{s.key}</span>
+                          </span>
+                          <span className="fw-bold">{count}</span>
+                        </div>
+                        <div className="progress" style={{ height: 6, borderRadius: 'var(--radius-full)', background: 'var(--color-surface-muted)' }}>
+                          <div style={{ width: `${pct}%`, background: s.bg, borderRadius: 'var(--radius-full)', transition: 'width var(--transition-slow)' }} />
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -655,92 +310,44 @@ const DashboardHome: React.FC = () => {
         </div>
       </div>
 
-      {/* Quick Actions */}
-      <div className="row g-3 mt-2">
-        <div className="col-12">
-          <div className="card rounded-4 border-0 shadow-sm">
-            <div className="card-body">
-              <h5 className="mb-3 fw-bold">Quick Actions</h5>
-              <div className="row row-cols-2 row-cols-md-5 g-3">
-                <div className="col">
-                  <button 
-                    className="btn btn-outline-success w-100 d-flex flex-column align-items-center gap-2 py-3"
-                    onClick={() => navigate('/deploy-new')}
-                    style={{ borderRadius: 12 }}
-                  >
-                    <i className="material-icons-outlined" style={{ fontSize: 32 }}>rocket_launch</i>
-                    <span style={{ fontSize: 14, fontWeight: 600 }}>Deploy New</span>
-                  </button>
-                </div>
-                <div className="col">
-                  <button 
-                    className="btn btn-outline-primary w-100 d-flex flex-column align-items-center gap-2 py-3"
-                    onClick={() => navigate('/onboarding')}
-                    style={{ borderRadius: 12 }}
-                  >
-                    <i className="material-icons-outlined" style={{ fontSize: 32 }}>add_circle_outline</i>
-                    <span style={{ fontSize: 14, fontWeight: 600 }}>Onboard Existing</span>
-                  </button>
-                </div>
-                <div className="col">
-                  <button 
-                    className="btn btn-outline-info w-100 d-flex flex-column align-items-center gap-2 py-3"
-                    onClick={() => navigate('/my-testbeds')}
-                    style={{ borderRadius: 12 }}
-                  >
-                    <i className="material-icons-outlined" style={{ fontSize: 32 }}>dns</i>
-                    <span style={{ fontSize: 14, fontWeight: 600 }}>My Testbeds</span>
-                  </button>
-                </div>
-                <div className="col">
-                  <button 
-                    className="btn btn-outline-danger w-100 d-flex flex-column align-items-center gap-2 py-3"
-                    onClick={() => navigate('/alert-summary')}
-                    style={{ borderRadius: 12 }}
-                  >
-                    <i className="material-icons-outlined" style={{ fontSize: 32 }}>notifications_active</i>
-                    <span style={{ fontSize: 14, fontWeight: 600 }}>View Alerts</span>
-                  </button>
-                </div>
-                <div className="col">
-                  <button 
-                    className="btn btn-outline-warning w-100 d-flex flex-column align-items-center gap-2 py-3"
-                    onClick={() => navigate('/status')}
-                    style={{ borderRadius: 12 }}
-                  >
-                    <i className="material-icons-outlined" style={{ fontSize: 32 }}>show_chart</i>
-                    <span style={{ fontSize: 14, fontWeight: 600 }}>View Status</span>
-                  </button>
-                </div>
+      {/* ── Quick Actions ──────────────────────────────────── */}
+      <div className="card border-0 rounded-3 mb-4" style={{ boxShadow: 'var(--shadow-sm)' }}>
+        <div className="card-body p-4">
+          <h6 className="mb-3 fw-bold" style={{ fontSize: 'var(--text-md)' }}>Quick Actions</h6>
+          <div className="row row-cols-2 row-cols-md-5 g-3">
+            {[
+              { path: '/smart-execution', icon: 'psychology', label: 'Smart Execution', cls: 'btn-primary' },
+              { path: '/deploy-new', icon: 'rocket_launch', label: 'Deploy New', cls: 'btn-outline-secondary' },
+              { path: '/onboarding', icon: 'add_circle_outline', label: 'Onboard', cls: 'btn-outline-secondary' },
+              { path: '/my-testbeds', icon: 'dns', label: 'My Testbeds', cls: 'btn-outline-secondary' },
+              { path: '/alert-summary', icon: 'notifications_active', label: 'View Alerts', cls: 'btn-outline-secondary' },
+            ].map(qa => (
+              <div className="col" key={qa.path}>
+                <button
+                  className={`btn ${qa.cls} w-100 d-flex flex-column align-items-center gap-2 py-3`}
+                  onClick={() => navigate(qa.path)}
+                  style={{ borderRadius: 'var(--radius-md)' }}
+                >
+                  <i className="material-icons-outlined" style={{ fontSize: 28 }}>{qa.icon}</i>
+                  <span style={{ fontSize: 'var(--text-sm)', fontWeight: 600 }}>{qa.label}</span>
+                </button>
               </div>
-            </div>
+            ))}
           </div>
         </div>
       </div>
 
-      {/* Empty State Guidance */}
+      {/* ── Welcome onboarding guidance ────────────────────── */}
       {stats.totalTestbeds === 0 && (
-        <div className="row mt-4">
-          <div className="col-12">
-            <div className="alert alert-info d-flex align-items-start" role="alert">
-              <i className="material-icons-outlined me-3" style={{ fontSize: 32 }}>info</i>
-              <div className="flex-grow-1">
-                <h5 className="alert-heading mb-2">Welcome to NCM Monitoring Tool!</h5>
-                <p className="mb-3">Get started by deploying a new testbed or onboarding your existing testbed.</p>
-                <div className="d-flex gap-2">
-                  <button className="btn btn-sm btn-success" onClick={() => navigate('/deploy-new')}>
-                    <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', marginRight: 4 }}>rocket_launch</i>
-                    Deploy New Testbed
-                  </button>
-                  <button className="btn btn-sm btn-primary" onClick={() => navigate('/onboarding')}>
-                    <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', marginRight: 4 }}>add_circle</i>
-                    Onboard Existing
-                  </button>
-                  <button className="btn btn-sm btn-outline-secondary" onClick={() => navigate('/my-testbeds')}>
-                    <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', marginRight: 4 }}>dns</i>
-                    View My Testbeds
-                  </button>
-                </div>
+        <div className="card border-0 rounded-3" style={{ boxShadow: 'var(--shadow-sm)', borderLeft: '4px solid var(--color-primary)' }}>
+          <div className="card-body p-4 d-flex align-items-start gap-3">
+            <i className="material-icons-outlined" style={{ fontSize: 28, color: 'var(--color-primary)' }}>info</i>
+            <div>
+              <h6 className="fw-bold mb-1">Welcome to NCM Monitoring Tool!</h6>
+              <p className="mb-3" style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-base)' }}>Get started by deploying a new testbed or onboarding your existing one.</p>
+              <div className="d-flex gap-2 flex-wrap">
+                <button className="btn btn-sm btn-success rounded-3" onClick={() => navigate('/deploy-new')}>Deploy New Testbed</button>
+                <button className="btn btn-sm btn-primary rounded-3" onClick={() => navigate('/onboarding')}>Onboard Existing</button>
               </div>
             </div>
           </div>

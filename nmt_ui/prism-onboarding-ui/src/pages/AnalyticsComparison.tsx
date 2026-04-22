@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactApexChart from 'react-apexcharts';
 import { getApiBase } from '../utils/backendUrl';
+import { SkeletonTable } from '../components/ui/LoadingSkeleton';
 
 interface Execution {
   execution_id: string;
@@ -170,7 +171,7 @@ const AnalyticsComparison: React.FC = () => {
         </div>
         <div className="card-body p-4">
           {loadingExecs ? (
-            <div className="text-center py-4"><div className="spinner-border text-primary" role="status"></div></div>
+            <div className="p-3"><SkeletonTable rows={4} cols={5} /></div>
           ) : executions.length === 0 ? (
             <div className="text-center py-4 text-muted">No completed executions found</div>
           ) : (
@@ -585,7 +586,7 @@ const AnalyticsComparison: React.FC = () => {
                   type="radar"
                   height={340}
                   width={500}
-                  series={results.map((r, i) => ({
+                  series={results.map((r, _i) => ({
                     name: shortLabel(r),
                     data: [
                       Math.min(100, r.success_rate || 0),

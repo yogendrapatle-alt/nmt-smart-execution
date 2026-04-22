@@ -4,6 +4,7 @@ import RuleBuilderExperimental from '../components/RuleBuilderExperimental';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeRulesByTestbed } from '../fake-data';
 import { getApiBase } from '../utils/backendUrl';
+import { SkeletonTable } from '../components/ui/LoadingSkeleton';
 
 interface Testbed {
   id: number;
@@ -490,11 +491,8 @@ const RuleConfigManager: React.FC = () => {
 
           <div className="card-body p-0">
             {loading ? (
-              <div className="text-center py-5">
-                <div className="spinner-border text-primary" role="status">
-                  <span className="visually-hidden">Loading...</span>
-                </div>
-                <p className="text-muted mt-2">Loading rules...</p>
+              <div className="p-4">
+                <SkeletonTable rows={5} cols={4} />
               </div>
             ) : rules.length === 0 ? (
               <div className="text-center py-5 px-4">
