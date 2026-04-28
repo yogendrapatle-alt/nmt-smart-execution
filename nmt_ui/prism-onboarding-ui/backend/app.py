@@ -5823,6 +5823,11 @@ def get_enhanced_smart_execution_report(execution_id):
             report_metadata=enhanced_data.get('report_metadata') or {},
             metrics_resolution_note=effm.get('resolution_note') or 'stored',
             pod_restart_tracking=enhanced_data.get('pod_restart_tracking') or {},
+            # New unified report sections
+            data_quality=status.get('data_quality') or report_data.get('data_quality') or {},
+            metrics_stats=status.get('metrics_stats') or report_data.get('metrics_stats') or {},
+            resource_lifecycle=status.get('resource_lifecycle') or report_data.get('resource_lifecycle') or {},
+            event_timeline=report_data.get('event_timeline') or status.get('event_timeline') or [],
             # JSON for charts
             metrics_history_json=json_mod.dumps(metrics_history),
             operations_history_json=json_mod.dumps(operations_history),
@@ -6117,6 +6122,68 @@ def get_execution_metrics_timeline(execution_id):
     except Exception as e:
         logging.exception("Error exporting smart execution report")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ===========================
+# Phase 12: New drill-down APIs
+# ===========================
+
+@app.route('/api/smart-execution/<execution_id>/timeline', methods=['GET'])
+def get_execution_timeline(execution_id):
+    """Return the full structured event timeline for an execution."""
+    from services.smart_execution_service import get_smart_execution
+    svc = get_smart_execution(execution_id)
+    if not svc:
+        return jsonify({'success': False, 'error': 'Execution not found'}), 404
+    event_type = request.args.get('event_type')
+    severity = request.args.get('severity')
+    events = list(svc._event_timeline)
+    if event_type:
+        events = [e for e in events if e.get('event_type') == event_type]
+    if severity:
+        events = [e for e in events if e.get('severity') == severity]
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 100))
+    start = (page - 1) * per_page
+    return jsonify({'success': True, 'total': len(events),
+                    'page': page, 'per_page': per_page,
+                    'events': events[start:start + per_page]})
+
+
+@app.route('/api/smart-execution/<execution_id>/operations', methods=['GET'])
+def get_execution_operations_filtered(execution_id):
+    """Return operations with optional filters (status, entity_type, iteration)."""
+    from services.smart_execution_service import get_smart_execution
+    svc = get_smart_execution(execution_id)
+    if not svc:
+        return jsonify({'success': False, 'error': 'Execution not found'}), 404
+    ops = list(svc.operations_history)
+    if request.args.get('status'):
+        ops = [o for o in ops if o.get('status') == request.args['status']]
+    if request.args.get('entity_type'):
+        ops = [o for o in ops if o.get('entity_type') == request.args['entity_type']]
+    if request.args.get('iteration'):
+        it = int(request.args['iteration'])
+        ops = [o for o in ops if o.get('iteration') == it]
+    if request.args.get('mode'):
+        ops = [o for o in ops if o.get('mode') == request.args['mode']]
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 100))
+    start = (page - 1) * per_page
+    return jsonify({'success': True, 'total': len(ops),
+                    'page': page, 'per_page': per_page,
+                    'operations': ops[start:start + per_page]})
+
+
+@app.route('/api/smart-execution/<execution_id>/resources', methods=['GET'])
+def get_execution_resources(execution_id):
+    """Return resource lifecycle summary."""
+    from services.smart_execution_service import get_smart_execution
+    svc = get_smart_execution(execution_id)
+    if not svc:
+        return jsonify({'success': False, 'error': 'Execution not found'}), 404
+    return jsonify({'success': True, **svc._get_resource_lifecycle_summary()})
+
 
 # ===========================
 # Phase 3: Export APIs (MUST BE BEFORE REPORT ROUTE)

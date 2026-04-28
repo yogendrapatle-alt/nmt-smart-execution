@@ -203,6 +203,17 @@ class SmartExecutionController:
         self.live_logs = []
         self.max_log_entries = 500
         
+        # ── Phase 2: Append-only execution event timeline ─────
+        self._event_timeline: List[Dict] = []
+        self._event_counter = 0
+        
+        # ── Phase 3: Operation ID counter ─────
+        self._operation_id_counter = 0
+        
+        # ── Phase 7: Resource lifecycle tracking ─────
+        self._resource_lifecycle: List[Dict] = []
+        self._cleanup_results: Dict[str, Any] = {}
+        
         # Execution state
         self.start_time = None
         self.end_time = None
@@ -1383,6 +1394,12 @@ class SmartExecutionController:
                             ) if self.start_time else 0,
                         }
                         self._pod_restart_events.append(event)
+                        self._emit_event(
+                            'pod_restarted', f'{pod}/{container} restarted (+{new_restarts})',
+                            severity='warning' if restart_reason != 'OOMKilled' else 'error',
+                            pod_name=pod, namespace=namespace,
+                            metadata={'container': container, 'reason': restart_reason,
+                                      'exit_code': exit_code, 'delta': delta})
                         self._log_event(
                             'WARNING',
                             f'🔄 Pod restart detected: {pod}/{container} in {namespace} '
@@ -1542,18 +1559,27 @@ class SmartExecutionController:
             self.is_running = True
             self.start_time = datetime.now(timezone.utc)
             self._log_event('INFO', f'🚀 Smart execution started (profile={self.workload_profile})', execution_id=self.execution_id)
+            self._emit_event('execution_started', 'Execution started', severity='info',
+                             metadata={'profile': self.workload_profile,
+                                       'cpu_target': self.target_config.get('cpu_threshold'),
+                                       'mem_target': self.target_config.get('memory_threshold')})
             
             self._persist_to_database()
             
             # Pre-execution resource check
+            self._emit_event('precheck_started', 'Pre-execution checks started')
             pre_check = await self.pre_execution_check()
             if pre_check.get('warnings'):
                 for w in pre_check['warnings']:
                     self._log_event('WARNING', f'Pre-check: {w}')
+            self._emit_event('precheck_completed', f'Pre-checks completed ({len(pre_check.get("warnings",[]))} warnings)',
+                             metadata={'warnings': pre_check.get('warnings', [])})
             
             self.baseline_metrics = await self._get_current_metrics()
             baseline_cpu = self.baseline_metrics.get('cpu_percent', 0)
             baseline_mem = self.baseline_metrics.get('memory_percent', 0)
+            self._emit_event('baseline_captured', f'Baseline: CPU={baseline_cpu:.1f}% Mem={baseline_mem:.1f}%',
+                             metadata={'cpu': baseline_cpu, 'memory': baseline_mem})
             
             self._capture_pod_restart_baseline()
             
@@ -1590,17 +1616,25 @@ class SmartExecutionController:
             duration = (self.end_time - self.start_time).total_seconds() / 60
             
             logger.info(f"✅ Smart execution completed: {self.total_operations} operations in {duration:.2f} minutes")
+            self._emit_event('execution_completed', f'Completed: {self.total_operations} ops in {duration:.1f}min',
+                             severity='success', metadata={'status': self.status, 'duration_min': round(duration, 2)})
             
             # Auto-cleanup if configured
             if self.auto_cleanup and self.created_entities:
                 logger.info(f"🧹 Auto-cleanup enabled - cleaning up created entities...")
                 self._log_event('INFO', 'Auto-cleanup started')
+                self._emit_event('cleanup_started', 'Auto-cleanup started')
                 try:
                     cleanup_summary = await self.cleanup_entities()
+                    self._cleanup_results = cleanup_summary
                     logger.info(f"🧹 Auto-cleanup done: {cleanup_summary.get('success', 0)}/{cleanup_summary.get('total', 0)} deleted")
                     self._log_event('INFO', f"Auto-cleanup: {cleanup_summary.get('success', 0)}/{cleanup_summary.get('total', 0)} deleted")
+                    self._emit_event('cleanup_completed',
+                                     f"Cleanup: {cleanup_summary.get('success',0)}/{cleanup_summary.get('total',0)} OK",
+                                     severity='info', metadata=cleanup_summary)
                 except Exception as ce:
                     logger.error(f"Auto-cleanup failed: {ce}")
+                    self._emit_event('cleanup_failed', f'Cleanup failed: {ce}', severity='error')
             
             # Generate learning summary
             try:
@@ -1630,6 +1664,8 @@ class SmartExecutionController:
             logger.exception(f"❌ Smart execution failed: {e}")
             self.status = "FAILED"
             self.end_time = datetime.now(timezone.utc)
+            self._emit_event('execution_failed', f'Execution failed: {e}', severity='error',
+                             metadata={'error': str(e)})
             return {
                 'success': False,
                 'execution_id': self.execution_id,
@@ -1779,6 +1815,7 @@ class SmartExecutionController:
             
             iteration += 1
             logger.info(f"Iteration {iteration}")
+            self._emit_event('iteration_started', f'Iteration {iteration}', iteration=iteration)
             
             try:
                 # 1. Get current metrics from Prometheus
@@ -1788,6 +1825,8 @@ class SmartExecutionController:
                 
                 logger.info(f"📊 Current metrics: CPU={cpu:.1f}%, Memory={memory:.1f}%")
                 self._log_event('INFO', f'📊 Metrics: CPU={cpu:.1f}%, Memory={memory:.1f}%', cpu=cpu, memory=memory, iteration=iteration)
+                self._emit_event('metrics_sampled', f'CPU={cpu:.1f}% Mem={memory:.1f}%',
+                                 iteration=iteration, metadata={'cpu': cpu, 'memory': memory})
                 
                 # Per-node metrics (best-effort; empty list when Prometheus unavailable)
                 per_node = await self._get_per_node_metrics()
@@ -1832,6 +1871,10 @@ class SmartExecutionController:
                         self.detected_anomalies.append(anomaly)
                         logger.warning(f"ANOMALY DETECTED: {anomaly['type']} - {anomaly['message']}")
                         self._log_event('WARNING', f"Anomaly: {anomaly['message']}", anomaly=anomaly)
+                        self._emit_event('anomaly_detected', anomaly['message'],
+                                         severity=anomaly.get('severity', 'medium'),
+                                         iteration=iteration,
+                                         metadata={'type': anomaly['type'], 'value': anomaly.get('value')})
                         
                         recommendation = self._generate_anomaly_recommendation(anomaly)
                         if recommendation:
@@ -1851,10 +1894,14 @@ class SmartExecutionController:
                         self._sustain_start_time = datetime.now(timezone.utc)
                         self._sustain_stats['entered_at'] = self._sustain_start_time.isoformat()
                         self._send_threshold_alert(cpu, memory)
+                        self._emit_event('threshold_reached', f'Threshold reached: CPU={cpu:.1f}% Mem={memory:.1f}%',
+                                         severity='success', iteration=iteration,
+                                         metadata={'cpu': cpu, 'memory': memory})
                         if self._longevity_enabled:
                             self.status = "LONGEVITY_SUSTAINING"
                             logger.info(f"🎯 Threshold reached, entering longevity sustain mode. CPU={cpu:.1f}%, Mem={memory:.1f}%")
                             self._log_event('SUCCESS', f'🎯 Threshold reached! Entering longevity sustain mode. CPU={cpu:.1f}%, Mem={memory:.1f}%')
+                            self._emit_event('sustain_entered', 'Entered longevity sustain mode', severity='info')
                             if self._health_checker:
                                 try:
                                     self._health_baseline = self._health_checker.capture_baseline()
@@ -1866,6 +1913,7 @@ class SmartExecutionController:
                             self.status = "SUSTAINING"
                             logger.info(f"🎯 Threshold reached! Entering sustain phase for {sustain_dur}m. CPU={cpu:.1f}%, Mem={memory:.1f}%")
                             self._log_event('SUCCESS', f'🎯 Threshold reached! Sustaining load for {sustain_dur} minutes. CPU={cpu:.1f}%, Mem={memory:.1f}%', cpu=cpu, memory=memory)
+                            self._emit_event('sustain_entered', f'Sustaining for {sustain_dur}min', severity='info')
 
                     # Track sustain stats
                     self._sustain_stats['min_cpu'] = min(self._sustain_stats['min_cpu'], cpu)
@@ -2757,6 +2805,8 @@ class SmartExecutionController:
         import random
         suffix = f"{self.total_operations + 1}-{random.randint(1000,9999)}"
         entity_name = f"smart-{entity_type.lower()}-{suffix}"
+        op_id = self._next_operation_id()
+        seq = self.total_operations + 1
         
         # Phase 5: Skip if failure predictor says high risk
         if self._failure_predictor:
@@ -2764,6 +2814,9 @@ class SmartExecutionController:
             mem_now = self.current_metrics.get('memory_percent', 0)
             if self._failure_predictor.should_skip(entity_type, operation, cpu_now, mem_now, threshold=0.8):
                 logger.info(f"Skipping {entity_type}.{operation}: high predicted failure probability")
+                self._emit_event('operation_skipped', f'{entity_type}.{operation} skipped (high failure risk)',
+                                 severity='warning', entity_type=entity_type, operation=operation,
+                                 operation_id=op_id, iteration=iteration)
                 return {
                     'entity_type': entity_type,
                     'operation': operation,
@@ -2775,6 +2828,8 @@ class SmartExecutionController:
                     'start_time': start_time.isoformat(),
                     'duration_seconds': 0,
                     'iteration': iteration,
+                    'operation_id': op_id,
+                    'sequence_number': seq,
                     'api_url': None,
                     'http_method': None,
                     'request_payload': None,
@@ -2802,6 +2857,7 @@ class SmartExecutionController:
                     'name': entity_name,
                     'created_at': start_time.isoformat()
                 })
+                self._track_resource_created(entity_type, entity_name, result['uuid'], op_id)
                 logger.info(f"📝 Tracked entity for cleanup: {entity_type}/{entity_name} ({result.get('uuid')})")
             
             # Remove deleted entity from tracking so future deletes don't target a ghost UUID
@@ -2810,14 +2866,25 @@ class SmartExecutionController:
                 self.created_entities[entity_type] = [
                     e for e in tracked if e.get('uuid') != result['uuid']
                 ]
+                self._track_resource_deleted(result['uuid'], op_id)
             
             execution_mode = 'REAL' if is_real else 'SIMULATED'
             http_status_code = result.get('http_status_code') or result.get('error_code')
+            op_status = result.get('status', 'SUCCESS')
+
+            self._emit_event(
+                'operation_completed' if op_status == 'SUCCESS' else 'operation_failed',
+                f'{entity_type}.{operation} {op_status} ({duration:.1f}s)',
+                severity='info' if op_status == 'SUCCESS' else 'error',
+                entity_type=entity_type, operation=operation,
+                operation_id=op_id, iteration=iteration,
+                metadata={'duration': duration, 'http_status': http_status_code},
+            )
 
             return {
                 'entity_type': entity_type,
                 'operation': operation,
-                'status': result.get('status', 'SUCCESS'),
+                'status': op_status,
                 'mode': execution_mode,
                 'timestamp': start_time.isoformat(),
                 'start_time': start_time.isoformat(),
@@ -2830,6 +2897,8 @@ class SmartExecutionController:
                 'error_code': result.get('error_code'),
                 'http_status_code': http_status_code,
                 'iteration': iteration,
+                'operation_id': op_id,
+                'sequence_number': seq,
                 'api_url': result.get('api_url'),
                 'http_method': result.get('http_method'),
                 'request_payload': result.get('request_payload'),
@@ -2844,6 +2913,11 @@ class SmartExecutionController:
             logger.error(f"❌ Operation failed: {entity_type}.{operation} - {e}")
             logger.debug(f"Traceback: {error_traceback}")
             
+            self._emit_event('operation_failed', f'{entity_type}.{operation} exception: {e}',
+                             severity='error', entity_type=entity_type, operation=operation,
+                             operation_id=op_id, iteration=iteration,
+                             metadata={'error': str(e), 'error_type': type(e).__name__})
+
             return {
                 'entity_type': entity_type,
                 'operation': operation,
@@ -2860,6 +2934,8 @@ class SmartExecutionController:
                 'error_code': getattr(e, 'status_code', None),
                 'http_status_code': getattr(e, 'status_code', None),
                 'traceback': error_traceback,
+                'operation_id': op_id,
+                'sequence_number': seq,
                 'iteration': iteration,
                 'api_url': None,
                 'http_method': None,
@@ -6840,6 +6916,176 @@ spec:
         else:
             self._stagnation_count = max(0, self._stagnation_count - 1)
     
+    # ── Phase 2: Structured Event Timeline ─────────────────────────
+
+    def _emit_event(self, event_type: str, title: str, severity: str = 'info',
+                    message: str = '', entity_type: str = '', operation: str = '',
+                    operation_id: str = '', pod_name: str = '', namespace: str = '',
+                    iteration: int = None, metadata: Dict = None):
+        """Append a structured, timestamped event to the execution timeline."""
+        self._event_counter += 1
+        now = datetime.now(timezone.utc)
+        elapsed = (now - self.start_time).total_seconds() if self.start_time else 0
+        self._event_timeline.append({
+            'event_id': f"EVT-{self._event_counter:06d}",
+            'execution_id': self.execution_id,
+            'timestamp': now.isoformat(),
+            'elapsed_seconds': round(elapsed, 2),
+            'iteration': iteration,
+            'event_type': event_type,
+            'severity': severity,
+            'title': title,
+            'message': message,
+            'entity_type': entity_type,
+            'operation': operation,
+            'operation_id': operation_id,
+            'pod_name': pod_name,
+            'namespace': namespace,
+            'metadata': metadata or {},
+        })
+
+    def _next_operation_id(self) -> str:
+        """Generate a unique operation ID within this execution."""
+        self._operation_id_counter += 1
+        return f"OP-{self._operation_id_counter:06d}"
+
+    # ── Phase 7: Resource Lifecycle helpers ────────────────────────
+
+    def _track_resource_created(self, entity_type: str, entity_name: str,
+                                entity_uuid: str, operation_id: str):
+        """Record that a resource was created."""
+        self._resource_lifecycle.append({
+            'entity_type': entity_type,
+            'entity_name': entity_name,
+            'entity_uuid': entity_uuid,
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'created_by_operation_id': operation_id,
+            'deleted_at': None,
+            'delete_operation_id': None,
+            'cleanup_status': 'pending',
+            'cleanup_error': None,
+        })
+
+    def _track_resource_deleted(self, entity_uuid: str, operation_id: str):
+        """Record that a resource was deleted during normal execution."""
+        for r in self._resource_lifecycle:
+            if r['entity_uuid'] == entity_uuid and r['deleted_at'] is None:
+                r['deleted_at'] = datetime.now(timezone.utc).isoformat()
+                r['delete_operation_id'] = operation_id
+                r['cleanup_status'] = 'deleted_during_execution'
+                return
+
+    def _get_resource_lifecycle_summary(self) -> Dict:
+        """Build the resource lifecycle report section."""
+        total = len(self._resource_lifecycle)
+        created = total
+        deleted = sum(1 for r in self._resource_lifecycle if r['deleted_at'] is not None)
+        cleanup_ok = sum(1 for r in self._resource_lifecycle if r['cleanup_status'] == 'cleanup_success')
+        cleanup_fail = sum(1 for r in self._resource_lifecycle if r['cleanup_status'] == 'cleanup_failed')
+        leaked = sum(1 for r in self._resource_lifecycle
+                     if r['deleted_at'] is None and r['cleanup_status'] not in ('cleanup_success',))
+        return {
+            'total_created': created,
+            'deleted_during_execution': deleted,
+            'cleanup_attempted': cleanup_ok + cleanup_fail,
+            'cleanup_success': cleanup_ok,
+            'cleanup_failed': cleanup_fail,
+            'potentially_leaked': leaked,
+            'leak_verdict': 'No leaked resources detected' if leaked == 0
+                            else f'{leaked} resource(s) may remain on testbed',
+            'resources': self._resource_lifecycle,
+        }
+
+    # ── Phase 11: Data Quality Score ───────────────────────────────
+
+    def _compute_data_quality(self) -> Dict:
+        """Compute a data-quality score for this execution."""
+        ops_count = self.total_operations
+        metrics_count = len(self.metrics_history)
+        pod_events_count = len(self._pod_restart_events)
+        has_prom = bool(self.prometheus_url)
+        real_ops = sum(1 for op in self.operations_history if op.get('mode') == 'REAL')
+        sim_ops = sum(1 for op in self.operations_history if op.get('mode') == 'SIMULATED')
+        real_pct = (real_ops / max(ops_count, 1)) * 100
+
+        missing_samples = 0
+        if self.start_time and self.end_time:
+            expected = max(1, int((self.end_time - self.start_time).total_seconds() / 30))
+            missing_samples = max(0, expected - metrics_count)
+
+        metrics_source_set = set(m.get('metrics_source', 'unknown') for m in self.metrics_history)
+
+        issues = []
+        if ops_count == 0:
+            issues.append('No operations recorded')
+        if metrics_count == 0:
+            issues.append('No metrics collected')
+        if not has_prom:
+            issues.append('Prometheus not configured')
+        if sim_ops > 0:
+            issues.append(f'{sim_ops} simulated operations')
+        if missing_samples > 5:
+            issues.append(f'{missing_samples} missing metric samples')
+
+        if ops_count > 0 and metrics_count > 0 and real_pct >= 80 and missing_samples <= 5:
+            score = 'HIGH'
+        elif ops_count > 0 and (metrics_count > 0 or has_prom):
+            score = 'MEDIUM'
+        else:
+            score = 'LOW'
+
+        return {
+            'score': score,
+            'operations_recorded': ops_count,
+            'metrics_samples': metrics_count,
+            'missing_metric_samples': missing_samples,
+            'prometheus_configured': has_prom,
+            'real_operations': real_ops,
+            'simulated_operations': sim_ops,
+            'real_operations_percent': round(real_pct, 1),
+            'pod_events_captured': pod_events_count,
+            'cleanup_tracked': len(self._resource_lifecycle) > 0,
+            'metrics_sources': list(metrics_source_set),
+            'timeline_events': len(self._event_timeline),
+            'issues': issues,
+        }
+
+    # ── Phase 5: Metrics Statistical Aggregation ───────────────────
+
+    def _compute_metrics_stats(self) -> Dict:
+        """Compute min/max/avg/p50/p95 for CPU and memory over the run."""
+        if not self.metrics_history:
+            return {}
+        cpu_vals = [m.get('cpu_percent', 0) for m in self.metrics_history]
+        mem_vals = [m.get('memory_percent', 0) for m in self.metrics_history]
+
+        def _stats(vals):
+            if not vals:
+                return {}
+            s = sorted(vals)
+            n = len(s)
+            return {
+                'min': round(s[0], 2),
+                'max': round(s[-1], 2),
+                'avg': round(sum(s) / n, 2),
+                'p50': round(s[int(n * 0.5)], 2),
+                'p95': round(s[min(int(n * 0.95), n - 1)], 2),
+                'samples': n,
+            }
+
+        return {
+            'cpu': {
+                'baseline': round(self.baseline_metrics.get('cpu_percent', 0), 2),
+                'final': round(self.current_metrics.get('cpu_percent', 0), 2),
+                **_stats(cpu_vals),
+            },
+            'memory': {
+                'baseline': round(self.baseline_metrics.get('memory_percent', 0), 2),
+                'final': round(self.current_metrics.get('memory_percent', 0), 2),
+                **_stats(mem_vals),
+            },
+        }
+
     def _log_event(self, level: str, message: str, **kwargs):
         """Add a log entry to the live logs buffer"""
         log_entry = {
@@ -7781,6 +8027,13 @@ spec:
             
             # Pod restart tracking (continuous during execution)
             'pod_restart_tracking': self._get_pod_restart_tracking(),
+
+            # ── NEW: Phases 1-11 unified sections ──
+            'event_timeline': self._event_timeline[-50:],
+            'event_timeline_total': len(self._event_timeline),
+            'resource_lifecycle': self._get_resource_lifecycle_summary(),
+            'data_quality': self._compute_data_quality(),
+            'metrics_stats': self._compute_metrics_stats(),
         }
     
     def _calculate_predictions(self) -> Optional[Dict]:
@@ -8073,6 +8326,13 @@ spec:
 
             # Learning summary
             'learning_summary': getattr(self, '_learning_summary', '') or '',
+
+            # ── NEW: Phases 1-11 unified sections ──
+            'event_timeline': self._event_timeline,
+            'resource_lifecycle': self._get_resource_lifecycle_summary(),
+            'data_quality': self._compute_data_quality(),
+            'metrics_stats': self._compute_metrics_stats(),
+            'cleanup_results': self._cleanup_results,
         }
     
     def _generate_analysis(self) -> Dict[str, Any]:
@@ -8516,14 +8776,15 @@ spec:
                 entity_name = entity['name']
                 
                 try:
+                    et_upper = entity_type.upper()
                     # Tier 1: Core Infrastructure
-                    if entity_type == "VM":
+                    if et_upper == "VM":
                         result = await self._cleanup_vm(entity_uuid, entity_name)
-                    elif entity_type == "Project":
+                    elif et_upper == "PROJECT":
                         result = await self._cleanup_project(entity_uuid, entity_name)
-                    elif entity_type == "Category":
+                    elif et_upper == "CATEGORY":
                         result = await self._cleanup_category(entity_uuid, entity_name)
-                    elif entity_type == "Subnet":
+                    elif et_upper == "SUBNET":
                         result = await self._cleanup_subnet(entity_uuid, entity_name)
                     
                     # Tier 2-3: Self-Service & App Lifecycle (have real operations)
@@ -8550,6 +8811,10 @@ spec:
                             'entity_uuid': entity_uuid,
                             'entity_name': entity_name
                         })
+                        for r in self._resource_lifecycle:
+                            if r['entity_uuid'] == entity_uuid:
+                                r['cleanup_status'] = 'cleanup_success'
+                                r['deleted_at'] = datetime.now(timezone.utc).isoformat()
                     else:
                         logger.error(f"❌ Failed to delete {entity_type}: {entity_name} - {result.get('error')}")
                         cleanup_results['failed'].append({
@@ -8558,6 +8823,10 @@ spec:
                             'entity_name': entity_name,
                             'error': result.get('error')
                         })
+                        for r in self._resource_lifecycle:
+                            if r['entity_uuid'] == entity_uuid:
+                                r['cleanup_status'] = 'cleanup_failed'
+                                r['cleanup_error'] = result.get('error')
                         
                 except Exception as e:
                     logger.error(f"❌ Exception during cleanup of {entity_type}/{entity_name}: {e}")
@@ -8567,6 +8836,10 @@ spec:
                         'entity_name': entity_name,
                         'error': str(e)
                     })
+                    for r in self._resource_lifecycle:
+                        if r['entity_uuid'] == entity_uuid:
+                            r['cleanup_status'] = 'cleanup_failed'
+                            r['cleanup_error'] = str(e)
         
         summary = {
             'total': total_entities,

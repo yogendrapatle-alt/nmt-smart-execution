@@ -12,7 +12,7 @@ Tables:
 """
 
 from sqlalchemy import (
-    Column, Integer, String, DateTime, JSON, Float, Boolean, Text, Index,
+    Column, Integer, String, DateTime, JSON, Float, Boolean, Text, Index, UniqueConstraint,
 )
 import datetime
 
@@ -27,6 +27,8 @@ class ExecutionApiLog(Base):
     id = Column(Integer, primary_key=True)
     execution_id = Column(String(128), nullable=False, index=True)
     iteration = Column(Integer, nullable=True)
+    operation_id = Column(String(32), nullable=True)
+    sequence_number = Column(Integer, nullable=True)
 
     entity_type = Column(String(64), nullable=True)
     operation = Column(String(32), nullable=True)
@@ -47,6 +49,7 @@ class ExecutionApiLog(Base):
     __table_args__ = (
         Index('ix_api_logs_exec_status', 'execution_id', 'status'),
         Index('ix_api_logs_exec_iter', 'execution_id', 'iteration'),
+        UniqueConstraint('execution_id', 'operation_id', name='uq_api_logs_exec_op'),
     )
 
     def to_dict(self):
@@ -54,6 +57,8 @@ class ExecutionApiLog(Base):
             'id': self.id,
             'execution_id': self.execution_id,
             'iteration': self.iteration,
+            'operation_id': self.operation_id,
+            'sequence_number': self.sequence_number,
             'entity_type': self.entity_type,
             'operation': self.operation,
             'entity_name': self.entity_name,
@@ -94,6 +99,8 @@ class ExecutionPodEvent(Base):
 
     __table_args__ = (
         Index('ix_pod_events_exec', 'execution_id', 'detected_at'),
+        UniqueConstraint('execution_id', 'pod_name', 'container', 'detected_at',
+                         name='uq_pod_events_natural'),
     )
 
     def to_dict(self):
@@ -136,6 +143,8 @@ class ExecutionMetricsTimeline(Base):
 
     __table_args__ = (
         Index('ix_metrics_tl_exec_iter', 'execution_id', 'iteration'),
+        UniqueConstraint('execution_id', 'iteration', 'node_id', 'timestamp',
+                         name='uq_metrics_tl_natural'),
     )
 
     def to_dict(self):

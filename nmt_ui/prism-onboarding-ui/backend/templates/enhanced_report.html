@@ -1325,6 +1325,114 @@
         </div>
     </div>
 
+    <!-- DATA QUALITY SCORE -->
+    {% if data_quality %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background:{% if data_quality.score == 'HIGH' %}var(--pass){% elif data_quality.score == 'MEDIUM' %}var(--warn){% else %}var(--fail){% endif %};">📊</div>
+            <h2>Data Quality Score: {{ data_quality.score }}</h2>
+        </div>
+        <div class="card-body">
+            <div class="stat-grid">
+                <div class="stat-card"><div class="stat-value">{{ data_quality.operations_recorded }}</div><div class="stat-label">Operations</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.metrics_samples }}</div><div class="stat-label">Metric Samples</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.real_operations_percent|round(1) }}%</div><div class="stat-label">Real Ops</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.pod_events_captured }}</div><div class="stat-label">Pod Events</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.timeline_events }}</div><div class="stat-label">Timeline Events</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.missing_metric_samples }}</div><div class="stat-label">Missing Samples</div></div>
+            </div>
+            {% if data_quality.issues %}
+            <div style="margin-top:12px;">
+                <strong style="color:var(--warn);">Issues:</strong>
+                <ul style="margin-top:6px;padding-left:20px;">
+                {% for issue in data_quality.issues %}
+                    <li style="color:var(--muted);font-size:13px;">{{ issue }}</li>
+                {% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- METRICS STATISTICS -->
+    {% if metrics_stats and metrics_stats.cpu %}
+    <div class="card">
+        <div class="card-header"><div class="icon" style="background:var(--blue);">📈</div><h2>Metrics Statistics</h2></div>
+        <div class="card-body">
+            <table>
+                <thead><tr><th>Metric</th><th>Baseline</th><th>Min</th><th>Avg</th><th>P50</th><th>P95</th><th>Max</th><th>Final</th><th>Samples</th></tr></thead>
+                <tbody>
+                    <tr><td><strong>CPU %</strong></td><td>{{ metrics_stats.cpu.baseline }}</td><td>{{ metrics_stats.cpu.min }}</td><td>{{ metrics_stats.cpu.avg }}</td><td>{{ metrics_stats.cpu.p50 }}</td><td>{{ metrics_stats.cpu.p95 }}</td><td>{{ metrics_stats.cpu.max }}</td><td>{{ metrics_stats.cpu.final }}</td><td>{{ metrics_stats.cpu.samples }}</td></tr>
+                    <tr><td><strong>Memory %</strong></td><td>{{ metrics_stats.memory.baseline }}</td><td>{{ metrics_stats.memory.min }}</td><td>{{ metrics_stats.memory.avg }}</td><td>{{ metrics_stats.memory.p50 }}</td><td>{{ metrics_stats.memory.p95 }}</td><td>{{ metrics_stats.memory.max }}</td><td>{{ metrics_stats.memory.final }}</td><td>{{ metrics_stats.memory.samples }}</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- RESOURCE LIFECYCLE -->
+    {% if resource_lifecycle and resource_lifecycle.total_created > 0 %}
+    <div class="card">
+        <div class="card-header"><div class="icon" style="background:var(--teal);">🗂️</div><h2>Resource Lifecycle & Cleanup</h2></div>
+        <div class="card-body">
+            <div class="stat-grid">
+                <div class="stat-card"><div class="stat-value">{{ resource_lifecycle.total_created }}</div><div class="stat-label">Created</div></div>
+                <div class="stat-card"><div class="stat-value">{{ resource_lifecycle.deleted_during_execution }}</div><div class="stat-label">Deleted (Execution)</div></div>
+                <div class="stat-card"><div class="stat-value">{{ resource_lifecycle.cleanup_success }}</div><div class="stat-label">Cleanup OK</div></div>
+                <div class="stat-card"><div class="stat-value" style="color:{% if resource_lifecycle.cleanup_failed > 0 %}var(--fail){% else %}var(--pass){% endif %};">{{ resource_lifecycle.cleanup_failed }}</div><div class="stat-label">Cleanup Failed</div></div>
+                <div class="stat-card"><div class="stat-value" style="color:{% if resource_lifecycle.potentially_leaked > 0 %}var(--fail){% else %}var(--pass){% endif %};">{{ resource_lifecycle.potentially_leaked }}</div><div class="stat-label">Potentially Leaked</div></div>
+            </div>
+            <div style="padding:12px;border-radius:8px;background:{% if resource_lifecycle.potentially_leaked == 0 %}#dcfce7{% else %}#fee2e2{% endif %};font-weight:600;text-align:center;">
+                {{ resource_lifecycle.leak_verdict }}
+            </div>
+            {% if resource_lifecycle.resources %}
+            <div style="max-height:400px;overflow-y:auto;margin-top:16px;">
+                <table>
+                    <thead><tr><th>Type</th><th>Name</th><th>UUID</th><th>Created</th><th>Deleted</th><th>Cleanup</th></tr></thead>
+                    <tbody>
+                    {% for r in resource_lifecycle.resources %}
+                        <tr>
+                            <td>{{ r.entity_type }}</td>
+                            <td>{{ r.entity_name }}</td>
+                            <td style="font-size:11px;font-family:monospace;">{{ r.entity_uuid[:12] }}…</td>
+                            <td style="font-size:12px;">{{ r.created_at|fmtts }}</td>
+                            <td style="font-size:12px;">{{ r.deleted_at|fmtts if r.deleted_at else '—' }}</td>
+                            <td><span style="padding:2px 8px;border-radius:10px;font-size:11px;background:{% if r.cleanup_status == 'cleanup_success' %}#dcfce7{% elif r.cleanup_status == 'cleanup_failed' %}#fee2e2{% elif r.cleanup_status == 'deleted_during_execution' %}#dbeafe{% else %}#f1f5f9{% endif %};">{{ r.cleanup_status }}</span></td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- EVENT TIMELINE -->
+    {% if event_timeline %}
+    <div class="card">
+        <div class="card-header"><div class="icon" style="background:var(--purple);">🕐</div><h2>Event Timeline ({{ event_timeline|length }} events)</h2></div>
+        <div class="card-body" style="max-height:600px;overflow-y:auto;">
+            <table>
+                <thead><tr><th>Time</th><th>Elapsed</th><th>Type</th><th>Severity</th><th>Title</th><th>Details</th></tr></thead>
+                <tbody>
+                {% for ev in event_timeline %}
+                    <tr style="{% if ev.severity == 'error' %}background:#fef2f2;{% elif ev.severity == 'warning' %}background:#fffbeb;{% elif ev.severity == 'success' %}background:#f0fdf4;{% endif %}">
+                        <td style="white-space:nowrap;font-size:12px;">{{ ev.timestamp|fmtts }}</td>
+                        <td style="font-size:12px;">{{ ev.elapsed_seconds|round(0)|int }}s</td>
+                        <td><span style="font-size:11px;padding:2px 8px;border-radius:10px;background:#f1f5f9;">{{ ev.event_type }}</span></td>
+                        <td><span style="font-size:11px;font-weight:600;color:{% if ev.severity == 'error' %}var(--fail){% elif ev.severity == 'warning' %}var(--warn){% elif ev.severity == 'success' %}var(--pass){% else %}var(--muted){% endif %};">{{ ev.severity }}</span></td>
+                        <td style="font-size:13px;">{{ ev.title }}</td>
+                        <td style="font-size:11px;color:var(--muted);">{{ ev.entity_type }}{% if ev.operation %}.{{ ev.operation }}{% endif %}{% if ev.pod_name %} pod={{ ev.pod_name }}{% endif %}{% if ev.operation_id %} {{ ev.operation_id }}{% endif %}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
     <!-- FOOTER -->
     <div class="report-footer">
         Generated by <strong>NMT Smart Execution Tool (Enhanced AI Report)</strong> — {{ timestamp|fmtts }}

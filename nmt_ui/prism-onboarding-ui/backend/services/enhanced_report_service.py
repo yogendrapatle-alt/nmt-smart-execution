@@ -995,13 +995,36 @@ class EnhancedReportService:
                 'root_cause_hint': self._infer_root_cause(error_pattern, ops),
                 'http_status_distribution': dict(status_counter),
                 'sample_failures': sample_failures,
+                'retryable': self._is_retryable(error_pattern),
             })
+
+        # Failure timeline: when bursts happened
+        failure_timeline = []
+        for op in failed_ops:
+            ts = op.get('start_time') or op.get('timestamp', '')
+            if ts:
+                failure_timeline.append({
+                    'timestamp': ts,
+                    'entity_type': op.get('entity_type'),
+                    'operation': op.get('operation'),
+                    'error_pattern': self._normalize_error(op.get('error', '') or '')[:80],
+                    'iteration': op.get('iteration'),
+                })
 
         return {
             'groups': result_groups,
             'total_failures': len(failed_ops),
             'unique_patterns': len(result_groups),
+            'failure_timeline': failure_timeline,
         }
+
+    def _is_retryable(self, pattern: str) -> bool:
+        """Heuristic: is this error pattern likely retryable?"""
+        p = pattern.lower()
+        retryable_hints = ['timeout', 'timed out', 'connection refused',
+                           'service unavailable', '503', '502', '429',
+                           'too many requests', 'temporary', 'retry']
+        return any(h in p for h in retryable_hints)
 
     def _normalize_error(self, error: str) -> str:
         error = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '<UUID>', error)

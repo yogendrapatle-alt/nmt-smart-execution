@@ -280,6 +280,59 @@ interface ReportData {
     total_health_checks?: number;
     latest_health_verdict?: string;
   };
+  event_timeline?: Array<{
+    event_id: string;
+    timestamp: string;
+    elapsed_seconds: number;
+    event_type: string;
+    severity: string;
+    title: string;
+    message?: string;
+    entity_type?: string;
+    operation?: string;
+    operation_id?: string;
+    pod_name?: string;
+    namespace?: string;
+    iteration?: number | null;
+    metadata?: Record<string, any>;
+  }>;
+  resource_lifecycle?: {
+    total_created: number;
+    deleted_during_execution: number;
+    cleanup_attempted: number;
+    cleanup_success: number;
+    cleanup_failed: number;
+    potentially_leaked: number;
+    leak_verdict: string;
+    resources: Array<{
+      entity_type: string;
+      entity_name: string;
+      entity_uuid: string;
+      created_at: string;
+      deleted_at: string | null;
+      cleanup_status: string;
+      cleanup_error?: string | null;
+    }>;
+  };
+  data_quality?: {
+    score: string;
+    operations_recorded: number;
+    metrics_samples: number;
+    missing_metric_samples: number;
+    prometheus_configured: boolean;
+    real_operations: number;
+    simulated_operations: number;
+    real_operations_percent: number;
+    pod_events_captured: number;
+    cleanup_tracked: boolean;
+    timeline_events: number;
+    issues: string[];
+  };
+  metrics_stats?: {
+    cpu?: { baseline: number; final: number; min: number; max: number; avg: number; p50: number; p95: number; samples: number };
+    memory?: { baseline: number; final: number; min: number; max: number; avg: number; p50: number; p95: number; samples: number };
+  };
+  cleanup_results?: Record<string, any>;
 }
 
 const SmartExecutionReport: React.FC = () => {
@@ -293,7 +346,7 @@ const SmartExecutionReport: React.FC = () => {
   const [downloadingEnhanced, setDownloadingEnhanced] = useState(false);
   const [enhancedUnavailable, setEnhancedUnavailable] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
-  const [activeTab, setActiveTab] = useState<'overview' | 'spikes' | 'health' | 'failures' | 'capacity' | 'iterations' | 'heatmap' | 'latency' | 'errors'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'timeline' | 'spikes' | 'health' | 'failures' | 'capacity' | 'iterations' | 'heatmap' | 'latency' | 'errors' | 'resources' | 'config'>('overview');
   const [expandedIterations, setExpandedIterations] = useState<Set<number>>(new Set());
   const [expandedEffectiveOps, setExpandedEffectiveOps] = useState<Set<string>>(new Set());
   const [podEvents, setPodEvents] = useState<any[]>([]);
@@ -845,6 +898,12 @@ const SmartExecutionReport: React.FC = () => {
                 <span className="badge bg-dark bg-opacity-10 text-dark" style={{ cursor: 'pointer' }} onClick={() => setActiveTab('health')} title="View cluster health details">OOM Kills: {enhanced.verdict.oom_kills} ↗</span>
                 <span className="badge bg-dark bg-opacity-10 text-dark" style={{ cursor: 'pointer' }} onClick={() => setActiveTab('health')} title="View pod restart details">Restarts: {enhanced.verdict.container_restarts} ↗</span>
                 <span className="badge bg-dark bg-opacity-10 text-dark" style={{ cursor: 'pointer' }} onClick={() => setActiveTab('spikes')} title="View spike analysis">High-Risk Spikes: {enhanced.verdict.high_risk_spikes} ↗</span>
+                {report?.data_quality && (
+                  <span className={`badge ${report.data_quality.score === 'HIGH' ? 'bg-success bg-opacity-10 text-success' : report.data_quality.score === 'MEDIUM' ? 'bg-warning bg-opacity-10 text-dark' : 'bg-danger bg-opacity-10 text-danger'}`}
+                        style={{ cursor: 'pointer' }} onClick={() => setActiveTab('config')} title="View data quality details">
+                    Data Quality: {report.data_quality.score} ↗
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -865,6 +924,7 @@ const SmartExecutionReport: React.FC = () => {
               <ul className="nav nav-tabs border-0" style={{ padding: '0 16px' }}>
                 {[
                   { key: 'overview', label: 'Overview', icon: 'dashboard' },
+                  { key: 'timeline', label: `Timeline (${report?.event_timeline?.length || 0})`, icon: 'schedule' },
                   { key: 'iterations', label: `Iterations (${enhanced.iteration_timeline?.total_iterations || 0})`, icon: 'format_list_numbered' },
                   { key: 'spikes', label: `Spikes (${enhanced.spike_analysis?.total_spikes || 0})`, icon: 'show_chart' },
                   { key: 'heatmap', label: 'Heatmap', icon: 'grid_on' },
@@ -872,7 +932,9 @@ const SmartExecutionReport: React.FC = () => {
                   { key: 'failures', label: `Failures (${enhanced.failure_analysis?.total_failures || 0})`, icon: 'bug_report' },
                   { key: 'latency', label: 'Latency', icon: 'timer' },
                   { key: 'errors', label: 'Error Codes', icon: 'error_outline' },
+                  { key: 'resources', label: 'Resources', icon: 'inventory_2' },
                   { key: 'capacity', label: 'Capacity', icon: 'speed' },
+                  { key: 'config', label: 'Config', icon: 'settings' },
                 ].map((tab) => (
                   <li key={tab.key} className="nav-item">
                     <button
@@ -2619,6 +2681,142 @@ const SmartExecutionReport: React.FC = () => {
                       <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>grid_on</i>
                       <div>No heatmap data available</div>
                     </div>
+                  )}
+                </div>
+              )}
+
+              {/* TIMELINE TAB */}
+              {activeTab === 'timeline' && (
+                <div>
+                  {report?.event_timeline?.length ? (
+                    <>
+                      <p className="text-muted small mb-3">Chronological log of every significant event during execution — operations, threshold events, pod restarts, anomalies, cleanup.</p>
+                      <div className="table-responsive" style={{ maxHeight: 600, overflowY: 'auto' }}>
+                        <table className="table table-sm table-hover align-middle mb-0">
+                          <thead className="table-light sticky-top">
+                            <tr><th>Time</th><th>Elapsed</th><th>Type</th><th>Severity</th><th>Title</th><th>Details</th></tr>
+                          </thead>
+                          <tbody>
+                            {report.event_timeline.map((ev, i) => (
+                              <tr key={ev.event_id || i} style={{
+                                background: ev.severity === 'error' ? '#fef2f2' : ev.severity === 'warning' ? '#fffbeb' : ev.severity === 'success' ? '#f0fdf4' : undefined,
+                              }}>
+                                <td style={{ whiteSpace: 'nowrap', fontSize: 12 }}>{ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '—'}</td>
+                                <td style={{ fontSize: 12 }}>{Math.round(ev.elapsed_seconds)}s</td>
+                                <td><span className="badge bg-light text-dark border" style={{ fontSize: 10 }}>{ev.event_type}</span></td>
+                                <td><span style={{ fontSize: 11, fontWeight: 600, color: ev.severity === 'error' ? '#ef4444' : ev.severity === 'warning' ? '#f59e0b' : ev.severity === 'success' ? '#22c55e' : '#64748b' }}>{ev.severity}</span></td>
+                                <td style={{ fontSize: 13 }}>{ev.title}</td>
+                                <td style={{ fontSize: 11, color: '#64748b' }}>
+                                  {ev.entity_type}{ev.operation ? `.${ev.operation}` : ''}{ev.pod_name ? ` pod=${ev.pod_name}` : ''}{ev.operation_id ? ` ${ev.operation_id}` : ''}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="text-center py-4 text-muted">
+                      <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>schedule</i>
+                      <div>No timeline events available</div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* RESOURCES TAB */}
+              {activeTab === 'resources' && (
+                <div>
+                  {report?.resource_lifecycle ? (
+                    <>
+                      <div className="row g-3 mb-3">
+                        <div className="col"><div className="card rounded-3 border h-100"><div className="card-body text-center p-3"><div className="h3 fw-bold text-primary mb-1">{report.resource_lifecycle.total_created}</div><div className="small text-muted fw-semibold">Created</div></div></div></div>
+                        <div className="col"><div className="card rounded-3 border h-100"><div className="card-body text-center p-3"><div className="h3 fw-bold text-info mb-1">{report.resource_lifecycle.deleted_during_execution}</div><div className="small text-muted fw-semibold">Deleted (Exec)</div></div></div></div>
+                        <div className="col"><div className="card rounded-3 border h-100"><div className="card-body text-center p-3"><div className="h3 fw-bold text-success mb-1">{report.resource_lifecycle.cleanup_success}</div><div className="small text-muted fw-semibold">Cleanup OK</div></div></div></div>
+                        <div className="col"><div className="card rounded-3 border h-100"><div className="card-body text-center p-3"><div className={`h3 fw-bold mb-1 ${report.resource_lifecycle.cleanup_failed > 0 ? 'text-danger' : 'text-success'}`}>{report.resource_lifecycle.cleanup_failed}</div><div className="small text-muted fw-semibold">Cleanup Failed</div></div></div></div>
+                        <div className="col"><div className="card rounded-3 border h-100"><div className="card-body text-center p-3"><div className={`h3 fw-bold mb-1 ${report.resource_lifecycle.potentially_leaked > 0 ? 'text-danger' : 'text-success'}`}>{report.resource_lifecycle.potentially_leaked}</div><div className="small text-muted fw-semibold">Leaked</div></div></div></div>
+                      </div>
+                      <div className={`alert ${report.resource_lifecycle.potentially_leaked === 0 ? 'alert-success' : 'alert-danger'} rounded-3 text-center fw-semibold`}>
+                        {report.resource_lifecycle.leak_verdict}
+                      </div>
+                      {report.resource_lifecycle.resources?.length > 0 && (
+                        <div className="table-responsive" style={{ maxHeight: 400, overflowY: 'auto' }}>
+                          <table className="table table-sm table-hover align-middle mb-0">
+                            <thead className="table-light sticky-top"><tr><th>Type</th><th>Name</th><th>UUID</th><th>Created</th><th>Deleted</th><th>Cleanup</th></tr></thead>
+                            <tbody>
+                              {report.resource_lifecycle.resources.map((r, i) => (
+                                <tr key={i}>
+                                  <td>{r.entity_type}</td>
+                                  <td>{r.entity_name}</td>
+                                  <td style={{ fontSize: 11, fontFamily: 'monospace' }}>{r.entity_uuid?.slice(0, 12)}…</td>
+                                  <td style={{ fontSize: 12 }}>{r.created_at ? new Date(r.created_at).toLocaleTimeString() : '—'}</td>
+                                  <td style={{ fontSize: 12 }}>{r.deleted_at ? new Date(r.deleted_at).toLocaleTimeString() : '—'}</td>
+                                  <td><span className={`badge ${r.cleanup_status === 'cleanup_success' ? 'bg-success bg-opacity-10 text-success' : r.cleanup_status === 'cleanup_failed' ? 'bg-danger bg-opacity-10 text-danger' : 'bg-light text-dark'}`} style={{ fontSize: 10 }}>{r.cleanup_status}</span></td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="text-center py-4 text-muted">
+                      <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>inventory_2</i>
+                      <div>No resource lifecycle data available</div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* CONFIG TAB */}
+              {activeTab === 'config' && (
+                <div>
+                  <h6 className="fw-semibold mb-3">Execution Configuration</h6>
+                  <div className="table-responsive">
+                    <table className="table table-sm mb-0">
+                      <tbody>
+                        <tr><td className="fw-semibold" style={{ width: 200 }}>Execution ID</td><td style={{ fontFamily: 'monospace', fontSize: 12 }}>{report?.execution_id}</td></tr>
+                        <tr><td className="fw-semibold">Testbed</td><td>{report?.testbed_label}</td></tr>
+                        <tr><td className="fw-semibold">CPU Threshold</td><td>{report?.target_config?.cpu_threshold}%</td></tr>
+                        <tr><td className="fw-semibold">Memory Threshold</td><td>{report?.target_config?.memory_threshold}%</td></tr>
+                        <tr><td className="fw-semibold">Stop Condition</td><td>{report?.target_config?.stop_condition}</td></tr>
+                        <tr><td className="fw-semibold">Start Time</td><td>{report?.start_time ? new Date(report.start_time).toLocaleString() : '—'}</td></tr>
+                        <tr><td className="fw-semibold">End Time</td><td>{report?.end_time ? new Date(report.end_time).toLocaleString() : '—'}</td></tr>
+                        <tr><td className="fw-semibold">Duration</td><td>{report?.duration_minutes?.toFixed(1)} min</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {report?.data_quality && (
+                    <>
+                      <h6 className="fw-semibold mt-4 mb-3">Data Quality</h6>
+                      <div className={`alert ${report.data_quality.score === 'HIGH' ? 'alert-success' : report.data_quality.score === 'MEDIUM' ? 'alert-warning' : 'alert-danger'} rounded-3 d-flex align-items-center gap-2`}>
+                        <strong>Score: {report.data_quality.score}</strong>
+                        <span className="ms-2 small text-muted">
+                          {report.data_quality.operations_recorded} ops, {report.data_quality.metrics_samples} metric samples, {report.data_quality.real_operations_percent?.toFixed(0)}% real
+                        </span>
+                      </div>
+                      {report.data_quality.issues.length > 0 && (
+                        <ul className="small text-muted mt-2">
+                          {report.data_quality.issues.map((iss, i) => <li key={i}>{iss}</li>)}
+                        </ul>
+                      )}
+                    </>
+                  )}
+
+                  {report?.metrics_stats?.cpu && (
+                    <>
+                      <h6 className="fw-semibold mt-4 mb-3">Metrics Statistics</h6>
+                      <div className="table-responsive">
+                        <table className="table table-sm table-bordered mb-0" style={{ fontSize: 13 }}>
+                          <thead className="table-light"><tr><th>Metric</th><th>Baseline</th><th>Min</th><th>Avg</th><th>P50</th><th>P95</th><th>Max</th><th>Final</th><th>Samples</th></tr></thead>
+                          <tbody>
+                            <tr><td className="fw-semibold">CPU %</td><td>{report.metrics_stats.cpu.baseline}</td><td>{report.metrics_stats.cpu.min}</td><td>{report.metrics_stats.cpu.avg}</td><td>{report.metrics_stats.cpu.p50}</td><td>{report.metrics_stats.cpu.p95}</td><td>{report.metrics_stats.cpu.max}</td><td>{report.metrics_stats.cpu.final}</td><td>{report.metrics_stats.cpu.samples}</td></tr>
+                            {report.metrics_stats.memory && <tr><td className="fw-semibold">Memory %</td><td>{report.metrics_stats.memory.baseline}</td><td>{report.metrics_stats.memory.min}</td><td>{report.metrics_stats.memory.avg}</td><td>{report.metrics_stats.memory.p50}</td><td>{report.metrics_stats.memory.p95}</td><td>{report.metrics_stats.memory.max}</td><td>{report.metrics_stats.memory.final}</td><td>{report.metrics_stats.memory.samples}</td></tr>}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
                   )}
                 </div>
               )}
