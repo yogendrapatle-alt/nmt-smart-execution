@@ -82,8 +82,9 @@ class EnhancedReportService:
             raw_baseline, raw_final, metrics_history
         )
         detected_anomalies = report_data.get('detected_anomalies') or status_data.get('detected_anomalies') or []
+        target_config = report_data.get('target_config') or status_data.get('target_config') or {}
 
-        spike_analysis = self._analyze_spikes(metrics_history, operations_history, pod_correlation, detected_anomalies)
+        spike_analysis = self._analyze_spikes(metrics_history, operations_history, pod_correlation, detected_anomalies, target_config)
         live_cluster_health = self._collect_cluster_health()
         cluster_health = live_cluster_health
         persisted_health = report_data.get('cluster_health_snapshot') or status_data.get('cluster_health_snapshot')
@@ -125,6 +126,7 @@ class EnhancedReportService:
         execution_mode_summary = self._build_execution_mode_summary(operations_history)
         learning = status_data.get('learning_summary') or report_data.get('learning_summary') or ''
         health_assessment = self._build_health_assessment(cluster_health, pod_stability, node_stability)
+        health_assessment['_deprecated'] = True
 
         report_metadata = self._build_report_metadata(
             metrics_history=metrics_history,
@@ -308,10 +310,21 @@ class EnhancedReportService:
     #  1. SPIKE ANALYSIS
     # ------------------------------------------------------------------
     def _analyze_spikes(self, metrics_history: List, operations_history: List,
-                        pod_correlation: Dict, detected_anomalies: List) -> Dict:
+                        pod_correlation: Dict, detected_anomalies: List,
+                        target_config: Optional[Dict] = None) -> Dict:
+        """Detect metric spikes and classify each as one of:
+
+        * **threshold_breach** – CPU or memory exceeded the configured threshold
+        * **ml_anomaly_deviation** – an ML IsolationForest anomaly was detected
+          within ±1 iteration of this spike
+        * **delta_spike** – a raw delta exceeded MIN_SPIKE_DELTA (fallback)
+        """
         spikes = []
         if len(metrics_history) < 3:
             return {'spikes': [], 'total_spikes': 0, 'avg_recovery_minutes': 0}
+
+        cpu_threshold = (target_config or {}).get('cpu_threshold', 80)
+        mem_threshold = (target_config or {}).get('memory_threshold', 80)
 
         for i in range(1, len(metrics_history)):
             prev = metrics_history[i - 1]
@@ -338,6 +351,24 @@ class EnhancedReportService:
 
             ml_prediction = self._get_ml_prediction_for_spike(causal_ops)
 
+            # --- spike type classification ---
+            curr_cpu = curr.get('cpu_percent', 0)
+            curr_mem = curr.get('memory_percent', 0)
+            spike_type = 'delta_spike'
+
+            if curr_cpu >= cpu_threshold or curr_mem >= mem_threshold:
+                spike_type = 'threshold_breach'
+
+            ml_anomaly_match = next(
+                (a for a in detected_anomalies
+                 if a.get('type') == 'ml_anomaly'
+                 and isinstance(a.get('iteration'), int)
+                 and abs(a['iteration'] - spike_iter) <= 1),
+                None,
+            )
+            if ml_anomaly_match:
+                spike_type = 'ml_anomaly_deviation'
+
             # Count operations that ran around this iteration
             ops_in_window = [op for op in operations_history
                              if op.get('iteration') == spike_iter or
@@ -351,12 +382,16 @@ class EnhancedReportService:
                 'iteration': spike_iter,
                 'timestamp': spike_ts,
                 'cpu_before': prev.get('cpu_percent', 0),
-                'cpu_after': curr.get('cpu_percent', 0),
+                'cpu_after': curr_cpu,
                 'cpu_delta': round(cpu_delta, 2),
                 'memory_before': prev.get('memory_percent', 0),
-                'memory_after': curr.get('memory_percent', 0),
+                'memory_after': curr_mem,
                 'memory_delta': round(mem_delta, 2),
                 'risk_level': risk,
+                'spike_type': spike_type,
+                'threshold_cpu': cpu_threshold,
+                'threshold_memory': mem_threshold,
+                'ml_anomaly_score': (ml_anomaly_match or {}).get('score'),
                 'causal_operations': causal_ops,
                 'operation_count': ops_count,
                 'operations_success': ops_success,
@@ -375,6 +410,8 @@ class EnhancedReportService:
             'avg_recovery_minutes': round(avg_recovery, 1),
             'high_risk_count': sum(1 for s in spikes if s['risk_level'] == 'high'),
             'medium_risk_count': sum(1 for s in spikes if s['risk_level'] == 'medium'),
+            'threshold_breach_count': sum(1 for s in spikes if s.get('spike_type') == 'threshold_breach'),
+            'ml_anomaly_count': sum(1 for s in spikes if s.get('spike_type') == 'ml_anomaly_deviation'),
         }
 
     def _find_causal_operations(self, spike_ts: str, operations_history: List) -> List[Dict]:
@@ -399,6 +436,7 @@ class EnhancedReportService:
             diff = (spike_time - op_time).total_seconds()
             if 0 <= diff <= SPIKE_WINDOW_SECONDS:
                 causal.append({
+                    'timestamp': op_ts,
                     'entity_type': op.get('entity_type', 'unknown'),
                     'operation': op.get('operation', 'unknown'),
                     'entity_name': op.get('entity_name', 'unknown'),
@@ -896,11 +934,17 @@ class EnhancedReportService:
     #  3. FAILURE ROOT CAUSE GROUPING
     # ------------------------------------------------------------------
     def _group_failures(self, operations_history: List) -> Dict:
+        """Group failed operations by normalized error pattern.
+
+        Each group now includes ``sample_failures`` (first 5 individual
+        failures with full API details for drill-down) and
+        ``http_status_distribution`` (count of each HTTP status code).
+        """
         failed_ops = [op for op in operations_history if op.get('status') == 'FAILED']
         if not failed_ops:
-            return {'groups': [], 'total_failures': 0}
+            return {'groups': [], 'total_failures': 0, 'unique_patterns': 0}
 
-        groups = defaultdict(list)
+        groups: Dict[str, list] = defaultdict(list)
         for op in failed_ops:
             error = op.get('error', '') or op.get('error_message', '') or 'Unknown error'
             key = self._normalize_error(error)
@@ -910,10 +954,35 @@ class EnhancedReportService:
         for error_pattern, ops in sorted(groups.items(), key=lambda x: -len(x[1])):
             entity_types = list({op.get('entity_type', 'unknown') for op in ops})
             operations = list({op.get('operation', 'unknown') for op in ops})
-            timestamps = [op.get('timestamp', '') for op in ops if op.get('timestamp')]
+            timestamps = [op.get('start_time') or op.get('timestamp', '') for op in ops
+                          if op.get('start_time') or op.get('timestamp')]
 
             first_ts = min(timestamps) if timestamps else ''
             last_ts = max(timestamps) if timestamps else ''
+
+            # HTTP status distribution across this failure group
+            status_counter: Dict[str, int] = defaultdict(int)
+            for op in ops:
+                code = op.get('http_status_code')
+                status_counter[str(code) if code else 'N/A'] += 1
+
+            # First 5 failures with full API details for triage drill-down
+            sample_failures = []
+            for op in ops[:5]:
+                sample_failures.append({
+                    'entity_type': op.get('entity_type'),
+                    'operation': op.get('operation'),
+                    'entity_name': op.get('entity_name'),
+                    'api_url': op.get('api_url'),
+                    'http_method': op.get('http_method'),
+                    'http_status_code': op.get('http_status_code'),
+                    'request_payload': op.get('request_payload'),
+                    'response_body': op.get('response_body'),
+                    'error': (op.get('error') or '')[:500],
+                    'timestamp': op.get('start_time') or op.get('timestamp', ''),
+                    'duration_seconds': op.get('duration_seconds'),
+                    'iteration': op.get('iteration'),
+                })
 
             result_groups.append({
                 'error_pattern': error_pattern,
@@ -924,6 +993,8 @@ class EnhancedReportService:
                 'last_occurrence': last_ts,
                 'sample_error': (ops[0].get('error', '') or ops[0].get('error_message', ''))[:300],
                 'root_cause_hint': self._infer_root_cause(error_pattern, ops),
+                'http_status_distribution': dict(status_counter),
+                'sample_failures': sample_failures,
             })
 
         return {

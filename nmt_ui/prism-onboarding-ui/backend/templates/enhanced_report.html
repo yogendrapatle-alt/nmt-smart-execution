@@ -92,6 +92,32 @@
         .collapsible-content { display: none; }
         .collapsible-content.open { display: block; }
 
+        /* Accordion (failure drill-down) */
+        .accordion-toggle { cursor: pointer; user-select: none; transition: background .15s; }
+        .accordion-toggle:hover { background: #fef2f2 !important; }
+        .accordion-toggle .arrow { display: inline-block; transition: transform .2s; font-size: 12px; margin-right: 6px; }
+        .accordion-toggle.open .arrow { transform: rotate(90deg); }
+        .accordion-body { display: none; padding: 16px; background: #fafafa; border-top: 1px solid var(--border); }
+        .accordion-body.open { display: block; }
+        .api-detail { background: #1e293b; color: #e2e8f0; border-radius: 8px; padding: 12px 16px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; overflow-x: auto; margin: 6px 0; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; }
+        .api-detail .key { color: #7dd3fc; }
+        .api-detail .val { color: #fde68a; }
+        .status-pill { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 700; }
+        .status-pill.s2xx { background: #dcfce7; color: #166534; }
+        .status-pill.s4xx { background: #fef3c7; color: #92400e; }
+        .status-pill.s5xx { background: #fee2e2; color: #991b1b; }
+        .status-pill.sna  { background: #f1f5f9; color: #64748b; }
+
+        /* Spike-type badges */
+        .spike-type { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; margin-left: 8px; }
+        .spike-type.threshold_breach   { background: #fee2e2; color: #991b1b; }
+        .spike-type.ml_anomaly_deviation { background: #ede9fe; color: #5b21b6; }
+        .spike-type.delta_spike        { background: #fef3c7; color: #92400e; }
+
+        /* Anchor-linked stat card */
+        a.stat-card-link { text-decoration: none; color: inherit; display: block; }
+        a.stat-card-link:hover .stat-card { border-color: var(--blue); box-shadow: 0 2px 8px rgba(59,130,246,.15); }
+
         /* Print */
         @media print {
             body { background: white; }
@@ -138,11 +164,11 @@
             </p>
             <table>
                 <tr><td style="width:220px;font-weight:600;">Execution</td><td><code>{{ report_metadata.get('execution_id', execution_id) }}</code></td></tr>
-                <tr><td style="font-weight:600;">Generated (UTC)</td><td>{{ report_metadata.get('generated_at_utc', '—') }}</td></tr>
+                <tr><td style="font-weight:600;">Generated (UTC)</td><td>{{ report_metadata.get('generated_at_utc', '')|fmtts }}</td></tr>
                 <tr><td style="font-weight:600;">Metrics samples</td><td>{{ report_metadata.get('metrics_samples', 0) }}</td></tr>
                 <tr><td style="font-weight:600;">Operations recorded</td><td>{{ report_metadata.get('operations_recorded', 0) }}</td></tr>
                 {% if report_metadata.get('metrics_time_range') %}
-                <tr><td style="font-weight:600;">Metric time range</td><td>{{ report_metadata.metrics_time_range.first_timestamp }} → {{ report_metadata.metrics_time_range.last_timestamp }}</td></tr>
+                <tr><td style="font-weight:600;">Metric time range</td><td>{{ report_metadata.metrics_time_range.first_timestamp|fmtts }} → {{ report_metadata.metrics_time_range.last_timestamp|fmtts }}</td></tr>
                 {% endif %}
                 <tr><td style="font-weight:600;">Cluster health source</td><td><span class="badge badge-info">{{ report_metadata.get('cluster_health_source', 'unknown') }}</span></td></tr>
                 <tr><td style="font-weight:600;">Prometheus configured</td><td>{{ 'Yes' if report_metadata.get('prometheus_configured') else 'No' }}</td></tr>
@@ -152,16 +178,20 @@
     </div>
     {% endif %}
 
-    <!-- EXECUTIVE SUMMARY -->
+    <!-- EXECUTIVE SUMMARY (anchor-linked to detail sections) -->
     <div class="stat-grid">
+        <a class="stat-card-link" href="#ops-log">
         <div class="stat-card">
             <div class="stat-value" style="color: var(--blue);">{{ total_operations }}</div>
             <div class="stat-label">Total Operations</div>
         </div>
+        </a>
+        <a class="stat-card-link" href="#section-failures">
         <div class="stat-card">
             <div class="stat-value" style="color: {% if success_rate > 90 %}var(--pass){% elif success_rate > 70 %}var(--warn){% else %}var(--fail){% endif %};">{{ success_rate|round(1) }}%</div>
             <div class="stat-label">Success Rate</div>
         </div>
+        </a>
         <div class="stat-card">
             <div class="stat-value" style="color: var(--teal);">{{ duration_minutes|round(1) }}m</div>
             <div class="stat-label">Duration</div>
@@ -170,14 +200,18 @@
             <div class="stat-value" style="color: var(--purple);">{{ ops_per_minute|round(1) }}</div>
             <div class="stat-label">Ops / Min</div>
         </div>
+        <a class="stat-card-link" href="#section-spikes">
         <div class="stat-card">
             <div class="stat-value" style="color: var(--fail);">{{ spike_analysis.total_spikes }}</div>
             <div class="stat-label">Metric Spikes</div>
         </div>
+        </a>
+        <a class="stat-card-link" href="#section-restarts">
         <div class="stat-card">
             <div class="stat-value" style="color: {% if verdict.oom_kills > 0 %}var(--fail){% else %}var(--pass){% endif %};">{{ verdict.oom_kills }}</div>
             <div class="stat-label">OOM Kills</div>
         </div>
+        </a>
     </div>
 
     <!-- EXECUTION INFO -->
@@ -191,7 +225,9 @@
                 <tr><td style="width:200px;font-weight:600;">Execution ID</td><td><code>{{ execution_id }}</code></td></tr>
                 <tr><td style="font-weight:600;">Testbed</td><td>{{ testbed_label }}</td></tr>
                 <tr><td style="font-weight:600;">Status</td><td><span class="badge badge-{% if status == 'COMPLETED' %}pass{% elif status == 'FAILED' %}fail{% else %}warn{% endif %}">{{ status }}</span></td></tr>
-                <tr><td style="font-weight:600;">Period</td><td>{{ timestamp }}</td></tr>
+                <tr><td style="font-weight:600;">Started</td><td>🕐 <strong>{{ (start_time if start_time else timestamp)|fmtts }}</strong></td></tr>
+                {% if end_time %}<tr><td style="font-weight:600;">Ended</td><td>🕐 <strong>{{ end_time|fmtts }}</strong></td></tr>{% endif %}
+                <tr><td style="font-weight:600;">Duration</td><td>{{ duration_minutes|round(1) }} minutes</td></tr>
                 <tr><td style="font-weight:600;">Target CPU</td><td>{{ target_config.get('cpu_threshold', 'N/A') }}%</td></tr>
                 <tr><td style="font-weight:600;">Target Memory</td><td>{{ target_config.get('memory_threshold', 'N/A') }}%</td></tr>
                 <tr><td style="font-weight:600;">Stop Condition</td><td>{{ target_config.get('stop_condition', 'any')|upper }}</td></tr>
@@ -214,7 +250,7 @@
             </div>
             <table style="margin-top:16px;">
                 <tr>
-                    <th>Metric</th><th>Baseline</th><th>Final</th><th>Change</th>
+                    <th>Metric</th><th>Start</th><th>Final</th><th>Change</th>
                 </tr>
                 <tr>
                     <td><strong>CPU</strong></td>
@@ -241,9 +277,28 @@
         </div>
     </div>
 
+    <!-- PER-NODE METRICS — ONE CHART PER CLUSTER -->
+    <div class="card" id="section-per-node">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #8b5cf6, #6d28d9);">🖥️</div>
+            <h2>Physical Host Metrics</h2>
+        </div>
+        <div class="card-body">
+            <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">
+                CPU &amp; Memory per physical host. Solid&nbsp;=&nbsp;CPU, dashed&nbsp;=&nbsp;Memory. One chart per cluster.
+            </p>
+            <div id="perNodeTopologyBadge" style="margin-bottom:10px;"></div>
+            <div id="perNodeHostTable" style="margin-bottom:16px;"></div>
+            <div id="perNodeChartsContainer" style="max-height:900px;overflow-y:auto;"></div>
+            <p id="perNodeEmpty" style="color:var(--muted);text-align:center;padding:40px 0;display:none;">
+                Per-node metrics not available for this execution.
+            </p>
+        </div>
+    </div>
+
     <!-- AI SPIKE ANALYSIS -->
     {% if spike_analysis.spikes %}
-    <div class="card">
+    <div class="card" id="section-spikes">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">🔍</div>
             <h2>AI Spike Analysis ({{ spike_analysis.total_spikes }} detected)</h2>
@@ -262,12 +317,32 @@
                     <div class="stat-value" style="color:var(--teal);">{{ spike_analysis.avg_recovery_minutes }}m</div>
                     <div class="stat-label">Avg Recovery</div>
                 </div>
+                {% if spike_analysis.threshold_breach_count is defined %}
+                <div class="stat-card">
+                    <div class="stat-value" style="color:#991b1b;">{{ spike_analysis.threshold_breach_count }}</div>
+                    <div class="stat-label">Threshold Breaches</div>
+                </div>
+                {% endif %}
+                {% if spike_analysis.ml_anomaly_count is defined %}
+                <div class="stat-card">
+                    <div class="stat-value" style="color:#5b21b6;">{{ spike_analysis.ml_anomaly_count }}</div>
+                    <div class="stat-label">ML Anomalies</div>
+                </div>
+                {% endif %}
             </div>
 
             {% for spike in spike_analysis.spikes[:15] %}
             <div class="spike-card {{ spike.risk_level }}">
                 <div class="spike-header">
-                    <div class="spike-title">Spike #{{ spike.spike_number }} — Iteration {{ spike.iteration }}</div>
+                    <div class="spike-title">
+                        Spike #{{ spike.spike_number }} — Iteration {{ spike.iteration }}
+                        <span style="font-weight:400;color:var(--muted);font-size:13px;margin-left:8px;">🕐 {{ spike.timestamp|fmtts }}</span>
+                        {% if spike.spike_type %}
+                        <span class="spike-type {{ spike.spike_type }}">
+                            {% if spike.spike_type == 'threshold_breach' %}Threshold Breach{% elif spike.spike_type == 'ml_anomaly_deviation' %}ML Anomaly{% else %}Delta Spike{% endif %}
+                        </span>
+                        {% endif %}
+                    </div>
                     <span class="badge badge-{{ spike.risk_level }}">{{ spike.risk_level|upper }} RISK</span>
                 </div>
                 <div class="spike-details">
@@ -301,9 +376,10 @@
                 <div class="spike-ops">
                     <div class="spike-detail-label" style="margin-bottom:6px;">Causal Operations — {{ spike.causal_operations|length }} event(s) near this spike</div>
                     <table>
-                        <tr><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Timing</th></tr>
+                        <tr><th>Timestamp</th><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Timing</th></tr>
                         {% for op in spike.causal_operations[:5] %}
                         <tr>
+                            <td style="font-size:11px;color:var(--muted);white-space:nowrap;">{{ op.timestamp|fmtts }}</td>
                             <td>{{ op.entity_type }}</td>
                             <td>{{ op.operation }}</td>
                             <td><code>{{ op.entity_name[:40] }}</code></td>
@@ -340,29 +416,81 @@
 
     <!-- FAILURE ROOT CAUSE ANALYSIS -->
     {% if failure_analysis.total_failures > 0 %}
-    <div class="card">
+    <div class="card" id="section-failures">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #ef4444, #b91c1c);">🔴</div>
             <h2>Failure Root Cause Analysis ({{ failure_analysis.total_failures }} failures in {{ failure_analysis.unique_patterns }} patterns)</h2>
         </div>
         <div class="card-body">
             {% for group in failure_analysis.groups %}
-            <div style="border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:12px; border-left: 4px solid var(--fail);">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                    <strong>{{ group.count }}x — {{ group.entity_types|join(', ') }} {{ group.operations|join(', ') }}</strong>
-                    <span class="badge badge-fail">{{ group.count }} occurrences</span>
+            <div style="border:1px solid var(--border); border-radius:10px; margin-bottom:12px; border-left: 4px solid var(--fail); overflow:hidden;">
+                <div class="accordion-toggle" onclick="toggleAccordion(this)" style="padding:16px; display:flex; justify-content:space-between; align-items:center;">
+                    <div>
+                        <span class="arrow">▶</span>
+                        <strong>{{ group.count }}x — {{ group.entity_types|join(', ') }} {{ group.operations|join(', ') }}</strong>
+                    </div>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        {% if group.http_status_distribution %}
+                        {% for code, cnt in group.http_status_distribution.items() %}
+                        <span class="status-pill {% if code.startswith('2') %}s2xx{% elif code.startswith('4') %}s4xx{% elif code.startswith('5') %}s5xx{% else %}sna{% endif %}">{{ code }}: {{ cnt }}</span>
+                        {% endfor %}
+                        {% endif %}
+                        <span class="badge badge-fail">{{ group.count }} occurrences</span>
+                    </div>
                 </div>
-                <div style="color: var(--muted); font-size:13px; margin-bottom:6px;">
-                    <strong>Error:</strong> <code>{{ group.sample_error[:200] }}</code>
+                <div class="accordion-body">
+                    <div style="color: var(--muted); font-size:13px; margin-bottom:6px;">
+                        <strong>Error:</strong> <code>{{ group.sample_error[:200] }}</code>
+                    </div>
+                    <div style="background: #fef3c7; padding:8px 12px; border-radius:6px; font-size:13px; margin-bottom:12px;">
+                        <strong>Root Cause Hint:</strong> {{ group.root_cause_hint }}
+                    </div>
+                    {% if group.first_occurrence or group.last_occurrence %}
+                    <div style="color:var(--muted); font-size:12px; margin-bottom:12px;">
+                        🕐 First seen: <strong>{{ group.first_occurrence|fmtts }}</strong> · Last seen: <strong>{{ group.last_occurrence|fmtts }}</strong>
+                    </div>
+                    {% endif %}
+
+                    {% if group.sample_failures %}
+                    <div class="section-title" style="margin-top:8px;">Sample Failures ({{ group.sample_failures|length }} of {{ group.count }})</div>
+                    {% for sf in group.sample_failures %}
+                    <div style="border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:10px; background:white;">
+                        <div style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+                            <div>
+                                <strong>{{ sf.entity_type }}.{{ sf.operation }}</strong>
+                                {% if sf.entity_name %}<code style="margin-left:6px;">{{ sf.entity_name[:40] }}</code>{% endif %}
+                                <span style="color:var(--muted);font-size:11px;margin-left:8px;">🕐 {{ sf.timestamp|fmtts }}{% if sf.iteration is defined %} · Iter #{{ sf.iteration }}{% endif %}</span>
+                            </div>
+                            <div style="display:flex; gap:6px; align-items:center;">
+                                {% if sf.http_status_code %}
+                                <span class="status-pill {% if sf.http_status_code >= 200 and sf.http_status_code < 300 %}s2xx{% elif sf.http_status_code >= 400 and sf.http_status_code < 500 %}s4xx{% elif sf.http_status_code >= 500 %}s5xx{% else %}sna{% endif %}">HTTP {{ sf.http_status_code }}</span>
+                                {% endif %}
+                                {% if sf.http_method %}<span class="badge badge-info">{{ sf.http_method }}</span>{% endif %}
+                                {% if sf.duration_seconds %}<span style="color:var(--muted);font-size:12px;">{{ sf.duration_seconds|round(2) }}s</span>{% endif %}
+                            </div>
+                        </div>
+                        {% if sf.api_url %}
+                        <div style="font-size:12px; color:var(--muted); margin-bottom:4px;"><strong>URL:</strong> <code>{{ sf.api_url }}</code></div>
+                        {% endif %}
+                        {% if sf.error %}
+                        <div style="font-size:12px; color:#991b1b; margin-bottom:4px;"><strong>Error:</strong> {{ sf.error[:300] }}</div>
+                        {% endif %}
+                        {% if sf.request_payload %}
+                        <details style="margin-top:4px;">
+                            <summary style="cursor:pointer; font-size:12px; font-weight:600; color:var(--muted);">Request Payload</summary>
+                            <div class="api-detail">{{ sf.request_payload }}</div>
+                        </details>
+                        {% endif %}
+                        {% if sf.response_body %}
+                        <details style="margin-top:4px;">
+                            <summary style="cursor:pointer; font-size:12px; font-weight:600; color:var(--muted);">Response Body</summary>
+                            <div class="api-detail">{{ sf.response_body }}</div>
+                        </details>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+                    {% endif %}
                 </div>
-                <div style="background: #fef3c7; padding:8px 12px; border-radius:6px; font-size:13px;">
-                    <strong>Root Cause Hint:</strong> {{ group.root_cause_hint }}
-                </div>
-                {% if group.first_occurrence %}
-                <div style="color:var(--muted); font-size:12px; margin-top:6px;">
-                    First: {{ group.first_occurrence }} | Last: {{ group.last_occurrence }}
-                </div>
-                {% endif %}
             </div>
             {% endfor %}
         </div>
@@ -420,8 +548,8 @@
     </div>
     {% endif %}
 
-    <!-- QA HEALTH ASSESSMENT -->
-    {% if health_assessment and health_assessment.findings %}
+    <!-- QA HEALTH ASSESSMENT (deprecated — hidden when _deprecated flag is set) -->
+    {% if health_assessment and health_assessment.findings and not health_assessment.get('_deprecated') %}
     <div class="card">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, {% if health_assessment.overall_status == 'CRITICAL' %}#ef4444, #dc2626{% elif health_assessment.overall_status == 'DEGRADED' %}#f59e0b, #d97706{% elif health_assessment.overall_status == 'ATTENTION' %}#f59e0b, #eab308{% else %}#22c55e, #16a34a{% endif %});">🔍</div>
@@ -466,8 +594,8 @@
     </div>
     {% endif %}
 
-    <!-- POD STABILITY SCORES -->
-    {% if pod_stability %}
+    <!-- POD STABILITY SCORES (deprecated — redundant with Pod Restarts During Execution) -->
+    {% if pod_stability and not (health_assessment and health_assessment.get('_deprecated')) %}
     <div class="card">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #14b8a6, #0d9488);">🛡️</div>
@@ -542,7 +670,7 @@
 
     <!-- POD RESTARTS DURING EXECUTION (Continuous Monitoring) -->
     {% if pod_restart_tracking and pod_restart_tracking.total_restarts_during_execution is defined and pod_restart_tracking.total_restarts_during_execution > 0 %}
-    <div class="card">
+    <div class="card" id="section-restarts">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">🔄</div>
             <h2>Pod Restarts During Execution</h2>
@@ -569,7 +697,7 @@
                 <thead>
                     <tr>
                         <th>Pod</th><th>Namespace</th><th>Container</th>
-                        <th>Restarts During Execution</th><th>Baseline</th><th>Current Total</th><th>Last Seen</th>
+                        <th>Restarts During Execution</th><th>Reason</th><th>Baseline</th><th>Current Total</th><th>Last Seen</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -581,9 +709,14 @@
                         <td>
                             <span class="badge {% if ps.delta > 3 %}badge-fail{% elif ps.delta > 1 %}badge-warn{% else %}badge-info{% endif %}">+{{ ps.delta }}</span>
                         </td>
+                        <td>
+                            {% if ps.restart_reason %}
+                            <span class="badge {% if ps.restart_reason == 'OOMKilled' %}badge-fail{% elif ps.restart_reason == 'Error' %}badge-warn{% else %}badge-info{% endif %}">{{ ps.restart_reason }}</span>
+                            {% else %}—{% endif %}
+                        </td>
                         <td style="color:#64748b;">{{ ps.baseline }}</td>
                         <td><strong>{{ ps.current }}</strong></td>
-                        <td style="font-size:0.85em;color:#64748b;">{{ ps.last_seen[:19] }}</td>
+                        <td style="font-size:0.85em;font-weight:600;color:#64748b;">🕐 {{ ps.last_seen|fmtts }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -596,19 +729,35 @@
                 <thead>
                     <tr>
                         <th>Time</th><th>Pod</th><th>Namespace</th><th>Container</th>
-                        <th>New Restarts</th><th>Total Since Start</th><th>Execution Elapsed</th>
+                        <th>New Restarts</th><th>Reason</th><th>Exit Code</th><th>Total Since Start</th><th>Elapsed</th><th>Logs</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for ev in pod_restart_tracking.restart_events %}
                     <tr>
-                        <td style="font-size:0.85em;">{{ ev.detected_at[:19] }}</td>
+                        <td style="font-size:0.85em;font-weight:600;white-space:nowrap;">🕐 {{ ev.detected_at|fmtts }}</td>
                         <td><code>{{ ev.pod[:35] }}</code></td>
                         <td>{{ ev.namespace }}</td>
                         <td>{{ ev.container }}</td>
                         <td><span class="badge badge-warn">+{{ ev.new_restarts }}</span></td>
+                        <td>
+                            {% if ev.restart_reason %}
+                            <span class="badge {% if ev.restart_reason == 'OOMKilled' %}badge-fail{% elif ev.restart_reason == 'Error' %}badge-warn{% else %}badge-info{% endif %}">{{ ev.restart_reason }}</span>
+                            {% else %}—{% endif %}
+                        </td>
+                        <td>
+                            {% if ev.exit_code is defined and ev.exit_code is not none %}
+                            <span class="badge {% if ev.exit_code == 137 %}badge-fail{% elif ev.exit_code == 0 %}badge-pass{% else %}badge-warn{% endif %}">{{ ev.exit_code }}</span>
+                            {% else %}—{% endif %}
+                        </td>
                         <td>{{ ev.total_since_start }}</td>
                         <td>{{ ev.execution_elapsed_min }} min</td>
+                        <td>
+                            {% if ev.log_snippet %}
+                            <button class="toggle-btn" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none';" style="font-size:0.8em;padding:2px 8px;cursor:pointer;border:1px solid #cbd5e1;border-radius:4px;background:#f8fafc;">View</button>
+                            <pre style="display:none;max-height:200px;overflow:auto;font-size:0.78em;background:#1e293b;color:#e2e8f0;padding:8px;border-radius:6px;margin-top:4px;white-space:pre-wrap;word-break:break-all;">{{ ev.log_snippet }}</pre>
+                            {% else %}—{% endif %}
+                        </td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -678,18 +827,20 @@
             <h2>Pod Restart Timeline</h2>
         </div>
         <div class="card-body">
-            <p style="color:var(--muted);margin-bottom:16px;">Most recent container terminations (last terminated timestamp from Prometheus).</p>
+            <p style="color:var(--muted);margin-bottom:16px;">Most recent container terminations. All timestamps are in UTC.</p>
             <table>
                 <thead>
-                    <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Last Terminated At</th></tr>
+                    <tr><th>Terminated At</th><th>Pod</th><th>Namespace</th><th>Container</th><th>Reason</th><th>Exit Code</th></tr>
                 </thead>
                 <tbody>
                     {% for rt in restart_timestamps[:20] %}
                     <tr>
+                        <td style="white-space:nowrap;font-weight:600;font-size:12px;">🕐 {{ rt.last_terminated_at|fmtts }}</td>
                         <td><code>{{ rt.pod[:40] }}</code></td>
                         <td>{{ rt.namespace }}</td>
                         <td>{{ rt.container }}</td>
-                        <td>{{ rt.last_terminated_at }}</td>
+                        <td>{% if rt.reason %}<span class="badge badge-{% if rt.reason == 'OOMKilled' %}fail{% else %}warn{% endif %}">{{ rt.reason }}</span>{% else %}—{% endif %}</td>
+                        <td>{% if rt.exit_code is defined and rt.exit_code is not none %}<span class="badge badge-{% if rt.exit_code == 137 %}fail{% elif rt.exit_code == 0 %}pass{% else %}warn{% endif %}">{{ rt.exit_code }}</span>{% else %}—{% endif %}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -913,8 +1064,8 @@
     </div>
     {% endif %}
 
-    <!-- CAPACITY PLANNING -->
-    {% if capacity_planning.available %}
+    <!-- CAPACITY PLANNING (deprecated — estimates were unreliable) -->
+    {% if capacity_planning.available and not (health_assessment and health_assessment.get('_deprecated')) %}
     <div class="card">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #a855f7, #7c3aed);">📐</div>
@@ -1015,7 +1166,7 @@
                         {% for it in iteration_timeline.iterations %}
                         <tr style="{% if it.is_spike %}background: #fffbeb;{% endif %}">
                             <td><strong>#{{ it.iteration }}</strong></td>
-                            <td class="text-muted" style="font-size:12px;">{{ it.timestamp[:19] if it.timestamp else '-' }}</td>
+                            <td class="text-muted" style="font-size:12px;">{{ it.timestamp|fmtts }}</td>
                             <td>{{ it.cpu }}%</td>
                             <td>{{ it.memory }}%</td>
                             <td>{{ '%+.1f'|format(it.cpu_delta) }}%</td>
@@ -1147,15 +1298,22 @@
             <div class="card-body" style="padding:0;">
                 <div style="max-height:600px; overflow-y:auto;">
                     <table>
-                        <thead><tr><th>#</th><th>Iter</th><th>Entity</th><th>Operation</th><th>Name</th><th>Duration</th><th>Status</th></tr></thead>
+                        <thead><tr><th>#</th><th>Timestamp</th><th>Iter</th><th>Entity</th><th>Operation</th><th>Name</th><th>HTTP</th><th>Duration</th><th>Status</th></tr></thead>
                         <tbody>
                             {% for op in operations_history %}
                             <tr>
                                 <td>{{ loop.index }}</td>
+                                <td style="font-size:11px;white-space:nowrap;color:var(--muted);">{{ op.get('timestamp', '')|fmtts }}</td>
                                 <td>{{ op.get('iteration', '—') }}</td>
                                 <td>{{ op.get('entity_type', 'N/A') }}</td>
                                 <td>{{ op.get('operation', 'N/A') }}</td>
                                 <td><code>{{ op.get('entity_name', 'N/A')[:40] }}</code></td>
+                                <td>
+                                    {% set hcode = op.get('http_status_code') %}
+                                    {% if hcode %}
+                                    <span class="status-pill {% if hcode >= 200 and hcode < 300 %}s2xx{% elif hcode >= 400 and hcode < 500 %}s4xx{% elif hcode >= 500 %}s5xx{% else %}sna{% endif %}">{{ hcode }}</span>
+                                    {% else %}—{% endif %}
+                                </td>
                                 <td>{{ op.get('duration_seconds', 0)|round(2) }}s</td>
                                 <td><span class="badge badge-{% if op.get('status') == 'SUCCESS' %}pass{% else %}fail{% endif %}">{{ op.get('status', '?') }}</span></td>
                             </tr>
@@ -1169,7 +1327,7 @@
 
     <!-- FOOTER -->
     <div class="report-footer">
-        Generated by <strong>NMT Smart Execution Tool (Enhanced AI Report)</strong> — {{ timestamp }}
+        Generated by <strong>NMT Smart Execution Tool (Enhanced AI Report)</strong> — {{ timestamp|fmtts }}
     </div>
 </div>
 
@@ -1179,6 +1337,14 @@ function toggleSection(id) {
     el.classList.toggle('open');
 }
 
+function toggleAccordion(header) {
+    header.classList.toggle('open');
+    var body = header.nextElementSibling;
+    if (body && body.classList.contains('accordion-body')) {
+        body.classList.toggle('open');
+    }
+}
+
 // Build Timeline Chart
 (function() {
     var metricsHistory = {{ metrics_history_json|safe }};
@@ -1186,7 +1352,10 @@ function toggleSection(id) {
 
     if (!metricsHistory || metricsHistory.length === 0) return;
 
-    var labels = metricsHistory.map(function(m, i) { return 'Iter ' + (m.iteration || i + 1); });
+    var labels = metricsHistory.map(function(m, i) {
+        if (m.timestamp) { try { return new Date(m.timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}); } catch(e) {} }
+        return '#' + (m.iteration || i + 1);
+    });
     var cpuData = metricsHistory.map(function(m) { return m.cpu_percent || 0; });
     var memData = metricsHistory.map(function(m) { return m.memory_percent || 0; });
 
@@ -1293,6 +1462,141 @@ function toggleSection(id) {
                 legend: { position: 'top' }
             }
         }
+    });
+})();
+
+// Per-Node Metrics — one chart per cluster
+(function() {
+    var metricsHistory = {{ metrics_history_json|safe }};
+    if (!metricsHistory || metricsHistory.length === 0) {
+        var emptyEl = document.getElementById('perNodeEmpty');
+        if (emptyEl) emptyEl.style.display = 'block';
+        return;
+    }
+
+    var clusterPalette = ['#3b82f6','#ef4444','#22c55e','#f59e0b','#8b5cf6','#06b6d4','#ec4899','#84cc16'];
+    var nodePalette = ['#3b82f6','#ef4444','#22c55e','#f59e0b','#8b5cf6','#06b6d4','#ec4899','#84cc16','#14b8a6','#a855f7','#f97316','#64748b'];
+
+    var nodeCluster = {};
+    var nodeLabel = {};
+    metricsHistory.forEach(function(m) {
+        (m.per_node || []).forEach(function(n) {
+            var id = n.node_id || n.name || 'unknown';
+            if (!nodeCluster[id]) {
+                nodeCluster[id] = n.cluster_name || '';
+                nodeLabel[id] = n.name || id;
+            }
+        });
+    });
+    var allNodeIds = Object.keys(nodeCluster);
+    if (allNodeIds.length === 0) {
+        var emptyEl2 = document.getElementById('perNodeEmpty');
+        if (emptyEl2) emptyEl2.style.display = 'block';
+        return;
+    }
+
+    var clusterNamesSet = {};
+    allNodeIds.forEach(function(id) { if (nodeCluster[id]) clusterNamesSet[nodeCluster[id]] = true; });
+    var clusterNames = Object.keys(clusterNamesSet);
+    if (clusterNames.length === 0) clusterNames.push('');
+    var clusterColorMap = {};
+    clusterNames.forEach(function(cn, i) { clusterColorMap[cn] = clusterPalette[i % clusterPalette.length]; });
+
+    // Time labels
+    var timeLabels = metricsHistory.map(function(m, i) {
+        if (m.timestamp) { try { return new Date(m.timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}); } catch(e) {} }
+        return '#' + (m.iteration || i + 1);
+    });
+
+    // Build per-node data
+    var nodeData = {};
+    allNodeIds.forEach(function(id) { nodeData[id] = { cpu: [], mem: [] }; });
+    metricsHistory.forEach(function(m) {
+        var seen = {};
+        (m.per_node || []).forEach(function(n) {
+            var id = n.node_id || n.name || 'unknown';
+            if (nodeData[id]) {
+                seen[id] = true;
+                nodeData[id].cpu.push(n.cpu_percent || 0);
+                nodeData[id].mem.push(n.memory_percent || 0);
+            }
+        });
+        allNodeIds.forEach(function(id) { if (!seen[id]) { nodeData[id].cpu.push(null); nodeData[id].mem.push(null); } });
+    });
+
+    // Topology badge
+    var topoType = clusterNames.length > 1 ? 'Multi-Cluster' : (allNodeIds.length > 1 ? 'Multi-Node' : 'Single Node');
+    var badgeEl = document.getElementById('perNodeTopologyBadge');
+    if (badgeEl) {
+        badgeEl.innerHTML = '<span style="display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;background:#e0f2fe;color:#0369a1;margin-right:8px;">' + topoType + '</span>' +
+            '<span style="font-size:12px;color:#64748b;">' + allNodeIds.length + ' host(s)' + (clusterNames.length > 1 ? ' across ' + clusterNames.length + ' clusters' : '') + '</span>';
+    }
+
+    // Host summary table
+    var tableEl = document.getElementById('perNodeHostTable');
+    if (tableEl) {
+        var lastSample = metricsHistory[metricsHistory.length - 1];
+        var lastNodes = {};
+        (lastSample && lastSample.per_node || []).forEach(function(n) { lastNodes[n.node_id || n.name || 'unknown'] = n; });
+        var tHtml = '<table><thead><tr><th>Cluster</th><th>Host</th><th>CPU %</th><th style="width:120px"></th><th>Memory %</th><th style="width:120px"></th></tr></thead><tbody>';
+        allNodeIds.forEach(function(id) {
+            var n = lastNodes[id] || {};
+            var cpu = (n.cpu_percent || nodeData[id].cpu.slice(-1)[0] || 0).toFixed(1);
+            var mem = (n.memory_percent || nodeData[id].mem.slice(-1)[0] || 0).toFixed(1);
+            var cpuColor = cpu > 80 ? '#ef4444' : cpu > 50 ? '#f59e0b' : '#22c55e';
+            var memColor = mem > 80 ? '#ef4444' : mem > 50 ? '#f59e0b' : '#22c55e';
+            tHtml += '<tr><td><span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;background:' + (clusterColorMap[nodeCluster[id]] || '#64748b') + ';color:white;">' + (nodeCluster[id] || 'N/A') + '</span></td>';
+            tHtml += '<td style="font-weight:600;">' + nodeLabel[id] + '</td>';
+            tHtml += '<td style="font-weight:700;color:' + cpuColor + ';">' + cpu + '%</td>';
+            tHtml += '<td><div style="background:#e2e8f0;border-radius:4px;height:8px;width:100%;"><div style="background:' + cpuColor + ';border-radius:4px;height:8px;width:' + Math.min(cpu, 100) + '%;"></div></div></td>';
+            tHtml += '<td style="font-weight:700;color:' + memColor + ';">' + mem + '%</td>';
+            tHtml += '<td><div style="background:#e2e8f0;border-radius:4px;height:8px;width:100%;"><div style="background:' + memColor + ';border-radius:4px;height:8px;width:' + Math.min(mem, 100) + '%;"></div></div></td></tr>';
+        });
+        tHtml += '</tbody></table>';
+        tableEl.innerHTML = tHtml;
+    }
+
+    // One chart per cluster
+    var container = document.getElementById('perNodeChartsContainer');
+    if (!container) return;
+    clusterNames.forEach(function(cname, ci) {
+        var cNodes = allNodeIds.filter(function(id) { return nodeCluster[id] === cname; });
+        if (cNodes.length === 0) return;
+
+        var wrapper = document.createElement('div');
+        wrapper.style.cssText = 'border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px;border-left:4px solid ' + (clusterColorMap[cname] || '#64748b');
+        wrapper.innerHTML = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">' +
+            '<span style="width:12px;height:12px;border-radius:50%;background:' + (clusterColorMap[cname] || '#64748b') + ';display:inline-block;"></span>' +
+            '<strong>' + (cname || 'Cluster') + '</strong>' +
+            '<span style="font-size:10px;color:#64748b;background:#f1f5f9;padding:2px 8px;border-radius:10px;">' + cNodes.length + ' host' + (cNodes.length !== 1 ? 's' : '') + '</span></div>';
+        var chartDiv = document.createElement('div');
+        chartDiv.style.cssText = 'position:relative;height:250px;width:100%;';
+        var canvas = document.createElement('canvas');
+        chartDiv.appendChild(canvas);
+        wrapper.appendChild(chartDiv);
+        container.appendChild(wrapper);
+
+        var datasets = [];
+        cNodes.forEach(function(id, ni) {
+            var c = nodePalette[ni % nodePalette.length];
+            datasets.push({ label: nodeLabel[id] + ' CPU', data: nodeData[id].cpu, borderColor: c, backgroundColor: 'transparent', borderWidth: 2, pointRadius: 1, tension: 0.3, borderDash: [] });
+            datasets.push({ label: nodeLabel[id] + ' Mem', data: nodeData[id].mem, borderColor: c, backgroundColor: 'transparent', borderWidth: 2, pointRadius: 1, tension: 0.3, borderDash: [5, 3] });
+        });
+
+        new Chart(canvas.getContext('2d'), {
+            type: 'line',
+            data: { labels: timeLabels, datasets: datasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                scales: {
+                    y: { min: 0, max: 100, title: { display: true, text: 'Usage %' } },
+                    x: { ticks: { maxTicksLimit: 20, font: { size: 9 } } }
+                },
+                plugins: { legend: { position: 'bottom', maxHeight: 50, labels: { font: { size: 9 }, usePointStyle: true, boxWidth: 8, padding: 8 } } }
+            }
+        });
     });
 })();
 </script>

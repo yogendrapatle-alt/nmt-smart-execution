@@ -193,6 +193,24 @@ interface EnhancedReport {
   };
 }
 
+function fmtTs(raw: string | number | undefined | null): string {
+  if (!raw) return '—';
+  try {
+    const d = new Date(typeof raw === 'number' ? raw * 1000 : raw);
+    if (isNaN(d.getTime())) return String(raw).substring(0, 19);
+    return d.toLocaleString([], { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch { return String(raw).substring(0, 19); }
+}
+
+function fmtTime(raw: string | number | undefined | null): string {
+  if (!raw) return '—';
+  try {
+    const d = new Date(typeof raw === 'number' ? raw * 1000 : raw);
+    if (isNaN(d.getTime())) return String(raw).substring(0, 19);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch { return String(raw).substring(0, 19); }
+}
+
 function csvEscapeCell(val: string): string {
   if (/[",\n\r]/.test(val)) return `"${val.replace(/"/g, '""')}"`;
   return val;
@@ -278,10 +296,13 @@ const SmartExecutionReport: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'overview' | 'spikes' | 'health' | 'failures' | 'capacity' | 'iterations' | 'heatmap' | 'latency' | 'errors'>('overview');
   const [expandedIterations, setExpandedIterations] = useState<Set<number>>(new Set());
   const [expandedEffectiveOps, setExpandedEffectiveOps] = useState<Set<string>>(new Set());
+  const [podEvents, setPodEvents] = useState<any[]>([]);
+  const [expandedLogSnippets, setExpandedLogSnippets] = useState<Set<number>>(new Set());
 
   useEffect(() => {
     fetchReport();
     fetchEnhancedReport();
+    fetchPodEvents();
   }, [executionId]);
 
   const fetchReport = async () => {
@@ -323,6 +344,19 @@ const SmartExecutionReport: React.FC = () => {
     } catch (err) {
       console.warn('Enhanced report fetch failed:', err);
       setEnhancedUnavailable(true);
+    }
+  };
+
+  const fetchPodEvents = async () => {
+    try {
+      const response = await fetch(`${getApiBase()}/api/smart-execution/${executionId}/pod-events?per_page=200`);
+      if (!response.ok) return;
+      const data = await response.json();
+      if (data.success && data.pod_events) {
+        setPodEvents(data.pod_events);
+      }
+    } catch {
+      // non-fatal
     }
   };
 
@@ -635,8 +669,34 @@ const SmartExecutionReport: React.FC = () => {
                   <span className="small text-muted fw-semibold">Duration</span>
                 </div>
                 <div className="fw-semibold">{formatDuration(report.duration_minutes || 0)}</div>
+                {report.end_time && (
+                  <div className="text-muted" style={{ fontSize: 11 }}>Ended: {formatDate(report.end_time)}</div>
+                )}
               </div>
             </div>
+            {/* Topology row */}
+            {(() => {
+              const topo = report.testbed_topology || (report as any).full_execution_data?.testbed_topology;
+              if (!topo || !topo.total_hosts) return null;
+              const topoLabel: Record<string, string> = { single_node: 'Single Node', multi_node: 'Multi-Node', multi_cluster: 'Multi-Cluster' };
+              return (
+                <div className="border-top pt-3 mt-3">
+                  <div className="d-flex align-items-center gap-2 flex-wrap">
+                    <i className="material-icons-outlined text-success" style={{ fontSize: 18 }}>account_tree</i>
+                    <span className="small fw-semibold text-muted">Topology:</span>
+                    <span className="badge bg-success bg-opacity-10 text-success rounded-pill" style={{ fontSize: 11 }}>
+                      {topoLabel[topo.topology_type] || topo.topology_type}
+                    </span>
+                    <span className="small text-muted">{topo.total_clusters} cluster{topo.total_clusters !== 1 ? 's' : ''}, {topo.total_hosts} host{topo.total_hosts !== 1 ? 's' : ''}</span>
+                    {(topo.clusters || []).map((c: any) => (
+                      <span key={c.name} className="badge bg-light text-dark rounded-pill" style={{ fontSize: 10 }}>
+                        {c.name}: {c.host_count} host{c.host_count !== 1 ? 's' : ''}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
 
@@ -676,7 +736,9 @@ const SmartExecutionReport: React.FC = () => {
                   </div>
                 </div>
                 <p className="mb-0" style={{ lineHeight: 1.7, color: '#334155' }}>
-                  This execution ran for <strong>{durStr}</strong> on testbed <strong>{testbed}</strong>, executing <strong>{ops} operations</strong> ({rate}% success rate).
+                  This execution ran for <strong>{durStr}</strong> on testbed <strong>{testbed}</strong>
+                  {report.start_time && <> (started <strong>{fmtTs(report.start_time)}</strong>{report.end_time && <>, ended <strong>{fmtTs(report.end_time)}</strong></>})</>}
+                  , executing <strong>{ops} operations</strong> ({rate}% success rate).
                   {failedOps > 0 && <> <strong>{failedOps} operations failed.</strong></>}
                   {' '}CPU reached <strong>{cpuFinal}%</strong> against a target of {cpuTarget}%, and memory reached <strong>{memFinal}%</strong> against a target of {memTarget}%.
                   {spikeCount > 0 && <> The cluster experienced <strong>{spikeCount} resource spike{spikeCount > 1 ? 's' : ''}</strong>.</>}
@@ -688,10 +750,10 @@ const SmartExecutionReport: React.FC = () => {
           );
         })()}
 
-        {/* Executive Summary Cards */}
+        {/* Executive Summary Cards — clickable drill-down to relevant tabs */}
         <div className="row g-3 mb-3">
-          <div className="col-md-3">
-            <div className="card rounded-4 shadow-none border h-100" style={{ borderLeft: '4px solid #667eea' }}>
+          <div className="col-md-3" onClick={() => setActiveTab('iterations')} style={{ cursor: 'pointer' }} title="Click to view iteration timeline">
+            <div className="card rounded-4 shadow-none border h-100 card-hover-lift" style={{ borderLeft: '4px solid #667eea' }}>
               <div className="card-body p-4 text-center">
                 <div className="d-inline-flex align-items-center justify-content-center rounded-3 mb-3" style={{
                   width: 56,
@@ -702,11 +764,12 @@ const SmartExecutionReport: React.FC = () => {
                 </div>
                 <h1 className="display-5 fw-bold text-primary mb-2">{report.total_operations || 0}</h1>
                 <p className="text-muted mb-0 fw-semibold">Total Operations</p>
+                <span className="badge bg-light text-muted mt-2" style={{ fontSize: 10 }}>Click to drill down</span>
               </div>
             </div>
           </div>
-          <div className="col-md-3">
-            <div className="card rounded-4 shadow-none border h-100" style={{ borderLeft: '4px solid #28a745' }}>
+          <div className="col-md-3" onClick={() => setActiveTab('latency')} style={{ cursor: 'pointer' }} title="Click to view latency breakdown">
+            <div className="card rounded-4 shadow-none border h-100 card-hover-lift" style={{ borderLeft: '4px solid #28a745' }}>
               <div className="card-body p-4 text-center">
                 <div className="d-inline-flex align-items-center justify-content-center rounded-3 mb-3" style={{
                   width: 56,
@@ -717,11 +780,12 @@ const SmartExecutionReport: React.FC = () => {
                 </div>
                 <h1 className="display-5 fw-bold text-success mb-2">{(report.success_rate || 0).toFixed(1)}%</h1>
                 <p className="text-muted mb-0 fw-semibold">Success Rate</p>
+                <span className="badge bg-light text-muted mt-2" style={{ fontSize: 10 }}>Click to drill down</span>
               </div>
             </div>
           </div>
-          <div className="col-md-3">
-            <div className="card rounded-4 shadow-none border h-100" style={{ borderLeft: '4px solid #17a2b8' }}>
+          <div className="col-md-3" onClick={() => setActiveTab('heatmap')} style={{ cursor: 'pointer' }} title="Click to view operation heatmap">
+            <div className="card rounded-4 shadow-none border h-100 card-hover-lift" style={{ borderLeft: '4px solid #17a2b8' }}>
               <div className="card-body p-4 text-center">
                 <div className="d-inline-flex align-items-center justify-content-center rounded-3 mb-3" style={{
                   width: 56,
@@ -732,11 +796,12 @@ const SmartExecutionReport: React.FC = () => {
                 </div>
                 <h1 className="display-5 fw-bold text-info mb-2">{(report.operations_per_minute || 0).toFixed(1)}</h1>
                 <p className="text-muted mb-0 fw-semibold">Ops/Min</p>
+                <span className="badge bg-light text-muted mt-2" style={{ fontSize: 10 }}>Click to drill down</span>
               </div>
             </div>
           </div>
-          <div className="col-md-3">
-            <div className="card rounded-4 shadow-none border h-100" style={{ borderLeft: '4px solid #ffc107' }}>
+          <div className="col-md-3" onClick={() => setActiveTab('failures')} style={{ cursor: 'pointer' }} title="Click to view failure analysis">
+            <div className="card rounded-4 shadow-none border h-100 card-hover-lift" style={{ borderLeft: '4px solid #ffc107' }}>
               <div className="card-body p-4 text-center">
                 <div className="d-inline-flex align-items-center justify-content-center rounded-3 mb-3" style={{
                   width: 56,
@@ -747,6 +812,7 @@ const SmartExecutionReport: React.FC = () => {
                 </div>
                 <h1 className="display-5 fw-bold text-warning mb-2">{report.failed_operations || 0}</h1>
                 <p className="text-muted mb-0 fw-semibold">Failed Ops</p>
+                <span className="badge bg-light text-muted mt-2" style={{ fontSize: 10 }}>Click to drill down</span>
               </div>
             </div>
           </div>
@@ -776,9 +842,9 @@ const SmartExecutionReport: React.FC = () => {
                 </ul>
               )}
               <div className="d-flex gap-3 mt-2 flex-wrap">
-                <span className="badge bg-dark bg-opacity-10 text-dark">OOM Kills: {enhanced.verdict.oom_kills}</span>
-                <span className="badge bg-dark bg-opacity-10 text-dark">Restarts: {enhanced.verdict.container_restarts}</span>
-                <span className="badge bg-dark bg-opacity-10 text-dark">High-Risk Spikes: {enhanced.verdict.high_risk_spikes}</span>
+                <span className="badge bg-dark bg-opacity-10 text-dark" style={{ cursor: 'pointer' }} onClick={() => setActiveTab('health')} title="View cluster health details">OOM Kills: {enhanced.verdict.oom_kills} ↗</span>
+                <span className="badge bg-dark bg-opacity-10 text-dark" style={{ cursor: 'pointer' }} onClick={() => setActiveTab('health')} title="View pod restart details">Restarts: {enhanced.verdict.container_restarts} ↗</span>
+                <span className="badge bg-dark bg-opacity-10 text-dark" style={{ cursor: 'pointer' }} onClick={() => setActiveTab('spikes')} title="View spike analysis">High-Risk Spikes: {enhanced.verdict.high_risk_spikes} ↗</span>
               </div>
             </div>
           </div>
@@ -833,7 +899,10 @@ const SmartExecutionReport: React.FC = () => {
                     const sampled = mh.filter((_: any, i: number) => i % step === 0);
                     const cpuD = sampled.map((m: any) => parseFloat((m.cpu_percent ?? m.cpu ?? 0).toFixed(1)));
                     const memD = sampled.map((m: any) => parseFloat((m.memory_percent ?? m.memory ?? 0).toFixed(1)));
-                    const cats = sampled.map((_: any, i: number) => `${i + 1}`);
+                    const cats = sampled.map((m: any, i: number) => {
+                      if (m.timestamp) { try { return new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch {} }
+                      return `#${m.iteration || i + 1}`;
+                    });
                     return (
                       <div className="mb-4">
                         <div className="d-flex align-items-center gap-2 mb-2">
@@ -855,7 +924,7 @@ const SmartExecutionReport: React.FC = () => {
                             dataLabels: { enabled: false },
                             stroke: { curve: 'smooth', width: 2 },
                             fill: { type: 'gradient', gradient: { shadeIntensity: 1, opacityFrom: 0.3, opacityTo: 0.05, stops: [0, 100] } },
-                            xaxis: { categories: cats, labels: { show: false }, axisBorder: { show: false }, axisTicks: { show: false } },
+                            xaxis: { categories: cats, labels: { show: sampled.length <= 30, rotate: -45, style: { fontSize: '9px' } }, axisBorder: { show: false }, axisTicks: { show: false } },
                             yaxis: { min: 0, max: 100, labels: { formatter: (v: number) => `${v.toFixed(0)}%` } },
                             annotations: {
                               yaxis: [
@@ -863,11 +932,149 @@ const SmartExecutionReport: React.FC = () => {
                                 { y: report.target_config?.memory_threshold || 0, borderColor: '#10b981', strokeDashArray: 4, label: { text: `Mem Target`, style: { color: '#10b981', background: '#f0fdf4', fontSize: '10px' }, position: 'front' } }
                               ]
                             },
-                            tooltip: { y: { formatter: (v: number) => `${v.toFixed(1)}%` } },
+                            tooltip: { x: { show: true }, y: { formatter: (v: number) => `${v.toFixed(1)}%` } },
                             grid: { borderColor: '#f1f5f9', strokeDashArray: 4 },
                             legend: { position: 'top' as const, horizontalAlign: 'right' as const }
                           }}
                         />
+                      </div>
+                    );
+                  })()}
+
+                  {/* Per-Node Metrics — one chart per cluster */}
+                  {report.metrics_history && report.metrics_history.some((m: any) => m.per_node?.length > 0) && (() => {
+                    const mh = report.metrics_history;
+                    const clusterPalette = ['#3b82f6','#ef4444','#22c55e','#f59e0b','#8b5cf6','#06b6d4','#ec4899','#84cc16'];
+                    const nodePalette  = ['#3b82f6','#ef4444','#22c55e','#f59e0b','#8b5cf6','#06b6d4','#ec4899','#84cc16','#14b8a6','#a855f7','#f97316','#64748b'];
+
+                    // Build node→cluster mapping from first non-empty sample
+                    const nodeCluster: Record<string, string> = {};
+                    const nodeLabel: Record<string, string> = {};
+                    mh.forEach((m: any) => {
+                      (m.per_node || []).forEach((n: any) => {
+                        const id = n.node_id || n.name || 'unknown';
+                        if (!nodeCluster[id]) {
+                          nodeCluster[id] = n.cluster_name || '';
+                          nodeLabel[id] = n.name || id.split(':')[0];
+                        }
+                      });
+                    });
+                    const allNodeIds = Object.keys(nodeCluster);
+                    if (allNodeIds.length === 0) return null;
+
+                    const clusterNames = [...new Set(Object.values(nodeCluster).filter(Boolean))];
+                    if (clusterNames.length === 0) clusterNames.push('');
+                    const clusterColorMap: Record<string, string> = {};
+                    clusterNames.forEach((cn, i) => { clusterColorMap[cn] = clusterPalette[i % clusterPalette.length]; });
+
+                    const step = Math.max(1, Math.floor(mh.length / 60));
+                    const sampled = mh.filter((_: any, i: number) => i % step === 0);
+                    const timeLabels = sampled.map((m: any, i: number) => {
+                      if (m.timestamp) { try { return new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch {} }
+                      return `#${m.iteration || i + 1}`;
+                    });
+
+                    // Build per-node time-series data
+                    const nodeData: Record<string, { cpu: number[]; mem: number[] }> = {};
+                    allNodeIds.forEach(id => { nodeData[id] = { cpu: [], mem: [] }; });
+                    sampled.forEach((m: any) => {
+                      const seen = new Set<string>();
+                      (m.per_node || []).forEach((n: any) => {
+                        const id = n.node_id || n.name || 'unknown';
+                        if (nodeData[id]) {
+                          seen.add(id);
+                          nodeData[id].cpu.push(parseFloat((n.cpu_percent || 0).toFixed(1)));
+                          nodeData[id].mem.push(parseFloat((n.memory_percent || 0).toFixed(1)));
+                        }
+                      });
+                      allNodeIds.forEach(id => { if (!seen.has(id)) { nodeData[id].cpu.push(0); nodeData[id].mem.push(0); } });
+                    });
+
+                    const topologyInfo = report.testbed_topology || (report as any).full_execution_data?.testbed_topology;
+                    const topoType = topologyInfo?.topology_type || (clusterNames.length > 1 ? 'multi_cluster' : allNodeIds.length > 1 ? 'multi_node' : 'single_node');
+                    const topoLabels: Record<string, string> = { single_node: 'Single Node', multi_node: 'Multi-Node', multi_cluster: 'Multi-Cluster' };
+
+                    // Latest snapshot for the summary table
+                    const lastSample = sampled[sampled.length - 1];
+                    const lastNodes: Record<string, any> = {};
+                    ((lastSample?.per_node) || []).forEach((n: any) => { lastNodes[n.node_id || n.name || 'unknown'] = n; });
+
+                    return (
+                      <div className="mb-4">
+                        {/* Header */}
+                        <div className="d-flex align-items-center gap-2 mb-3 flex-wrap">
+                          <h6 className="fw-bold mb-0"><i className="material-icons-outlined align-middle me-1" style={{ fontSize: 20 }}>dns</i>Physical Host Metrics</h6>
+                          <span className={`badge ${topoType === 'multi_cluster' ? 'bg-success' : topoType === 'multi_node' ? 'bg-info' : 'bg-secondary'} text-white rounded-pill`} style={{ fontSize: 10 }}>{topoLabels[topoType] || topoType}</span>
+                          <span className="badge bg-primary bg-opacity-10 text-primary rounded-pill" style={{ fontSize: 10 }}>{allNodeIds.length} host{allNodeIds.length !== 1 ? 's' : ''}</span>
+                          {clusterNames.length > 1 && <span className="badge bg-warning bg-opacity-15 text-warning rounded-pill" style={{ fontSize: 10 }}>{clusterNames.length} clusters</span>}
+                        </div>
+
+                        {/* Live snapshot table */}
+                        <div className="table-responsive mb-3">
+                          <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 12 }}>
+                            <thead className="table-light">
+                              <tr><th>Cluster</th><th>Host</th><th>CPU %</th><th style={{ width: 150 }}></th><th>Memory %</th><th style={{ width: 150 }}></th><th>Cores</th><th>RAM (GB)</th></tr>
+                            </thead>
+                            <tbody>
+                              {allNodeIds.map(id => {
+                                const n = lastNodes[id] || {};
+                                const cpu = n.cpu_percent || nodeData[id]?.cpu?.slice(-1)[0] || 0;
+                                const mem = n.memory_percent || nodeData[id]?.mem?.slice(-1)[0] || 0;
+                                return (
+                                  <tr key={id}>
+                                    <td><span className="badge rounded-pill" style={{ background: clusterColorMap[nodeCluster[id]] || '#64748b', color: '#fff', fontSize: 10 }}>{nodeCluster[id] || 'N/A'}</span></td>
+                                    <td className="fw-semibold">{nodeLabel[id]}</td>
+                                    <td className="fw-bold" style={{ color: cpu > 80 ? '#ef4444' : cpu > 50 ? '#f59e0b' : '#22c55e' }}>{cpu.toFixed(1)}%</td>
+                                    <td><div style={{ background: '#e2e8f0', borderRadius: 4, height: 8, width: '100%' }}><div style={{ background: cpu > 80 ? '#ef4444' : cpu > 50 ? '#f59e0b' : '#22c55e', borderRadius: 4, height: 8, width: `${Math.min(cpu, 100)}%` }} /></div></td>
+                                    <td className="fw-bold" style={{ color: mem > 80 ? '#ef4444' : mem > 50 ? '#f59e0b' : '#22c55e' }}>{mem.toFixed(1)}%</td>
+                                    <td><div style={{ background: '#e2e8f0', borderRadius: 4, height: 8, width: '100%' }}><div style={{ background: mem > 80 ? '#ef4444' : mem > 50 ? '#f59e0b' : '#22c55e', borderRadius: 4, height: 8, width: `${Math.min(mem, 100)}%` }} /></div></td>
+                                    <td>{n.num_cpu_cores || '-'}</td>
+                                    <td>{n.memory_capacity_gb ? n.memory_capacity_gb.toFixed(0) : '-'}</td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        {/* One chart per cluster */}
+                        {clusterNames.map((cname, ci) => {
+                          const cNodes = allNodeIds.filter(id => nodeCluster[id] === cname);
+                          if (cNodes.length === 0) return null;
+                          const cSeries = cNodes.flatMap((id, ni) => [
+                            { name: `${nodeLabel[id]} CPU`, data: nodeData[id].cpu },
+                            { name: `${nodeLabel[id]} Mem`, data: nodeData[id].mem },
+                          ]);
+                          const cColors = cNodes.flatMap((_, ni) => {
+                            const c = nodePalette[ni % nodePalette.length];
+                            return [c, c];
+                          });
+                          return (
+                            <div key={ci} className="mb-3 border rounded-3 p-3" style={{ borderLeft: `4px solid ${clusterColorMap[cname] || '#64748b'}` }}>
+                              <div className="d-flex align-items-center gap-2 mb-2">
+                                <span style={{ width: 12, height: 12, borderRadius: '50%', background: clusterColorMap[cname] || '#64748b', display: 'inline-block' }} />
+                                <h6 className="fw-bold mb-0">{cname || 'Cluster'}</h6>
+                                <span className="badge bg-light text-muted rounded-pill" style={{ fontSize: 10 }}>{cNodes.length} host{cNodes.length !== 1 ? 's' : ''}</span>
+                              </div>
+                              <ReactApexChart
+                                type="line"
+                                height={220}
+                                series={cSeries}
+                                options={{
+                                  chart: { toolbar: { show: false }, zoom: { enabled: false }, fontFamily: 'inherit' },
+                                  colors: cColors,
+                                  dataLabels: { enabled: false },
+                                  stroke: { curve: 'smooth', width: 2, dashArray: cNodes.flatMap(() => [0, 5]) },
+                                  xaxis: { categories: timeLabels, labels: { show: sampled.length <= 30, rotate: -45, style: { fontSize: '9px' } }, axisBorder: { show: false }, axisTicks: { show: false } },
+                                  yaxis: { min: 0, max: 100, labels: { formatter: (v: number) => `${v.toFixed(0)}%` } },
+                                  tooltip: { x: { show: true }, y: { formatter: (v: number) => `${v?.toFixed(1)}%` } },
+                                  grid: { borderColor: '#f1f5f9', strokeDashArray: 4 },
+                                  legend: { position: 'bottom' as const, horizontalAlign: 'center' as const, fontSize: '10px', markers: { size: 4 }, height: 40, itemMargin: { horizontal: 8, vertical: 2 } },
+                                }}
+                              />
+                            </div>
+                          );
+                        })}
                       </div>
                     );
                   })()}
@@ -976,7 +1183,7 @@ const SmartExecutionReport: React.FC = () => {
                           <span className="badge bg-info text-dark">{enhanced.report_metadata.cluster_health_source}</span></div>
                         <div className="col-md-4"><span className="text-muted">Prometheus configured:</span>{' '}
                           {enhanced.report_metadata.prometheus_configured ? 'Yes' : 'No'}</div>
-                        <div className="col-md-4"><span className="text-muted">Baseline/final resolution:</span>{' '}
+                        <div className="col-md-4"><span className="text-muted">Start/final resolution:</span>{' '}
                           <code className="small">{enhanced.report_metadata.baseline_final_resolution}</code></div>
                       </div>
                     </div>
@@ -1188,6 +1395,19 @@ const SmartExecutionReport: React.FC = () => {
                         }}>
                           <div className="d-flex justify-content-between align-items-center mb-2">
                             <h6 className="fw-bold mb-0">Spike #{spike.spike_number} — Iteration {spike.iteration}
+                              <span className="text-muted fw-normal ms-2" style={{ fontSize: 12 }}>
+                                <i className="material-icons-outlined align-middle me-1" style={{ fontSize: 13 }}>schedule</i>
+                                {fmtTs(spike.timestamp)}
+                              </span>
+                              {spike.spike_type && (
+                                <span className={`badge ms-2 rounded-pill ${
+                                  spike.spike_type === 'threshold_breach' ? 'bg-danger' :
+                                  spike.spike_type === 'ml_anomaly_deviation' ? 'bg-purple text-white' : 'bg-warning text-dark'
+                                }`} style={spike.spike_type === 'ml_anomaly_deviation' ? { background: '#7c3aed' } : undefined}>
+                                  {spike.spike_type === 'threshold_breach' ? 'Threshold Breach' :
+                                   spike.spike_type === 'ml_anomaly_deviation' ? 'ML Anomaly' : 'Delta Spike'}
+                                </span>
+                              )}
                               {spike.operation_count > 0 && <span className="badge bg-secondary ms-2">{spike.operation_count} ops ({spike.operations_success}ok/{spike.operations_failed}fail)</span>}
                             </h6>
                             <span className={`badge ${getRiskBadge(spike.risk_level)} rounded-pill`}>{spike.risk_level?.toUpperCase()} RISK</span>
@@ -1224,10 +1444,11 @@ const SmartExecutionReport: React.FC = () => {
                               <div className="small text-muted fw-semibold mb-1">Causal Operations ({spike.causal_operations.length})</div>
                               <div className="table-responsive">
                                 <table className="table table-sm table-bordered mb-0">
-                                  <thead className="table-light"><tr><th>Entity</th><th>Op</th><th>Name</th><th>Status</th><th>Timing</th></tr></thead>
+                                  <thead className="table-light"><tr><th>Timestamp</th><th>Entity</th><th>Op</th><th>Name</th><th>Status</th><th>Timing</th></tr></thead>
                                   <tbody>
                                     {spike.causal_operations.slice(0, 5).map((op: any, oi: number) => (
                                       <tr key={oi}>
+                                        <td className="text-muted" style={{ fontSize: 11 }}>{fmtTs(op.timestamp)}</td>
                                         <td>{op.entity_type}</td>
                                         <td>{op.operation}</td>
                                         <td><code className="small">{op.entity_name?.substring(0, 30)}</code></td>
@@ -1586,25 +1807,24 @@ const SmartExecutionReport: React.FC = () => {
                         </div>
                       )}
 
-                      {/* Pod Stability Scores */}
+                      {/* Pod Health Overview (replaces numeric stability scores) */}
                       {enhanced.pod_stability?.length > 0 && (
                         <div>
-                          <h6 className="fw-bold mb-3">Pod Stability Scores</h6>
+                          <h6 className="fw-bold mb-3">Pod Health Overview</h6>
                           <div className="table-responsive">
                             <table className="table table-sm table-bordered">
-                              <thead className="table-light"><tr><th>Pod</th><th>Score</th><th>Restarts (1h/Total)</th><th>Throttle %</th><th>OOM</th><th>State</th><th>Max CPU</th><th>Max Mem</th></tr></thead>
+                              <thead className="table-light"><tr><th>Pod</th><th>Status</th><th>Restarts (1h/Total)</th><th>Throttle %</th><th>OOM</th><th>State</th><th>Max CPU</th><th>Max Mem</th></tr></thead>
                               <tbody>
                                 {enhanced.pod_stability.slice(0, 20).map((p: any, i: number) => (
                                   <tr key={i}>
                                     <td><code className="small">{p.pod_name?.substring(0, 40)}</code></td>
                                     <td>
-                                      <div className="d-flex align-items-center gap-2">
-                                        <div className="progress" style={{ width: 60, height: 6 }}>
-                                          <div className={`progress-bar ${p.stability_score >= 80 ? 'bg-success' : p.stability_score >= 50 ? 'bg-warning' : 'bg-danger'}`}
-                                            style={{ width: `${p.stability_score}%` }} />
-                                        </div>
-                                        <strong>{p.stability_score}</strong>
-                                      </div>
+                                      {p.stability_score >= 80
+                                        ? <span className="badge bg-success">Healthy</span>
+                                        : p.stability_score >= 50
+                                          ? <span className="badge bg-warning text-dark">Degraded</span>
+                                          : <span className="badge bg-danger">Critical</span>
+                                      }
                                     </td>
                                     <td>
                                       {p.restarts > 0 ? <span className="badge bg-danger">{p.restarts}</span> : '0'}
@@ -1652,25 +1872,24 @@ const SmartExecutionReport: React.FC = () => {
                         </div>
                       )}
 
-                      {/* Node Stability Scores */}
+                      {/* Node Health Overview (replaces numeric stability scores) */}
                       {enhanced.node_stability?.length > 0 && (
                         <div>
-                          <h6 className="fw-bold mb-3">Node Stability Scores</h6>
+                          <h6 className="fw-bold mb-3">Node Health Overview</h6>
                           <div className="table-responsive">
                             <table className="table table-sm table-bordered">
-                              <thead className="table-light"><tr><th>Node</th><th>Score</th><th>Ready</th><th>CPU %</th><th>Memory %</th><th>Disk %</th><th>Pressures</th></tr></thead>
+                              <thead className="table-light"><tr><th>Node</th><th>Status</th><th>Ready</th><th>CPU %</th><th>Memory %</th><th>Disk %</th><th>Pressures</th></tr></thead>
                               <tbody>
                                 {enhanced.node_stability.map((n: any, i: number) => (
                                   <tr key={i}>
                                     <td><strong>{n.node_name}</strong></td>
                                     <td>
-                                      <div className="d-flex align-items-center gap-2">
-                                        <div className="progress" style={{ width: 60, height: 6 }}>
-                                          <div className={`progress-bar ${n.stability_score >= 80 ? 'bg-success' : n.stability_score >= 50 ? 'bg-warning' : 'bg-danger'}`}
-                                            style={{ width: `${n.stability_score}%` }} />
-                                        </div>
-                                        <strong>{n.stability_score}</strong>
-                                      </div>
+                                      {n.stability_score >= 80
+                                        ? <span className="badge bg-success">Healthy</span>
+                                        : n.stability_score >= 50
+                                          ? <span className="badge bg-warning text-dark">Degraded</span>
+                                          : <span className="badge bg-danger">Critical</span>
+                                      }
                                     </td>
                                     <td>{n.ready ? <span className="badge bg-success">Ready</span> : <span className="badge bg-danger">NotReady</span>}</td>
                                     <td><span className={n.cpu_percent > 85 ? 'text-danger fw-bold' : n.cpu_percent > 70 ? 'text-warning' : ''}>{n.cpu_percent}%</span></td>
@@ -1688,28 +1907,101 @@ const SmartExecutionReport: React.FC = () => {
                       {/* Pod Restart Timeline */}
                       {enhanced.restart_timestamps?.length > 0 && (
                         <div>
-                          <h6 className="fw-bold mb-3">Pod Restart Timeline</h6>
-                          <p className="text-muted small mb-2">Most recent container terminations (last terminated timestamp from Prometheus).</p>
+                          <h6 className="fw-bold mb-3"><i className="material-icons-outlined align-middle me-1" style={{ fontSize: 18 }}>restart_alt</i>Pod Restart Timeline</h6>
+                          <p className="text-muted small mb-2">Most recent container terminations. All timestamps are in local time.</p>
                           <div className="table-responsive">
                             <table className="table table-sm table-bordered">
-                              <thead className="table-light"><tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Last Terminated At</th></tr></thead>
+                              <thead className="table-light"><tr><th>Terminated At</th><th>Pod</th><th>Namespace</th><th>Container</th><th>Reason</th><th>Exit Code</th></tr></thead>
                               <tbody>
-                                {enhanced.restart_timestamps.slice(0, 20).map((rt: any, i: number) => {
-                                  const ts = rt.last_terminated_at;
-                                  let display = ts;
-                                  try {
-                                    const d = new Date(ts);
-                                    if (!isNaN(d.getTime())) display = d.toLocaleString();
-                                  } catch { /* keep raw */ }
-                                  return (
+                                {enhanced.restart_timestamps.slice(0, 20).map((rt: any, i: number) => (
                                     <tr key={i}>
+                                      <td className="fw-semibold" style={{ fontSize: 12, whiteSpace: 'nowrap' }}><i className="material-icons-outlined align-middle me-1" style={{ fontSize: 13 }}>schedule</i>{fmtTs(rt.last_terminated_at)}</td>
                                       <td><code className="small">{rt.pod?.substring(0, 40)}</code></td>
                                       <td>{rt.namespace}</td>
                                       <td>{rt.container}</td>
-                                      <td>{display}</td>
+                                      <td>{rt.reason ? <span className={`badge ${rt.reason === 'OOMKilled' ? 'bg-danger' : 'bg-warning text-dark'}`}>{rt.reason}</span> : '—'}</td>
+                                      <td>{rt.exit_code != null ? <span className={`badge ${rt.exit_code === 137 ? 'bg-danger' : rt.exit_code === 0 ? 'bg-success' : 'bg-warning text-dark'}`}>{rt.exit_code}</span> : '—'}</td>
                                     </tr>
-                                  );
-                                })}
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Pod Restart Events with Log Snippets (Phase 2 data) */}
+                      {podEvents.length > 0 && (
+                        <div className="mt-4">
+                          <h6 className="fw-bold mb-3">Pod Restart Events &mdash; Captured Logs</h6>
+                          <p className="text-muted small mb-2">
+                            Restart events detected during execution with exit codes and captured log snippets from Kubernetes.
+                          </p>
+                          <div className="table-responsive">
+                            <table className="table table-sm table-bordered">
+                              <thead className="table-light">
+                                <tr>
+                                  <th>Time</th><th>Pod</th><th>Namespace</th><th>Container</th>
+                                  <th>Restarts</th><th>Reason</th><th>Exit Code</th><th>Elapsed</th><th>Logs</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {podEvents.map((ev: any) => (
+                                  <React.Fragment key={ev.id}>
+                                    <tr>
+                                      <td className="small fw-semibold" style={{ whiteSpace: 'nowrap' }}><i className="material-icons-outlined align-middle me-1" style={{ fontSize: 12 }}>schedule</i>{fmtTs(ev.detected_at)}</td>
+                                      <td><code className="small">{ev.pod_name?.substring(0, 35)}</code></td>
+                                      <td>{ev.namespace}</td>
+                                      <td>{ev.container}</td>
+                                      <td><span className="badge bg-warning text-dark">+{ev.new_restarts}</span></td>
+                                      <td>
+                                        {ev.restart_reason ? (
+                                          <span className={`badge ${ev.restart_reason === 'OOMKilled' ? 'bg-danger' : ev.restart_reason === 'Error' ? 'bg-warning text-dark' : 'bg-info'}`}>
+                                            {ev.restart_reason}
+                                          </span>
+                                        ) : '—'}
+                                      </td>
+                                      <td>
+                                        {ev.exit_code != null ? (
+                                          <span className={`badge ${ev.exit_code === 137 ? 'bg-danger' : ev.exit_code === 0 ? 'bg-success' : 'bg-warning text-dark'}`}>
+                                            {ev.exit_code}
+                                          </span>
+                                        ) : '—'}
+                                      </td>
+                                      <td>{ev.execution_elapsed_min != null ? `${ev.execution_elapsed_min} min` : '—'}</td>
+                                      <td>
+                                        {ev.log_snippet ? (
+                                          <button
+                                            className="btn btn-sm btn-outline-secondary py-0 px-2"
+                                            style={{ fontSize: '0.75rem' }}
+                                            onClick={() => {
+                                              setExpandedLogSnippets(prev => {
+                                                const next = new Set(prev);
+                                                if (next.has(ev.id)) next.delete(ev.id);
+                                                else next.add(ev.id);
+                                                return next;
+                                              });
+                                            }}
+                                          >
+                                            {expandedLogSnippets.has(ev.id) ? 'Hide' : 'View'}
+                                          </button>
+                                        ) : '—'}
+                                      </td>
+                                    </tr>
+                                    {expandedLogSnippets.has(ev.id) && ev.log_snippet && (
+                                      <tr>
+                                        <td colSpan={9} style={{ padding: 0 }}>
+                                          <pre className="mb-0" style={{
+                                            maxHeight: 200, overflow: 'auto', fontSize: '0.75rem',
+                                            background: '#1e293b', color: '#e2e8f0', padding: '8px 12px',
+                                            whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                                          }}>
+                                            {ev.log_snippet}
+                                          </pre>
+                                        </td>
+                                      </tr>
+                                    )}
+                                  </React.Fragment>
+                                ))}
                               </tbody>
                             </table>
                           </div>
@@ -1771,16 +2063,78 @@ const SmartExecutionReport: React.FC = () => {
                         <strong>{enhanced.failure_analysis.total_failures}</strong> failures grouped into <strong>{enhanced.failure_analysis.unique_patterns}</strong> root cause patterns
                       </div>
                       {enhanced.failure_analysis.groups.map((group: any, idx: number) => (
-                        <div key={idx} className="border rounded-3 p-3 mb-3" style={{ borderLeft: '4px solid #ef4444' }}>
-                          <div className="d-flex justify-content-between align-items-center mb-2">
-                            <strong>{group.count}x — {group.entity_types?.join(', ')} {group.operations?.join(', ')}</strong>
-                            <span className="badge bg-danger rounded-pill">{group.count} occurrences</span>
+                        <div key={idx} className="border rounded-3 mb-3" style={{ borderLeft: '4px solid #ef4444' }}>
+                          <div
+                            className="p-3 d-flex justify-content-between align-items-center"
+                            style={{ cursor: 'pointer' }}
+                            onClick={(e) => {
+                              const body = (e.currentTarget as HTMLElement).nextElementSibling;
+                              if (body) body.classList.toggle('d-none');
+                            }}
+                          >
+                            <div>
+                              <span className="me-2" style={{ fontSize: 12 }}>▶</span>
+                              <strong>{group.count}x — {group.entity_types?.join(', ')} {group.operations?.join(', ')}</strong>
+                            </div>
+                            <div className="d-flex gap-1 align-items-center">
+                              {group.http_status_distribution && Object.entries(group.http_status_distribution).map(([code, cnt]: [string, any]) => (
+                                <span key={code} className={`badge rounded-pill ${
+                                  code.startsWith('5') ? 'bg-danger' : code.startsWith('4') ? 'bg-warning text-dark' : 'bg-secondary'
+                                }`}>{code}: {cnt}</span>
+                              ))}
+                              <span className="badge bg-danger rounded-pill">{group.count}</span>
+                            </div>
                           </div>
-                          <div className="mb-2">
-                            <code className="small text-muted">{group.sample_error?.substring(0, 200)}</code>
-                          </div>
-                          <div className="alert alert-warning rounded-3 mb-0 py-2">
-                            <strong>Root Cause:</strong> {group.root_cause_hint}
+                          <div className="d-none border-top px-3 pb-3 pt-2" style={{ background: '#fafafa' }}>
+                            <div className="mb-2">
+                              <code className="small text-muted">{group.sample_error?.substring(0, 200)}</code>
+                            </div>
+                            <div className="alert alert-warning rounded-3 mb-2 py-2">
+                              <strong>Root Cause:</strong> {group.root_cause_hint}
+                            </div>
+                            {(group.first_occurrence || group.last_occurrence) && (
+                              <div className="text-muted small mb-2"><i className="material-icons-outlined align-middle me-1" style={{ fontSize: 13 }}>schedule</i>First seen: <strong>{fmtTs(group.first_occurrence)}</strong> · Last seen: <strong>{fmtTs(group.last_occurrence)}</strong></div>
+                            )}
+                                {group.sample_failures?.length > 0 && (
+                              <div className="mt-2">
+                                <div className="small text-muted fw-bold mb-2 text-uppercase">Sample Failures ({group.sample_failures.length} of {group.count})</div>
+                                {group.sample_failures.map((sf: any, si: number) => (
+                                  <div key={si} className="border rounded-2 p-2 mb-2 bg-white">
+                                    <div className="d-flex justify-content-between flex-wrap gap-1 mb-1">
+                                      <div>
+                                        <span className="fw-bold small">{sf.entity_type}.{sf.operation} <code className="ms-1">{sf.entity_name?.substring(0, 40)}</code></span>
+                                        <span className="text-muted ms-2" style={{ fontSize: 11 }}><i className="material-icons-outlined align-middle" style={{ fontSize: 12 }}>schedule</i> {fmtTs(sf.timestamp)}{sf.iteration != null && ` · Iter #${sf.iteration}`}</span>
+                                      </div>
+                                      <div className="d-flex gap-1">
+                                        {sf.http_status_code && (
+                                          <span className={`badge rounded-pill ${sf.http_status_code >= 500 ? 'bg-danger' : sf.http_status_code >= 400 ? 'bg-warning text-dark' : 'bg-secondary'}`}>HTTP {sf.http_status_code}</span>
+                                        )}
+                                        {sf.http_method && <span className="badge bg-info rounded-pill">{sf.http_method}</span>}
+                                        {sf.duration_seconds != null && <span className="text-muted" style={{ fontSize: 11 }}>{sf.duration_seconds.toFixed(2)}s</span>}
+                                      </div>
+                                    </div>
+                                    {sf.api_url && <div className="small text-muted mb-1"><strong>URL:</strong> <code>{sf.api_url}</code></div>}
+                                    {sf.error && <div className="small text-danger mb-1">{sf.error.substring(0, 300)}</div>}
+                                    {sf.request_payload && (
+                                      <details className="mt-1 mb-1">
+                                        <summary className="small fw-bold text-muted" style={{ cursor: 'pointer' }}>Request Payload</summary>
+                                        <pre className="p-2 rounded small mt-1 mb-0" style={{ maxHeight: 200, overflow: 'auto', background: '#1e293b', color: '#e2e8f0', fontSize: 11 }}>
+                                          {typeof sf.request_payload === 'string' ? sf.request_payload : JSON.stringify(sf.request_payload, null, 2)}
+                                        </pre>
+                                      </details>
+                                    )}
+                                    {sf.response_body && (
+                                      <details className="mt-1 mb-1">
+                                        <summary className="small fw-bold text-muted" style={{ cursor: 'pointer' }}>Response Body</summary>
+                                        <pre className="p-2 rounded small mt-1 mb-0" style={{ maxHeight: 200, overflow: 'auto', background: '#1e293b', color: '#e2e8f0', fontSize: 11 }}>
+                                          {typeof sf.response_body === 'string' ? sf.response_body : JSON.stringify(sf.response_body, null, 2)}
+                                        </pre>
+                                      </details>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         </div>
                       ))}
@@ -2124,7 +2478,7 @@ const SmartExecutionReport: React.FC = () => {
                                     <strong>#{iter.iteration}</strong>
                                     {iter.is_spike && <span className={`badge ms-1 ${iter.spike_risk === 'high' ? 'bg-danger' : iter.spike_risk === 'medium' ? 'bg-warning text-dark' : 'bg-success'}`} style={{ fontSize: 9 }}>SPIKE</span>}
                                   </td>
-                                  <td className="text-muted small">{iter.timestamp ? new Date(iter.timestamp).toLocaleTimeString() : '-'}</td>
+                                  <td className="text-muted small">{fmtTs(iter.timestamp)}</td>
                                   <td><strong>{iter.cpu}%</strong></td>
                                   <td><strong>{iter.memory}%</strong></td>
                                   <td style={{ color: iter.cpu_delta > 0 ? '#ef4444' : iter.cpu_delta < -2 ? '#22c55e' : '#666' }}>
@@ -2166,10 +2520,11 @@ const SmartExecutionReport: React.FC = () => {
                                           <>
                                             <strong>Operation instances (up to 20):</strong>
                                             <table className="table table-sm table-bordered mt-1 mb-0" style={{ fontSize: 12 }}>
-                                              <thead className="table-light"><tr><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
+                                              <thead className="table-light"><tr><th>Timestamp</th><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
                                               <tbody>
                                                 {iter.operations.map((op: any, oi: number) => (
                                                   <tr key={oi}>
+                                                    <td className="text-muted" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>{fmtTs(op.timestamp)}</td>
                                                     <td>{op.entity_type}</td>
                                                     <td>{op.operation}</td>
                                                     <td><code>{op.entity_name?.substring(0, 30)}</code></td>
@@ -2330,7 +2685,7 @@ const SmartExecutionReport: React.FC = () => {
           </div>
         </div>
 
-        {/* Metrics Summary Card — baseline / final; uses enhanced effective_metrics when stored finals were zero */}
+        {/* Metrics Summary Card — start / final; uses enhanced effective_metrics when stored finals were zero */}
         <div className="card rounded-4 shadow-none border mb-3">
           <div className="card-header bg-transparent border-bottom p-4">
             <h5 className="mb-0 d-flex align-items-center gap-2">
@@ -2345,7 +2700,7 @@ const SmartExecutionReport: React.FC = () => {
             </h5>
             {enhanced?.effective_metrics?.resolution_note && enhanced.effective_metrics.resolution_note !== 'stored' && (
               <p className="text-muted small mb-0 mt-2">
-                Final/baseline shown using last/first <code>metrics_history</code> samples when stored values were missing ({enhanced.effective_metrics.resolution_note}).
+                Final/start values shown using last/first <code>metrics_history</code> samples when stored values were missing ({enhanced.effective_metrics.resolution_note}).
               </p>
             )}
           </div>
@@ -2355,7 +2710,7 @@ const SmartExecutionReport: React.FC = () => {
                 <thead className="table-light">
                   <tr>
                     <th className="ps-4">Metric</th>
-                    <th className="text-center">Baseline</th>
+                    <th className="text-center">Start</th>
                     <th className="text-center pe-4">Final</th>
                   </tr>
                 </thead>
@@ -2702,6 +3057,7 @@ const SmartExecutionReport: React.FC = () => {
                 <thead className="table-light">
                   <tr>
                     <th className="ps-4">#</th>
+                    <th>Timestamp</th>
                     <th>Entity</th>
                     <th>Operation</th>
                     <th>Name</th>
@@ -2715,6 +3071,7 @@ const SmartExecutionReport: React.FC = () => {
                       <td className="ps-4">
                         <span className="badge bg-light text-dark rounded-pill">{idx + 1}</span>
                       </td>
+                      <td className="text-muted" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>{fmtTs(op.timestamp)}</td>
                       <td>
                         <span className="badge bg-secondary rounded-pill px-3 py-2">
                           {op.entity_type || 'Unknown'}
@@ -2742,7 +3099,7 @@ const SmartExecutionReport: React.FC = () => {
                   ))}
                   {(!report.operations_history || !Array.isArray(report.operations_history) || report.operations_history.length === 0) && (
                     <tr>
-                      <td colSpan={6} className="text-center text-muted py-5">
+                      <td colSpan={7} className="text-center text-muted py-5">
                         <i className="material-icons-outlined mb-2" style={{ fontSize: 48, opacity: 0.3 }}>inbox</i>
                         <div>No operation details available</div>
                       </td>

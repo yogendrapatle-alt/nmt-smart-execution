@@ -5618,6 +5618,7 @@ def get_enhanced_smart_execution_report(execution_id):
                 'pod_operation_correlation': full_execution_data.get('pod_operation_correlation', {}),
                 'cluster_health_snapshot': full_execution_data.get('cluster_health_snapshot') or {},
                 'pod_restart_tracking': full_execution_data.get('pod_restart_tracking') or {},
+                'testbed_topology': full_execution_data.get('testbed_topology') or {},
             }
             report_data = status
 
@@ -5682,7 +5683,7 @@ def get_enhanced_smart_execution_report(execution_id):
 
         # Prepare template variables
         import json as json_mod
-        from jinja2 import Template
+        from jinja2 import Environment, BaseLoader
 
         total_ops = status.get('total_operations', 0) or 0
         duration_mins = status.get('duration_minutes', 0) or 0.1
@@ -5769,15 +5770,31 @@ def get_enhanced_smart_execution_report(execution_id):
         if testbed_label == 'Unknown':
             testbed_label = status.get('testbed_label', 'Unknown')
 
+        def _fmtts(raw):
+            """Format an ISO timestamp string into a human-readable local time."""
+            if not raw:
+                return '—'
+            try:
+                from dateutil import parser as dtparser
+                dt = dtparser.isoparse(str(raw))
+                return dt.strftime('%b %d, %Y %H:%M:%S')
+            except Exception:
+                s = str(raw)
+                return s[:19].replace('T', ' ') if len(s) > 10 else s
+
         template_path = os.path.join(os.path.dirname(__file__), 'templates', 'enhanced_report.html')
         with open(template_path, 'r') as f:
-            template = Template(f.read())
+            env = Environment(loader=BaseLoader(), autoescape=False)
+            env.filters['fmtts'] = _fmtts
+            template = env.from_string(f.read())
 
         html_content = template.render(
             execution_id=execution_id,
             testbed_label=testbed_label,
             status=status.get('status', 'UNKNOWN'),
             timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            start_time=report_data.get('start_time') or status.get('start_time', ''),
+            end_time=report_data.get('end_time') or status.get('end_time', ''),
             total_operations=total_ops,
             duration_minutes=duration_mins,
             ops_per_minute=ops_per_minute,
@@ -5860,6 +5877,154 @@ def delete_smart_execution(execution_id):
             
     except Exception as e:
         logging.exception("Error deleting execution")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================================
+# Phase 3: Drill-down APIs for normalized execution detail tables
+# ============================================================================
+
+@app.route('/api/smart-execution/<execution_id>/failures', methods=['GET'])
+def get_execution_failures(execution_id):
+    """
+    Paginated list of failed API calls for a given execution.
+
+    Query params:
+        page (int, default 1)
+        per_page (int, default 50, max 200)
+        entity_type (str, optional filter)
+        http_status (int, optional filter)
+    """
+    try:
+        from database import SessionLocal
+        from models.execution_detail_tables import ExecutionApiLog
+
+        page = max(1, request.args.get('page', 1, type=int))
+        per_page = min(200, max(1, request.args.get('per_page', 50, type=int)))
+        entity_filter = request.args.get('entity_type')
+        status_filter = request.args.get('http_status', type=int)
+
+        db = SessionLocal()
+        try:
+            q = db.query(ExecutionApiLog).filter(
+                ExecutionApiLog.execution_id == execution_id,
+                ExecutionApiLog.status == 'FAILED',
+            )
+            if entity_filter:
+                q = q.filter(ExecutionApiLog.entity_type == entity_filter)
+            if status_filter:
+                q = q.filter(ExecutionApiLog.http_status_code == status_filter)
+
+            total = q.count()
+            rows = (
+                q.order_by(ExecutionApiLog.timestamp.desc())
+                .offset((page - 1) * per_page)
+                .limit(per_page)
+                .all()
+            )
+            return jsonify({
+                'success': True,
+                'execution_id': execution_id,
+                'page': page,
+                'per_page': per_page,
+                'total': total,
+                'failures': [r.to_dict() for r in rows],
+            })
+        finally:
+            db.close()
+
+    except Exception as e:
+        logging.exception("Error fetching execution failures")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/smart-execution/<execution_id>/pod-events', methods=['GET'])
+def get_execution_pod_events(execution_id):
+    """
+    Pod restart / termination events for an execution.
+
+    Query params:
+        page (int, default 1)
+        per_page (int, default 100)
+        reason (str, optional — OOMKilled, Error, CrashLoopBackOff)
+    """
+    try:
+        from database import SessionLocal
+        from models.execution_detail_tables import ExecutionPodEvent
+
+        page = max(1, request.args.get('page', 1, type=int))
+        per_page = min(200, max(1, request.args.get('per_page', 100, type=int)))
+        reason_filter = request.args.get('reason')
+
+        db = SessionLocal()
+        try:
+            q = db.query(ExecutionPodEvent).filter(
+                ExecutionPodEvent.execution_id == execution_id,
+            )
+            if reason_filter:
+                q = q.filter(ExecutionPodEvent.restart_reason == reason_filter)
+
+            total = q.count()
+            rows = (
+                q.order_by(ExecutionPodEvent.detected_at.asc())
+                .offset((page - 1) * per_page)
+                .limit(per_page)
+                .all()
+            )
+            return jsonify({
+                'success': True,
+                'execution_id': execution_id,
+                'page': page,
+                'per_page': per_page,
+                'total': total,
+                'pod_events': [r.to_dict() for r in rows],
+            })
+        finally:
+            db.close()
+
+    except Exception as e:
+        logging.exception("Error fetching pod events")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/smart-execution/<execution_id>/metrics-timeline', methods=['GET'])
+def get_execution_metrics_timeline(execution_id):
+    """
+    Per-iteration cluster + per-node metrics for an execution.
+
+    Query params:
+        node_id (str, optional — filter to a single node)
+        cluster_only (bool, default false — return only cluster-level rows)
+    """
+    try:
+        from database import SessionLocal
+        from models.execution_detail_tables import ExecutionMetricsTimeline
+
+        node_filter = request.args.get('node_id')
+        cluster_only = request.args.get('cluster_only', 'false').lower() == 'true'
+
+        db = SessionLocal()
+        try:
+            q = db.query(ExecutionMetricsTimeline).filter(
+                ExecutionMetricsTimeline.execution_id == execution_id,
+            )
+            if cluster_only:
+                q = q.filter(ExecutionMetricsTimeline.node_id.is_(None))
+            elif node_filter:
+                q = q.filter(ExecutionMetricsTimeline.node_id == node_filter)
+
+            rows = q.order_by(ExecutionMetricsTimeline.iteration.asc()).all()
+            return jsonify({
+                'success': True,
+                'execution_id': execution_id,
+                'total': len(rows),
+                'metrics': [r.to_dict() for r in rows],
+            })
+        finally:
+            db.close()
+
+    except Exception as e:
+        logging.exception("Error fetching metrics timeline")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -6537,7 +6702,8 @@ def get_smart_execution_report(execution_id):
                     'analysis': full_data.get('analysis', {}),
                     'network': full_data.get('current_metrics', {}).get('network'),
                     'disk': full_data.get('current_metrics', {}).get('disk'),
-                    'latency': full_data.get('current_metrics', {}).get('latency')
+                    'latency': full_data.get('current_metrics', {}).get('latency'),
+                    'testbed_topology': full_data.get('testbed_topology', {}),
                 })
                 # Longevity data from full execution data
                 longevity = full_data.get('longevity', {})

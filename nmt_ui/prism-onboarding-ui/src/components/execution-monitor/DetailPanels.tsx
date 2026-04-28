@@ -156,10 +156,15 @@ const DetailPanels: React.FC<Props> = ({ data }) => {
       {prt && prt.restart_events && prt.restart_events.length > 0 && (
         <Panel icon="timeline" title="Restart Timeline">
           <div style={{ maxHeight: 200, overflowY: 'auto', fontSize: 11 }}>
-            {prt.restart_events.slice(-10).reverse().map((ev, i) => (
+            {prt.restart_events.slice(-10).reverse().map((ev, i) => {
+              let tsLabel = '';
+              if (ev.detected_at) {
+                try { tsLabel = new Date(ev.detected_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch { /* ignore */ }
+              }
+              return (
               <div key={i} style={{ borderBottom: '1px solid #f1f5f9', padding: '4px 0' }}>
                 <div className="d-flex justify-content-between">
-                  <span className="text-muted">{ev.execution_elapsed_min} min</span>
+                  <span className="text-muted">{tsLabel ? `${tsLabel} (${ev.execution_elapsed_min} min)` : `${ev.execution_elapsed_min} min`}</span>
                   <span className="badge bg-warning bg-opacity-10 text-warning" style={{ fontSize: 10 }}>+{ev.new_restarts}</span>
                 </div>
                 <div style={{ color: '#334155' }} title={`${ev.namespace}/${ev.container}`}>
@@ -169,7 +174,8 @@ const DetailPanels: React.FC<Props> = ({ data }) => {
                   total since start: {ev.total_since_start} | cumulative: {ev.cumulative_total}
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         </Panel>
       )}

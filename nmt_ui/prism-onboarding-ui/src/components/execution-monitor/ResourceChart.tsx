@@ -19,7 +19,15 @@ const ResourceChart: React.FC<Props> = ({ metricsHistory, cpuTarget, memTarget }
     );
   }
 
-  const categories = metricsHistory.map((_h, i) => `${i + 1}`);
+  const categories = metricsHistory.map((h, i) => {
+    if (h.timestamp) {
+      try {
+        const d = new Date(h.timestamp);
+        if (!isNaN(d.getTime())) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      } catch { /* fallback */ }
+    }
+    return `${i + 1}`;
+  });
   const cpuSeries = metricsHistory.map(h => parseFloat((h.cpu ?? 0).toFixed(1)));
   const memSeries = metricsHistory.map(h => parseFloat((h.memory ?? 0).toFixed(1)));
 
@@ -49,9 +57,10 @@ const ResourceChart: React.FC<Props> = ({ metricsHistory, cpuTarget, memTarget }
             },
             xaxis: {
               categories,
-              labels: { show: false },
+              labels: { show: true, rotate: -45, rotateAlways: false, style: { fontSize: '9px', colors: '#94a3b8' }, maxHeight: 50 },
               axisBorder: { show: false },
               axisTicks: { show: false },
+              tickAmount: Math.min(10, categories.length),
             },
             yaxis: { min: 0, max: 100, labels: { formatter: (v: number) => `${v.toFixed(0)}%` } },
             annotations: {

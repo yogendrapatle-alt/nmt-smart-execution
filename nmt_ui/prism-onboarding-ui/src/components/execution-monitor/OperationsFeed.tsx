@@ -5,6 +5,15 @@ interface Props {
   operations: RecentOperation[];
 }
 
+function fmtOpTime(raw: string | undefined | null): string {
+  if (!raw) return '';
+  try {
+    const d = new Date(raw);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch { return ''; }
+}
+
 const OperationsFeed: React.FC<Props> = ({ operations }) => {
   if (!operations.length) return null;
 
@@ -21,6 +30,7 @@ const OperationsFeed: React.FC<Props> = ({ operations }) => {
             <i className="material-icons-outlined" style={{ fontSize: 14, color: op.success ? '#22c55e' : '#ef4444' }}>
               {op.success ? 'check_circle' : 'cancel'}
             </i>
+            {op.timestamp && <span className="text-muted" style={{ fontSize: 10, minWidth: 60 }}>{fmtOpTime(op.timestamp)}</span>}
             <span className="op-entity">{op.entity_type}</span>
             <span className="op-badge">{op.operation}</span>
             {op.duration != null && <span className="op-duration">{op.duration.toFixed(1)}s</span>}

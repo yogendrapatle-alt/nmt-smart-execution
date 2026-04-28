@@ -407,6 +407,16 @@ class SmartExecutionController:
         self._ncm_cluster_name: Optional[str] = None
         self.subnet_uuid = None
         self.subnet_name = None
+
+        # Round-robin cluster placement for VM distribution
+        self._pe_clusters: List[Dict] = []  # PE clusters only (no PCVM cluster)
+        self._pe_cluster_subnets: Dict[str, Dict] = {}  # cluster_uuid -> {subnet_uuid, subnet_name}
+        self._vm_cluster_index: int = 0  # round-robin counter
+
+        # Testbed topology: hosts grouped by cluster (populated by _discover_hosts_topology)
+        self._hosts_by_cluster: Dict[str, List[Dict]] = {}
+        self._host_cluster_map: Dict[str, str] = {}  # host_uuid -> cluster_name
+        self._topology_type: str = 'unknown'  # single_node | multi_node | multi_cluster
         
         logger.info(f"SmartExecutionController initialized for {self.execution_id}")
         logger.info(f"Targets: CPU={target_config.get('cpu_threshold')}%, Memory={target_config.get('memory_threshold')}%")
@@ -459,26 +469,54 @@ class SmartExecutionController:
             # Use pc_client (direct PC IP) for infrastructure discovery
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
             
-            # List ALL clusters (up to 50) for multi-cluster awareness
-            clusters_response = await pc.v3_request(
-                endpoint="/clusters/list",
-                method="POST",
-                payload={"kind": "cluster", "length": 50}
-            )
-            
-            if clusters_response and clusters_response[0].status in (200, 202) and isinstance(clusters_response[0].body, dict) and clusters_response[0].body.get('entities'):
-                all_clusters = clusters_response[0].body['entities']
-                named_clusters = []
-                for c in all_clusters:
-                    cname = c.get('spec', {}).get('name', '')
-                    if cname and cname != 'Unnamed':
-                        net = c.get('spec', {}).get('resources', {}).get('network', {})
-                        named_clusters.append({
-                            'uuid': c['metadata']['uuid'],
-                            'name': cname,
-                            'external_ip': net.get('external_ip', ''),
-                            'data_services_ip': net.get('external_data_services_ip', ''),
-                        })
+            # List ALL clusters — try v4 clustermgmt first, fall back to v3
+            named_clusters = []
+            try:
+                logger.info("🔍 Trying v4 clustermgmt API for cluster discovery...")
+                v4_resp = await pc.v4_clustermgmt_request(
+                    endpoint="/config/clusters",
+                    method="GET",
+                )
+                if v4_resp and v4_resp[0].status == 200 and isinstance(v4_resp[0].body, dict):
+                    v4_clusters = v4_resp[0].body.get('data', [])
+                    for c in v4_clusters:
+                        cname = c.get('name', '')
+                        if cname and cname != 'Unnamed':
+                            net_cfg = c.get('network', {}) or {}
+                            ext_addr = net_cfg.get('externalAddress', {}) or {}
+                            ext_ip = (ext_addr.get('ipv4', {}) or {}).get('value', '')
+                            named_clusters.append({
+                                'uuid': c.get('extId', ''),
+                                'name': cname,
+                                'external_ip': ext_ip,
+                                'data_services_ip': '',
+                            })
+                    if named_clusters:
+                        logger.info(f"✅ v4 clustermgmt: {len(named_clusters)} cluster(s) detected")
+            except Exception as v4_err:
+                logger.debug(f"v4 clustermgmt not available, falling back to v3: {v4_err}")
+
+            if not named_clusters:
+                logger.info("🔍 Falling back to v3 clusters/list API...")
+                clusters_response = await pc.v3_request(
+                    endpoint="/clusters/list",
+                    method="POST",
+                    payload={"kind": "cluster", "length": 50}
+                )
+                if clusters_response and clusters_response[0].status in (200, 202) and isinstance(clusters_response[0].body, dict) and clusters_response[0].body.get('entities'):
+                    all_clusters = clusters_response[0].body['entities']
+                    for c in all_clusters:
+                        cname = c.get('spec', {}).get('name', '')
+                        if cname and cname != 'Unnamed':
+                            net = c.get('spec', {}).get('resources', {}).get('network', {})
+                            named_clusters.append({
+                                'uuid': c['metadata']['uuid'],
+                                'name': cname,
+                                'external_ip': net.get('external_ip', ''),
+                                'data_services_ip': net.get('external_data_services_ip', ''),
+                            })
+
+            if named_clusters:
                 self._all_clusters = named_clusters
                 cluster_names = [c['name'] for c in named_clusters]
                 logger.info(f"🔍 Detected {len(named_clusters)} cluster(s): {cluster_names}")
@@ -517,62 +555,103 @@ class SmartExecutionController:
                     logger.warning(f"⚠️ Could not match ncm_ip={ncm_ip} to any cluster external_ip; "
                                    f"falling back to first cluster: {self.cluster_name}")
                 else:
-                    cluster = all_clusters[0]
-                    self.cluster_uuid = cluster['metadata']['uuid']
-                    self.cluster_name = cluster.get('spec', {}).get('name', 'default-cluster')
+                    self.cluster_uuid = named_clusters[0]['uuid']
+                    self.cluster_name = named_clusters[0]['name']
                     self._ncm_cluster_name = None
                 logger.info(f"✅ Using cluster: {self.cluster_name} ({self.cluster_uuid})")
             else:
                 raise ValueError("No clusters found on testbed")
             
-            # Get first available subnet
-            subnets_response = await pc.v3_request(
-                endpoint="/subnets/list",
-                method="POST",
-                payload={"kind": "subnet", "length": 10}
-            )
-            
-            if subnets_response and subnets_response[0].status in (200, 202) and isinstance(subnets_response[0].body, dict) and subnets_response[0].body.get('entities'):
-                subnet = subnets_response[0].body['entities'][0]
-                self.subnet_uuid = subnet['metadata']['uuid']
-                self.subnet_name = subnet['spec'].get('name', 'default-subnet')
+            # Discover subnets — try v4 networking first, fall back to v3
+            all_subnets_normalised: List[Dict] = []
+            try:
+                logger.info("🔍 Trying v4 networking API for subnet discovery...")
+                v4_sn_resp = await pc.v4_networking_request(
+                    endpoint="/config/subnets",
+                    method="GET",
+                )
+                if v4_sn_resp and v4_sn_resp[0].status == 200 and isinstance(v4_sn_resp[0].body, dict):
+                    v4_subnets = v4_sn_resp[0].body.get('data', [])
+                    for sn in v4_subnets:
+                        all_subnets_normalised.append({
+                            'uuid': sn.get('extId', ''),
+                            'name': sn.get('name', ''),
+                            'cluster_uuid': sn.get('clusterReference', ''),
+                        })
+                    if all_subnets_normalised:
+                        logger.info(f"✅ v4 networking: {len(all_subnets_normalised)} subnet(s)")
+            except Exception as v4_sn_err:
+                logger.debug(f"v4 networking not available for subnets, falling back to v3: {v4_sn_err}")
+
+            if not all_subnets_normalised:
+                logger.info("🔍 Falling back to v3 subnets/list API...")
+                subnets_response = await pc.v3_request(
+                    endpoint="/subnets/list",
+                    method="POST",
+                    payload={"kind": "subnet", "length": 50}
+                )
+                if subnets_response and subnets_response[0].status in (200, 202) and isinstance(subnets_response[0].body, dict) and subnets_response[0].body.get('entities'):
+                    for sn in subnets_response[0].body['entities']:
+                        all_subnets_normalised.append({
+                            'uuid': sn['metadata']['uuid'],
+                            'name': sn['spec'].get('name', ''),
+                            'cluster_uuid': sn.get('spec', {}).get('cluster_reference', {}).get('uuid', ''),
+                        })
+
+            if all_subnets_normalised:
+                first = all_subnets_normalised[0]
+                self.subnet_uuid = first['uuid']
+                self.subnet_name = first['name'] or 'default-subnet'
                 logger.info(f"✅ Using subnet: {self.subnet_name} ({self.subnet_uuid})")
+
+                # Build per-cluster subnet map for round-robin VM placement
+                pc_ip = self.testbed_info.get('pc_ip', '').strip()
+                pe_clusters = [
+                    c for c in named_clusters
+                    if not c['name'].startswith('PC_')
+                       and 'Unnamed' not in c['name']
+                       and c['name'] != pc_ip
+                ]
+                if not pe_clusters:
+                    pe_clusters = list(named_clusters)
+                self._pe_clusters = pe_clusters
+
+                for c in pe_clusters:
+                    for sn in all_subnets_normalised:
+                        if sn['cluster_uuid'] == c['uuid']:
+                            self._pe_cluster_subnets[c['uuid']] = {
+                                'subnet_uuid': sn['uuid'],
+                                'subnet_name': sn['name'],
+                            }
+                            break
+                    if c['uuid'] not in self._pe_cluster_subnets:
+                        self._pe_cluster_subnets[c['uuid']] = {
+                            'subnet_uuid': self.subnet_uuid,
+                            'subnet_name': self.subnet_name,
+                        }
+
+                pe_names = [c['name'] for c in pe_clusters]
+                logger.info(f"🔄 VM round-robin across {len(pe_clusters)} PE cluster(s): {pe_names}")
             else:
                 raise ValueError("No subnets found on testbed")
             
-            # Dynamically discover an available image for VM creation
+            # Dynamically discover an available image via v3 API
+            # (NCMClient doesn't have a VMM-specific v4 method yet)
             try:
-                logger.info("🔍 Discovering available images...")
+                logger.info("🔍 Discovering available images via v3 API...")
                 images_response = await pc.v3_request(
                     endpoint="/images/list",
                     method="POST",
                     payload={"kind": "image", "length": 50}
                 )
-                
+
                 images = []
                 if images_response and images_response[0].status in (200, 202):
                     body = images_response[0].body
                     if isinstance(body, dict):
                         images = body.get('entities', [])
-                    logger.info(f"Found {len(images)} images via primary API")
-                
-                if not images:
-                    logger.info("Trying direct PC image API...")
-                    pc_ip = self.testbed_info.get('pc_ip')
-                    if pc_ip:
-                        direct_client = NCMClient(
-                            host=pc_ip, username=self.testbed_info.get('username'),
-                            password=self.testbed_info.get('password'),
-                            port=9440, verify_ssl=False, execution_id=self.execution_id
-                        )
-                        img_resp = await direct_client.v3_request(
-                            endpoint="/images/list", method="POST",
-                            payload={"kind": "image", "length": 50}
-                        )
-                        if img_resp and img_resp[0].status in (200, 202) and isinstance(img_resp[0].body, dict):
-                            images = img_resp[0].body.get('entities', [])
-                            logger.info(f"Found {len(images)} images via direct PC API")
-                
+                    logger.info(f"Found {len(images)} images via v3 API")
+
                 if images:
                     preferred_names = ['tinycorelinux', 'tinycore', 'centos', 'ubuntu', 'linux', 'cirros']
                     for pref in preferred_names:
@@ -585,7 +664,7 @@ class SmartExecutionController:
                                 break
                         if self.IMAGE_UUID:
                             break
-                    
+
                     if not self.IMAGE_UUID:
                         for img in images:
                             img_state = img.get('status', {}).get('state', '')
@@ -593,18 +672,218 @@ class SmartExecutionController:
                                 self.IMAGE_UUID = img['metadata']['uuid']
                                 self.IMAGE_NAME = img.get('status', {}).get('name', '') or img.get('spec', {}).get('name', 'Unknown')
                                 break
-                
+
                 if self.IMAGE_UUID:
                     logger.info(f"Using discovered image: {self.IMAGE_NAME} ({self.IMAGE_UUID})")
                 else:
                     logger.warning("No COMPLETE images found - VM creation will fail")
             except Exception as img_err:
                 logger.warning(f"Image discovery failed: {img_err} - VM creation may fail")
-                
+
+            # Discover full host topology (hosts per cluster) for per-node metrics
+            await self._discover_hosts_topology()
+
         except Exception as e:
             logger.error(f"Failed to fetch cluster/subnet/image info: {e}")
             raise
     
+    def _build_topology_dict(self) -> Dict:
+        """Build a serialisable topology dict from the cached host discovery data."""
+        return {
+            'topology_type': getattr(self, '_topology_type', 'unknown'),
+            'clusters': [
+                {'name': cname, 'host_count': len(hosts),
+                 'hosts': [{'name': h['name'], 'uuid': h['uuid'],
+                            'hypervisor_ip': h.get('hypervisor_ip', ''),
+                            'num_cpu_cores': h.get('num_cpu_cores', 0),
+                            'memory_capacity_mib': h.get('memory_capacity_mib', 0)}
+                           for h in hosts]}
+                for cname, hosts in getattr(self, '_hosts_by_cluster', {}).items()
+            ],
+            'total_hosts': sum(len(hl) for hl in getattr(self, '_hosts_by_cluster', {}).values()),
+            'total_clusters': len(getattr(self, '_hosts_by_cluster', {})),
+        }
+
+    async def _discover_hosts_topology(self):
+        """Discover all physical hosts across all clusters.
+
+        Uses **v4 clustermgmt** first (``/config/hosts``), falling back to
+        **v3** ``/hosts/list``.  Populates ``self._hosts_by_cluster``,
+        ``self._host_cluster_map``, and ``self._topology_type``.
+        """
+        try:
+            pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
+            if not pc:
+                logger.warning("⚠️ No PC client available for host topology discovery")
+                return
+
+            cluster_name_map = {c['uuid']: c['name'] for c in self._all_clusters}
+            hosts_by_cluster: Dict[str, List[Dict]] = {}
+            host_cluster_map: Dict[str, str] = {}
+            v4_ok = False
+
+            # v4 clustermgmt hosts
+            try:
+                logger.info("🔍 Trying v4 clustermgmt hosts API...")
+                v4_hosts = await pc.v4_clustermgmt_request(
+                    endpoint="/config/hosts",
+                    method="GET",
+                )
+                if v4_hosts and v4_hosts[0].status == 200 and isinstance(v4_hosts[0].body, dict):
+                    for h in v4_hosts[0].body.get('data', []):
+                        h_uuid = h.get('extId', '')
+                        h_name = h.get('hostName', h_uuid[:12])
+                        cl_ref = h.get('cluster', {}) or {}
+                        c_uuid = cl_ref.get('uuid', '')
+                        c_name = cl_ref.get('name', '') or cluster_name_map.get(c_uuid, c_uuid[:12])
+
+                        hyp_ref = h.get('hypervisor', {}) or {}
+                        ext_addr = hyp_ref.get('externalAddress', {}) or {}
+                        hyp_ipv4 = (ext_addr.get('ipv4', {}) or {}).get('value', '')
+
+                        cvm_ref = h.get('controllerVm', {}) or {}
+                        cvm_addr = cvm_ref.get('externalAddress', {}) or {}
+                        cvm_ipv4 = (cvm_addr.get('ipv4', {}) or {}).get('value', '')
+
+                        host_info = {
+                            'uuid': h_uuid,
+                            'name': h_name,
+                            'hypervisor_ip': hyp_ipv4,
+                            'cvm_ip': cvm_ipv4,
+                            'num_cpu_cores': h.get('numberOfCpuCores', 0),
+                            'num_cpu_sockets': h.get('numberOfCpuSockets', 0),
+                            'memory_capacity_mib': round(h.get('memorySizeBytes', 0) / (1024 * 1024)),
+                            'cluster_uuid': c_uuid,
+                            'cluster_name': c_name,
+                            'host_type': h.get('hostType', ''),
+                        }
+                        hosts_by_cluster.setdefault(c_name, []).append(host_info)
+                        host_cluster_map[h_uuid] = c_name
+                    if host_cluster_map:
+                        v4_ok = True
+                        logger.info(f"✅ v4 clustermgmt hosts: {len(host_cluster_map)} host(s)")
+            except Exception as v4_err:
+                logger.debug(f"v4 clustermgmt hosts not available: {v4_err}")
+
+            # v3 fallback
+            if not v4_ok:
+                logger.info("🔍 Falling back to v3 hosts/list API...")
+                hosts_resp = await pc.v3_request(
+                    endpoint="/hosts/list",
+                    method="POST",
+                    payload={"kind": "host", "length": 500}
+                )
+                if hosts_resp and hosts_resp[0].status in (200, 202) and isinstance(hosts_resp[0].body, dict):
+                    for h in hosts_resp[0].body.get('entities', []):
+                        h_uuid = h.get('metadata', {}).get('uuid', '')
+                        h_name = (h.get('status', {}).get('name', '')
+                                  or h.get('spec', {}).get('name', '')
+                                  or h_uuid[:12])
+                        cluster_ref = h.get('status', {}).get('cluster_reference', {})
+                        c_uuid = cluster_ref.get('uuid', '')
+                        c_name = cluster_ref.get('name', '') or cluster_name_map.get(c_uuid, c_uuid[:12])
+
+                        resources = h.get('status', {}).get('resources', {})
+                        hyp = resources.get('hypervisor', {})
+                        cvm = resources.get('controller_vm', {})
+
+                        host_info = {
+                            'uuid': h_uuid,
+                            'name': h_name,
+                            'hypervisor_ip': hyp.get('ip', ''),
+                            'cvm_ip': cvm.get('ip', ''),
+                            'num_cpu_cores': resources.get('num_cpu_cores', 0),
+                            'num_cpu_sockets': resources.get('num_cpu_sockets', 0),
+                            'memory_capacity_mib': resources.get('memory_capacity_mib', 0),
+                            'cluster_uuid': c_uuid,
+                            'cluster_name': c_name,
+                            'host_type': resources.get('host_type', ''),
+                        }
+                        hosts_by_cluster.setdefault(c_name, []).append(host_info)
+                        host_cluster_map[h_uuid] = c_name
+
+            self._hosts_by_cluster = hosts_by_cluster
+            self._host_cluster_map = host_cluster_map
+
+            total_hosts = sum(len(hl) for hl in hosts_by_cluster.values())
+            num_clusters = len(hosts_by_cluster)
+
+            if num_clusters <= 1 and total_hosts <= 1:
+                self._topology_type = 'single_node'
+            elif num_clusters <= 1:
+                self._topology_type = 'multi_node'
+            else:
+                self._topology_type = 'multi_cluster'
+
+            for cname, hosts in hosts_by_cluster.items():
+                host_names = [h['name'] for h in hosts]
+                logger.info(f"  📦 Cluster '{cname}': {len(hosts)} host(s) → {host_names}")
+            logger.info(f"✅ Topology: {self._topology_type} — "
+                        f"{num_clusters} cluster(s), {total_hosts} host(s)")
+
+        except Exception as e:
+            logger.warning(f"⚠️ Host topology discovery failed: {e}")
+
+    def _get_host_stats_via_v2(self) -> List[Dict]:
+        """Fetch real-time per-host CPU/memory usage.
+
+        The v2 PrismGateway ``/hosts/`` endpoint is the only PC API that
+        returns **live** ``hypervisor_cpu_usage_ppm`` and
+        ``hypervisor_memory_usage_ppm``.  The v4 clustermgmt hosts API gives
+        config data (cores, memory capacity) but *not* live usage stats, so
+        v2 remains the correct source for real-time metrics.
+
+        Auth credentials are taken from ``self.testbed_info`` and the port is
+        derived from the NCMClient to support both NCM 1.5 (9440) and NCM 2.0
+        (443) deployments.
+        """
+        pc_ip = self.testbed_info.get('pc_ip', '').strip()
+        if not pc_ip:
+            return []
+        username = self.testbed_info.get('username', 'admin')
+        password = self.testbed_info.get('password', '')
+        port = getattr(getattr(self, 'ncm_client', None), 'port', 9440) or 9440
+        url = f"https://{pc_ip}:{port}/PrismGateway/services/rest/v2.0/hosts/"
+
+        cluster_name_map = {c['uuid']: c['name'] for c in self._all_clusters}
+        try:
+            resp = requests.get(url, auth=(username, password), verify=False, timeout=10)
+            if resp.status_code != 200:
+                logger.debug(f"v2 hosts API returned {resp.status_code}")
+                return []
+            entities = resp.json().get('entities', [])
+            results: List[Dict] = []
+            for h in entities:
+                h_uuid = h.get('uuid', '')
+                h_name = h.get('name', h_uuid[:12])
+                c_uuid = h.get('cluster_uuid', '')
+                c_name = (self._host_cluster_map.get(h_uuid, '')
+                          or cluster_name_map.get(c_uuid, c_uuid[:12]))
+
+                stats = h.get('stats', {})
+                cpu_ppm = stats.get('hypervisor_cpu_usage_ppm', 0)
+                mem_ppm = stats.get('hypervisor_memory_usage_ppm', 0)
+                cpu_pct = round(float(cpu_ppm) / 10000.0, 1) if cpu_ppm else 0.0
+                mem_pct = round(float(mem_ppm) / 10000.0, 1) if mem_ppm else 0.0
+
+                mem_cap_bytes = h.get('memory_capacity_in_bytes', 0)
+                num_cores = h.get('num_cpu_cores', 0)
+
+                results.append({
+                    'node_id': h_uuid,
+                    'name': h_name,
+                    'cluster_name': c_name,
+                    'cpu_percent': cpu_pct,
+                    'memory_percent': mem_pct,
+                    'num_cpu_cores': num_cores,
+                    'memory_capacity_gb': round(mem_cap_bytes / (1024 ** 3), 1) if mem_cap_bytes else 0,
+                })
+            logger.debug(f"📊 Host stats (v2 PrismGateway): {len(results)} hosts")
+            return results
+        except Exception as e:
+            logger.debug(f"v2 host stats unavailable: {e}")
+            return []
+
     # Entity types that require Calm/Self-Service API
     CALM_DEPENDENT_ENTITIES = {
         'blueprint_single_vm', 'blueprint_multi_vm', 'blueprint',
@@ -655,6 +934,12 @@ class SmartExecutionController:
                 checks['cluster'] = self.cluster_name
                 checks['all_clusters'] = [c['name'] for c in getattr(self, '_all_clusters', [])]
                 checks['ncm_cluster'] = getattr(self, '_ncm_cluster_name', None)
+                checks['topology'] = {
+                    'type': getattr(self, '_topology_type', 'unknown'),
+                    'total_hosts': sum(len(hl) for hl in getattr(self, '_hosts_by_cluster', {}).values()),
+                    'total_clusters': len(getattr(self, '_hosts_by_cluster', {})),
+                    'clusters': {cname: len(hosts) for cname, hosts in getattr(self, '_hosts_by_cluster', {}).items()},
+                }
                 if not has_image:
                     checks['warnings'].append('No VM image discovered - VM create operations will fail')
                 if not has_subnet:
@@ -1009,7 +1294,14 @@ class SmartExecutionController:
             logger.debug(f"Could not capture pod restart baseline: {e}")
 
     def _check_pod_restarts(self):
-        """Poll Prometheus for restart counts and detect new restarts since baseline."""
+        """Poll Prometheus for restart counts and detect new restarts since baseline.
+
+        Also queries kube_pod_container_status_last_terminated_reason to capture
+        the termination reason (OOMKilled, Error, CrashLoopBackOff, etc.) and
+        kube_pod_container_status_last_terminated_exitcode for the exit code of
+        each container that restarted.  Assembles a structured log_snippet per
+        event for storage in execution_pod_events.
+        """
         if not self.prometheus_url:
             return
         now = datetime.now(timezone.utc)
@@ -1020,8 +1312,41 @@ class SmartExecutionController:
         self._last_pod_restart_check = now
 
         try:
+            # --- restart counts ---
             query = 'kube_pod_container_status_restarts_total{container!=""}'
             results = self._query_prometheus_multi(query)
+
+            # --- termination reasons (best-effort) ---
+            reason_map: Dict[str, str] = {}
+            try:
+                reason_query = 'kube_pod_container_status_last_terminated_reason{container!=""}'
+                reason_results = self._query_prometheus_multi(reason_query)
+                for rr in reason_results:
+                    rm = rr.get('metric', {})
+                    rval = float(rr.get('value', [0, 0])[1])
+                    if rval > 0:
+                        rkey = f"{rm.get('pod','')}/{rm.get('namespace','')}/{rm.get('container','')}"
+                        reason_map[rkey] = rm.get('reason', 'Unknown')
+            except Exception:
+                pass
+
+            # --- exit codes (best-effort) ---
+            exit_code_map: Dict[str, int] = {}
+            try:
+                ec_query = 'kube_pod_container_status_last_terminated_exitcode{container!=""}'
+                ec_results = self._query_prometheus_multi(ec_query)
+                for ec in ec_results:
+                    ecm = ec.get('metric', {})
+                    ecval = float(ec.get('value', [0, 0])[1])
+                    if ecval != 0:
+                        eckey = f"{ecm.get('pod','')}/{ecm.get('namespace','')}/{ecm.get('container','')}"
+                        exit_code_map[eckey] = int(ecval)
+            except Exception:
+                pass
+
+            # --- K8s events via Prometheus (best-effort) ---
+            k8s_events = self._try_fetch_k8s_events()
+
             for r in results:
                 m = r.get('metric', {})
                 pod = m.get('pod', '')
@@ -1035,7 +1360,13 @@ class SmartExecutionController:
                 if delta > 0:
                     prev = self._pod_restart_summary.get(key, {}).get('delta', 0)
                     new_restarts = delta - prev
+                    restart_reason = reason_map.get(key, 'Unknown')
+                    exit_code = exit_code_map.get(key)
                     if new_restarts > 0:
+                        log_snippet = self._build_pod_log_snippet(
+                            pod, namespace, container, restart_reason,
+                            exit_code, k8s_events.get(pod, []),
+                        )
                         event = {
                             'pod': pod,
                             'namespace': namespace,
@@ -1043,6 +1374,9 @@ class SmartExecutionController:
                             'new_restarts': new_restarts,
                             'total_since_start': delta,
                             'cumulative_total': current_count,
+                            'restart_reason': restart_reason,
+                            'exit_code': exit_code,
+                            'log_snippet': log_snippet,
                             'detected_at': now.isoformat(),
                             'execution_elapsed_min': round(
                                 (now - self.start_time).total_seconds() / 60, 1
@@ -1052,7 +1386,9 @@ class SmartExecutionController:
                         self._log_event(
                             'WARNING',
                             f'🔄 Pod restart detected: {pod}/{container} in {namespace} '
-                            f'(+{new_restarts}, total since start: {delta})'
+                            f'(+{new_restarts}, total since start: {delta}, '
+                            f'reason: {restart_reason}'
+                            f'{", exit=" + str(exit_code) if exit_code is not None else ""})'
                         )
 
                     self._pod_restart_summary[key] = {
@@ -1062,6 +1398,7 @@ class SmartExecutionController:
                         'delta': delta,
                         'baseline': baseline,
                         'current': current_count,
+                        'restart_reason': restart_reason,
                         'last_seen': now.isoformat(),
                     }
 
@@ -1072,6 +1409,97 @@ class SmartExecutionController:
                            f"{len(self._pod_restart_summary)} pods since execution start")
         except Exception as e:
             logger.debug(f"Pod restart check failed: {e}")
+
+    def _try_fetch_k8s_events(self) -> Dict[str, List[Dict]]:
+        """Best-effort fetch of Kubernetes warning events via the K8s Python client.
+
+        Returns a dict keyed by pod name, each value a list of recent event dicts
+        with keys: reason, message, timestamp.  Falls back to empty dict on any
+        failure so callers are never affected.
+        """
+        try:
+            from kubernetes import client as k8s_client, config as k8s_config
+        except ImportError:
+            return {}
+
+        events_by_pod: Dict[str, List[Dict]] = {}
+        try:
+            try:
+                k8s_config.load_incluster_config()
+            except k8s_config.ConfigException:
+                try:
+                    k8s_config.load_kube_config()
+                except k8s_config.ConfigException:
+                    return {}
+
+            v1 = k8s_client.CoreV1Api()
+            raw_events = v1.list_event_for_all_namespaces(
+                field_selector="type=Warning",
+                limit=200,
+                _request_timeout=5,
+            )
+            for ev in raw_events.items:
+                obj = ev.involved_object
+                if obj.kind != 'Pod':
+                    continue
+                pod_name = obj.name or ''
+                events_by_pod.setdefault(pod_name, []).append({
+                    'reason': ev.reason or '',
+                    'message': (ev.message or '')[:500],
+                    'timestamp': (ev.last_timestamp or ev.event_time or '').isoformat()
+                        if hasattr(ev.last_timestamp or ev.event_time or '', 'isoformat')
+                        else str(ev.last_timestamp or ev.event_time or ''),
+                    'count': ev.count or 1,
+                })
+        except Exception as exc:
+            logger.debug(f"K8s event fetch skipped (non-fatal): {exc}")
+        return events_by_pod
+
+    @staticmethod
+    def _build_pod_log_snippet(
+        pod: str, namespace: str, container: str,
+        reason: str, exit_code: Optional[int],
+        k8s_events: List[Dict],
+        max_bytes: int = 2048,
+    ) -> str:
+        """Compose a human-readable log snippet for a pod restart event.
+
+        Combines Prometheus termination reason/exit code with any Kubernetes
+        warning events captured for this pod.  Truncated to *max_bytes*.
+        """
+        lines: List[str] = []
+        lines.append(f"=== Pod Restart Log ===")
+        lines.append(f"Pod:       {pod}")
+        lines.append(f"Namespace: {namespace}")
+        lines.append(f"Container: {container}")
+        lines.append(f"Reason:    {reason}")
+        if exit_code is not None:
+            lines.append(f"Exit Code: {exit_code}")
+            if exit_code == 137:
+                lines.append("  -> SIGKILL (likely OOMKilled or external kill)")
+            elif exit_code == 143:
+                lines.append("  -> SIGTERM (graceful termination)")
+            elif exit_code == 1:
+                lines.append("  -> General application error")
+            elif exit_code == 139:
+                lines.append("  -> SIGSEGV (segmentation fault)")
+
+        if k8s_events:
+            lines.append("")
+            lines.append("--- Kubernetes Warning Events ---")
+            for ev in k8s_events[-10:]:
+                ts = ev.get('timestamp', '?')
+                r = ev.get('reason', '?')
+                msg = ev.get('message', '')
+                cnt = ev.get('count', 1)
+                lines.append(f"[{ts}] {r} (x{cnt}): {msg}")
+
+        snippet = "\n".join(lines)
+        if len(snippet.encode('utf-8', errors='replace')) > max_bytes:
+            snippet = snippet.encode('utf-8', errors='replace')[:max_bytes].decode(
+                'utf-8', errors='ignore'
+            )
+        return snippet
 
     def _get_pod_restart_tracking(self) -> Dict:
         """Return pod restart tracking data for status / persistence."""
@@ -1361,6 +1789,9 @@ class SmartExecutionController:
                 logger.info(f"📊 Current metrics: CPU={cpu:.1f}%, Memory={memory:.1f}%")
                 self._log_event('INFO', f'📊 Metrics: CPU={cpu:.1f}%, Memory={memory:.1f}%', cpu=cpu, memory=memory, iteration=iteration)
                 
+                # Per-node metrics (best-effort; empty list when Prometheus unavailable)
+                per_node = await self._get_per_node_metrics()
+
                 # Store enhanced metrics history
                 self.metrics_history.append({
                     'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -1369,7 +1800,9 @@ class SmartExecutionController:
                     'network': self.current_metrics.get('network', {}),
                     'disk': self.current_metrics.get('disk', {}),
                     'resources': self.current_metrics.get('resources', {}),
-                    'iteration': iteration
+                    'iteration': iteration,
+                    'per_node': per_node,
+                    'metrics_source': self.current_metrics.get('metrics_source', 'unknown'),
                 })
                 
                 # Phase 3: Real-time anomaly detection (threshold-based)
@@ -2338,9 +2771,14 @@ class SmartExecutionController:
                     'status': 'SKIPPED',
                     'mode': 'REAL' if (self.ncm_client_ready and self.ncm_client) else 'SIMULATED',
                     'error': 'High predicted failure probability',
+                    'timestamp': start_time.isoformat(),
                     'start_time': start_time.isoformat(),
                     'duration_seconds': 0,
                     'iteration': iteration,
+                    'api_url': None,
+                    'http_method': None,
+                    'request_payload': None,
+                    'response_body': None,
                 }
         
         try:
@@ -2375,12 +2813,13 @@ class SmartExecutionController:
             
             execution_mode = 'REAL' if is_real else 'SIMULATED'
             http_status_code = result.get('http_status_code') or result.get('error_code')
-            
+
             return {
                 'entity_type': entity_type,
                 'operation': operation,
                 'status': result.get('status', 'SUCCESS'),
                 'mode': execution_mode,
+                'timestamp': start_time.isoformat(),
                 'start_time': start_time.isoformat(),
                 'end_time': end_time.isoformat(),
                 'duration_seconds': duration,
@@ -2391,6 +2830,10 @@ class SmartExecutionController:
                 'error_code': result.get('error_code'),
                 'http_status_code': http_status_code,
                 'iteration': iteration,
+                'api_url': result.get('api_url'),
+                'http_method': result.get('http_method'),
+                'request_payload': result.get('request_payload'),
+                'response_body': result.get('response_body'),
             }
             
         except Exception as e:
@@ -2406,6 +2849,7 @@ class SmartExecutionController:
                 'operation': operation,
                 'status': 'FAILED',
                 'mode': 'REAL' if is_real else 'SIMULATED',
+                'timestamp': start_time.isoformat(),
                 'start_time': start_time.isoformat(),
                 'end_time': end_time.isoformat(),
                 'duration_seconds': duration,
@@ -2417,6 +2861,10 @@ class SmartExecutionController:
                 'http_status_code': getattr(e, 'status_code', None),
                 'traceback': error_traceback,
                 'iteration': iteration,
+                'api_url': None,
+                'http_method': None,
+                'request_payload': None,
+                'response_body': None,
             }
     
     async def _execute_real_operation(self, entity_type: str, operation: str, entity_name: str) -> Dict:
@@ -2812,8 +3260,37 @@ class SmartExecutionController:
             logger.error(f"❌ Failed to start stress on VM: {e}")
             return {'status': 'FAILED', 'error': str(e), 'uuid': None}
     
+    def _pick_next_cluster_for_vm(self) -> Dict:
+        """Round-robin pick the next PE cluster for VM placement.
+
+        Returns ``{'cluster_uuid', 'cluster_name', 'subnet_uuid', 'subnet_name'}``.
+        Falls back to the default cluster/subnet when the PE list is empty.
+        """
+        pe = self._pe_clusters
+        if not pe:
+            return {
+                'cluster_uuid': self.cluster_uuid,
+                'cluster_name': self.cluster_name,
+                'subnet_uuid': self.subnet_uuid,
+                'subnet_name': self.subnet_name,
+            }
+        idx = self._vm_cluster_index % len(pe)
+        self._vm_cluster_index += 1
+        chosen = pe[idx]
+        sn = self._pe_cluster_subnets.get(chosen['uuid'], {})
+        return {
+            'cluster_uuid': chosen['uuid'],
+            'cluster_name': chosen['name'],
+            'subnet_uuid': sn.get('subnet_uuid', self.subnet_uuid),
+            'subnet_name': sn.get('subnet_name', self.subnet_name),
+        }
+
     async def _create_vm(self, vm_name: str, enable_stress: bool = False) -> Dict:
-        """Create a new VM with dynamically discovered image/subnet/cluster"""
+        """Create a new VM with dynamically discovered image/subnet/cluster.
+
+        VMs are distributed across all PE clusters in round-robin order so load
+        is spread across the entire testbed (single-node, multi-node, or multi-cluster).
+        """
         try:
             if not self.IMAGE_UUID or not self.subnet_uuid or not self.cluster_uuid:
                 return {
@@ -2823,9 +3300,9 @@ class SmartExecutionController:
                     'error_code': None,
                     'uuid': None
                 }
-            
-            # Scale VM specs based on how far we are from the target threshold
-            # Bigger VMs = faster path to reaching CPU/memory targets
+
+            placement = self._pick_next_cluster_for_vm()
+
             current_cpu = self.current_metrics.get('cpu_percent', 0)
             current_mem = self.current_metrics.get('memory_percent', 0)
             target_cpu = self.target_config.get('cpu_threshold', 80)
@@ -2871,16 +3348,16 @@ class SmartExecutionController:
                         "nic_list": [{
                             "subnet_reference": {
                                 "kind": "subnet",
-                                "uuid": self.subnet_uuid,
-                                "name": self.subnet_name
+                                "uuid": placement['subnet_uuid'],
+                                "name": placement['subnet_name']
                             },
                             "is_connected": True
                         }]
                     },
                     "cluster_reference": {
                         "kind": "cluster",
-                        "uuid": self.cluster_uuid,
-                        "name": self.cluster_name
+                        "uuid": placement['cluster_uuid'],
+                        "name": placement['cluster_name']
                     }
                 },
                 "metadata": {
@@ -2888,7 +3365,7 @@ class SmartExecutionController:
                 }
             }
             
-            logger.info(f"📤 Creating VM: {vm_name} (image={self.IMAGE_NAME}, subnet={self.subnet_name})")
+            logger.info(f"📤 Creating VM: {vm_name} on cluster={placement['cluster_name']} (image={self.IMAGE_NAME}, subnet={placement['subnet_name']})")
             client = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
             response = await client.v3_request(
                 endpoint="/vms",
@@ -2917,18 +3394,27 @@ class SmartExecutionController:
                     'error': None,
                     'error_type': None,
                     'error_code': None,
-                    'stress_enabled': enable_stress
+                    'stress_enabled': enable_stress,
+                    'api_url': '/api/nutanix/v3/vms',
+                    'http_method': 'POST',
+                    'request_payload': self._truncate_for_storage(vm_payload, 2048),
+                    'response_body': self._truncate_for_storage(body, 4096, keys_only_on_success=True),
                 }
             else:
                 status_code = response[0].status if response else 'N/A'
                 error_msg = self._extract_api_error(response)
+                resp_body = response[0].body if response else None
                 logger.error(f"❌ VM creation failed: HTTP {status_code} - {error_msg}")
                 return {
                     'status': 'FAILED',
                     'error': f'HTTP {status_code}: {error_msg}',
                     'error_type': 'APIError',
                     'error_code': status_code,
-                    'uuid': None
+                    'uuid': None,
+                    'api_url': '/api/nutanix/v3/vms',
+                    'http_method': 'POST',
+                    'request_payload': self._truncate_for_storage(vm_payload, 2048),
+                    'response_body': self._truncate_for_storage(resp_body, 4096),
                 }
                 
         except Exception as e:
@@ -2952,10 +3438,17 @@ class SmartExecutionController:
             if tracked:
                 entry = tracked[-1]
                 vm_uuid = entry['uuid']
-                logger.info(f"🗑️  Deleting tracked VM: {entry.get('name')} ({vm_uuid})")
+                vm_name = entry.get('name', vm_uuid[:12])
+                logger.info(f"🗑️  Deleting tracked VM: {vm_name} ({vm_uuid})")
                 await pc.v3_request(endpoint=f"/vms/{vm_uuid}", method="DELETE")
                 logger.info(f"✅ VM deleted (tracked): {vm_uuid}")
-                return {'status': 'SUCCESS', 'uuid': vm_uuid, 'error': None}
+                return {
+                    'status': 'SUCCESS', 'uuid': vm_uuid, 'error': None,
+                    'api_url': f'/api/nutanix/v3/vms/{vm_uuid}',
+                    'http_method': 'DELETE',
+                    'request_payload': {'vm_name': vm_name, 'vm_uuid': vm_uuid},
+                    'response_body': {'deleted': True},
+                }
 
             response = await pc.v3_request(
                 endpoint="/vms/list", method="POST",
@@ -2969,12 +3462,18 @@ class SmartExecutionController:
                         logger.info(f"🗑️  Deleting VM: {vm_name} ({vm_uuid})")
                         await pc.v3_request(endpoint=f"/vms/{vm_uuid}", method="DELETE")
                         logger.info(f"✅ VM deleted: {vm_name}")
-                        return {'status': 'SUCCESS', 'uuid': vm_uuid, 'error': None}
+                        return {
+                            'status': 'SUCCESS', 'uuid': vm_uuid, 'error': None,
+                            'api_url': f'/api/nutanix/v3/vms/{vm_uuid}',
+                            'http_method': 'DELETE',
+                            'request_payload': {'vm_name': vm_name, 'vm_uuid': vm_uuid},
+                            'response_body': {'deleted': True},
+                        }
 
             return {'status': 'SKIPPED', 'error': 'No smart-vm exists yet — nothing to delete', 'uuid': None}
         except Exception as e:
             logger.error(f"VM deletion failed: {e}")
-            return {'status': 'FAILED', 'error': str(e)}
+            return {'status': 'FAILED', 'error': str(e), 'api_url': '/api/nutanix/v3/vms/', 'http_method': 'DELETE'}
     
     async def _list_vms(self) -> Dict:
         """List VMs — lightweight read operation for API load generation."""
@@ -3464,16 +3963,29 @@ class SmartExecutionController:
                 body = response[0].body
                 project_uuid = body.get('metadata', {}).get('uuid') if isinstance(body, dict) else None
                 logger.info(f"✅ Project created: {project_name} ({project_uuid})")
-                return {'status': 'SUCCESS', 'uuid': project_uuid, 'error': None}
+                return {
+                    'status': 'SUCCESS', 'uuid': project_uuid, 'error': None,
+                    'api_url': '/projects', 'http_method': 'POST',
+                    'http_status_code': response[0].status,
+                    'request_payload': self._truncate_for_storage(project_payload, 2048),
+                    'response_body': self._truncate_for_storage(body, 4096, keys_only_on_success=True),
+                }
             else:
                 error_msg = self._extract_api_error(response)
                 status_code = response[0].status if response else 'N/A'
+                resp_body = response[0].body if response else None
                 logger.error(f"❌ Project create failed: HTTP {status_code} - {error_msg}")
-                return {'status': 'FAILED', 'error': f'HTTP {status_code}: {error_msg}', 'uuid': None}
+                return {
+                    'status': 'FAILED', 'error': f'HTTP {status_code}: {error_msg}', 'uuid': None,
+                    'api_url': '/projects', 'http_method': 'POST',
+                    'http_status_code': status_code,
+                    'request_payload': self._truncate_for_storage(project_payload, 2048),
+                    'response_body': self._truncate_for_storage(resp_body, 4096),
+                }
                 
         except Exception as e:
             logger.error(f"Project creation failed: {e}")
-            return {'status': 'FAILED', 'error': str(e)}
+            return {'status': 'FAILED', 'error': str(e), 'api_url': '/projects', 'http_method': 'POST'}
     
     async def _update_project(self, project_name: str) -> Dict:
         """Update an existing project — prefer tracked UUID, fall back to API list."""
@@ -3581,12 +4093,25 @@ class SmartExecutionController:
             if resp and resp[0].status in (200, 202):
                 count = len(resp[0].body.get('entities', [])) if isinstance(resp[0].body, dict) else 0
                 logger.info(f"✅ Project list returned {count} projects")
-                return {'status': 'SUCCESS', 'uuid': None, 'error': None, 'count': count}
-            return {'status': 'FAILED', 'error': 'Project list failed', 'uuid': None}
+                return {
+                    'status': 'SUCCESS', 'uuid': None, 'error': None, 'count': count,
+                    'api_url': '/projects/list', 'http_method': 'POST',
+                    'http_status_code': resp[0].status,
+                    'request_payload': {"kind": "project", "length": 20},
+                    'response_body': {'entity_count': count},
+                }
+            status_code = resp[0].status if resp else None
+            return {
+                'status': 'FAILED', 'error': 'Project list failed', 'uuid': None,
+                'api_url': '/projects/list', 'http_method': 'POST',
+                'http_status_code': status_code,
+                'request_payload': {"kind": "project", "length": 20},
+                'response_body': self._truncate_for_storage(resp[0].body if resp else None, 4096),
+            }
         except asyncio.TimeoutError:
-            return {'status': 'FAILED', 'error': 'Project list timed out', 'uuid': None}
+            return {'status': 'FAILED', 'error': 'Project list timed out', 'uuid': None, 'api_url': '/projects/list', 'http_method': 'POST'}
         except Exception as e:
-            return {'status': 'FAILED', 'error': str(e), 'uuid': None}
+            return {'status': 'FAILED', 'error': str(e), 'uuid': None, 'api_url': '/projects/list', 'http_method': 'POST'}
 
     async def _execute_category_operation(self, operation: str, category_name: str) -> Dict:
         """Execute Category operation"""
@@ -3643,15 +4168,25 @@ class SmartExecutionController:
                     'uuid': category_uuid,
                     'error': None,
                     'error_type': None,
-                    'error_code': None
+                    'error_code': None,
+                    'api_url': '/categories', 'http_method': 'POST',
+                    'http_status_code': response[0].status,
+                    'request_payload': self._truncate_for_storage(category_payload, 2048),
+                    'response_body': self._truncate_for_storage(response[0].body, 4096, keys_only_on_success=True),
                 }
             else:
+                resp_body = response[0].body if response else None
+                status_code = response[0].status if response else None
                 return {
                     'status': 'FAILED',
                     'error': 'No response from NCM API',
                     'error_type': 'EmptyResponseError',
-                    'error_code': None,
-                    'uuid': None
+                    'error_code': status_code,
+                    'uuid': None,
+                    'api_url': '/categories', 'http_method': 'POST',
+                    'http_status_code': status_code,
+                    'request_payload': self._truncate_for_storage(category_payload, 2048),
+                    'response_body': self._truncate_for_storage(resp_body, 4096),
                 }
         except Exception as e:
             import traceback
@@ -3661,7 +4196,8 @@ class SmartExecutionController:
                 'error': str(e),
                 'error_type': type(e).__name__,
                 'error_code': getattr(e, 'status_code', None),
-                'uuid': None
+                'uuid': None,
+                'api_url': '/categories', 'http_method': 'POST',
             }
     
     async def _delete_category(self) -> Dict:
@@ -5185,25 +5721,64 @@ class SmartExecutionController:
     # HELPER METHODS
     # ============================================================================
     
+    @staticmethod
+    def _truncate_for_storage(obj, max_bytes: int = 2048, keys_only_on_success: bool = False):
+        """Truncate a payload/response dict for storage in operation results.
+
+        Args:
+            obj: The dict/str/object to truncate.
+            max_bytes: Maximum JSON-encoded size to keep.
+            keys_only_on_success: If True, store only top-level keys (no values).
+        """
+        if obj is None:
+            return None
+        try:
+            if keys_only_on_success and isinstance(obj, dict):
+                return {'_keys': list(obj.keys())[:30], '_truncated': True}
+            raw = json.dumps(obj, default=str)
+            if len(raw) <= max_bytes:
+                return obj
+            return json.loads(raw[:max_bytes]) if raw[:max_bytes].endswith('}') else {'_truncated_text': raw[:max_bytes]}
+        except Exception:
+            s = str(obj)
+            return s[:max_bytes] if len(s) > max_bytes else s
+
     async def _generic_entity_operation(self, entity_display_name: str, api_endpoint: str, operation: str, entity_name: str, create_payload: Dict) -> Dict:
-        """Generic entity operation handler for create/update/delete with proper HTTP status checking"""
+        """Generic entity operation handler for create/update/delete with proper HTTP status checking.
+
+        Every return dict now includes api_url, http_method, request_payload, response_body,
+        and http_status_code so callers can surface full API details for triage.
+        """
+        _base = {
+            'api_url': api_endpoint,
+            'http_method': None,
+            'request_payload': None,
+            'response_body': None,
+            'http_status_code': None,
+        }
+
         try:
             client = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
             if operation == "create":
+                _base['http_method'] = 'POST'
+                _base['request_payload'] = self._truncate_for_storage(create_payload, 2048)
                 logger.info(f"📤 Creating {entity_display_name}: {entity_name}")
                 response = await client.v3_request(
                     endpoint=api_endpoint,
                     method="POST",
                     payload=create_payload
                 )
-                
+
                 if response and response[0].status in (200, 202):
                     body = response[0].body
                     entity_uuid = body.get('metadata', {}).get('uuid') if isinstance(body, dict) else None
                     logger.info(f"✅ {entity_display_name} created: {entity_name} ({entity_uuid})")
                     return {
+                        **_base,
                         'status': 'SUCCESS',
                         'uuid': entity_uuid,
+                        'http_status_code': response[0].status,
+                        'response_body': self._truncate_for_storage(body, 4096, keys_only_on_success=True),
                         'error': None,
                         'error_type': None,
                         'error_code': None
@@ -5211,82 +5786,113 @@ class SmartExecutionController:
                 else:
                     status_code = response[0].status if response else 'N/A'
                     error_msg = self._extract_api_error(response)
+                    resp_body = response[0].body if response else None
                     logger.error(f"❌ {entity_display_name} create failed: HTTP {status_code} - {error_msg}")
                     return {
+                        **_base,
                         'status': 'FAILED',
+                        'http_status_code': status_code,
+                        'response_body': self._truncate_for_storage(resp_body, 4096),
                         'error': f'HTTP {status_code}: {error_msg}',
                         'error_type': 'APIError',
                         'error_code': status_code,
                         'uuid': None
                     }
-            
+
             elif operation == "list":
+                list_endpoint = f"{api_endpoint}/list"
+                list_payload = {"length": 100}
+                _base['api_url'] = list_endpoint
+                _base['http_method'] = 'POST'
+                _base['request_payload'] = list_payload
                 logger.info(f"📋 Listing {entity_display_name}")
                 response = await client.v3_request(
-                    endpoint=f"{api_endpoint}/list",
+                    endpoint=list_endpoint,
                     method="POST",
-                    payload={"length": 100}
+                    payload=list_payload
                 )
-                
+
                 if response and response[0].status in (200, 202) and isinstance(response[0].body, dict):
                     entities = response[0].body.get('entities', [])
                     entity_count = len(entities)
                     logger.info(f"✅ Listed {entity_count} {entity_display_name}(s)")
                     return {
+                        **_base,
                         'status': 'SUCCESS',
+                        'http_status_code': response[0].status,
+                        'response_body': self._truncate_for_storage({'entity_count': entity_count}, 4096, keys_only_on_success=True),
                         'count': entity_count,
                         'entities': entities[:10],
                         'error': None
                     }
                 else:
+                    status_code = response[0].status if response else 'N/A'
+                    resp_body = response[0].body if response else None
                     return {
+                        **_base,
                         'status': 'FAILED',
-                        'error': f'Failed to list {entity_display_name} (HTTP {response[0].status if response else "N/A"})',
+                        'http_status_code': status_code,
+                        'response_body': self._truncate_for_storage(resp_body, 4096),
+                        'error': f'Failed to list {entity_display_name} (HTTP {status_code})',
                         'error_type': 'ListError',
-                        'error_code': response[0].status if response else None,
+                        'error_code': status_code,
                         'count': 0
                     }
-            
+
             elif operation == "delete":
+                list_endpoint = f"{api_endpoint}/list"
+                _base['http_method'] = 'POST'
+                _base['api_url'] = list_endpoint
+                _base['request_payload'] = {"length": 10}
                 response = await client.v3_request(
-                    endpoint=f"{api_endpoint}/list",
+                    endpoint=list_endpoint,
                     method="POST",
                     payload={"length": 10}
                 )
-                
+
                 if response and response[0].status in (200, 202) and isinstance(response[0].body, dict) and response[0].body.get('entities'):
                     for entity in response[0].body['entities']:
                         name = entity.get('spec', {}).get('name', '')
                         if f'smart-{entity_display_name.lower().replace(" ", "-")}' in name.lower():
                             entity_uuid = entity['metadata']['uuid']
+                            del_endpoint = f"{api_endpoint}/{entity_uuid}"
                             logger.info(f"🗑️  Deleting {entity_display_name}: {name} ({entity_uuid})")
-                            
+
                             del_response = await client.v3_request(
-                                endpoint=f"{api_endpoint}/{entity_uuid}",
+                                endpoint=del_endpoint,
                                 method="DELETE"
                             )
                             if del_response and del_response[0].status in (200, 202, 204):
-                                return {'status': 'SUCCESS', 'uuid': entity_uuid, 'error': None}
+                                return {**_base, 'api_url': del_endpoint, 'http_method': 'DELETE',
+                                        'http_status_code': del_response[0].status,
+                                        'response_body': self._truncate_for_storage(del_response[0].body, 4096, keys_only_on_success=True),
+                                        'status': 'SUCCESS', 'uuid': entity_uuid, 'error': None}
                             else:
-                                return {'status': 'FAILED', 'error': f'Delete returned HTTP {del_response[0].status if del_response else "N/A"}', 'uuid': entity_uuid}
-                    
-                    return {'status': 'FAILED', 'error': f'No {entity_display_name} found to delete'}
+                                del_status = del_response[0].status if del_response else 'N/A'
+                                return {**_base, 'api_url': del_endpoint, 'http_method': 'DELETE',
+                                        'http_status_code': del_status,
+                                        'response_body': self._truncate_for_storage(del_response[0].body if del_response else None, 4096),
+                                        'status': 'FAILED', 'error': f'Delete returned HTTP {del_status}', 'uuid': entity_uuid}
+
+                    return {**_base, 'status': 'FAILED', 'error': f'No {entity_display_name} found to delete'}
                 else:
-                    return {'status': 'FAILED', 'error': f'No {entity_display_name} entities found'}
-            
+                    return {**_base, 'status': 'FAILED', 'error': f'No {entity_display_name} entities found'}
+
             else:
                 return {
+                    **_base,
                     'status': 'FAILED',
                     'error': f'Unsupported {entity_display_name} operation: {operation}',
                     'error_type': 'UnsupportedOperationError',
                     'error_code': None,
                     'uuid': None
                 }
-        
+
         except Exception as e:
             import traceback
             logger.error(f"❌ {entity_display_name} operation {operation} failed: {e}")
             return {
+                **_base,
                 'status': 'FAILED',
                 'error': str(e),
                 'error_type': type(e).__name__,
@@ -5595,8 +6201,49 @@ class SmartExecutionController:
         affected.sort(key=lambda x: x['impact_score'], reverse=True)
         return affected
     
+    def _compute_testbed_average_from_v2(self) -> Optional[Dict[str, float]]:
+        """Compute weighted-average CPU/memory across ALL physical hosts via PC v2 API.
+
+        Excludes PCVM-only clusters (names starting with 'PC_' or 'Unnamed')
+        so the average reflects real PE hypervisor nodes.  Falls back to
+        including all hosts if every cluster would be excluded.
+
+        Returns ``{'cpu_percent': ..., 'memory_percent': ...}`` or ``None``
+        if the v2 API is unavailable or returns no hosts.
+        """
+        v2_nodes = self._get_host_stats_via_v2()
+        if not v2_nodes:
+            return None
+
+        pc_ip = self.testbed_info.get('pc_ip', '').strip()
+        pe_nodes = [
+            n for n in v2_nodes
+            if not (n.get('cluster_name', '').startswith('PC_')
+                    or n.get('cluster_name', '') == 'Unnamed'
+                    or n.get('name', '').startswith(pc_ip.replace('.', '')))
+        ]
+        nodes = pe_nodes if pe_nodes else v2_nodes
+        if not nodes:
+            return None
+
+        total_cpu = sum(n.get('cpu_percent', 0) for n in nodes)
+        total_mem = sum(n.get('memory_percent', 0) for n in nodes)
+        count = len(nodes)
+        avg_cpu = round(total_cpu / count, 2)
+        avg_mem = round(total_mem / count, 2)
+
+        logger.info(f"📊 Testbed average (PC v2, {count} PE hosts): CPU={avg_cpu:.1f}%, Mem={avg_mem:.1f}%")
+        return {'cpu_percent': avg_cpu, 'memory_percent': avg_mem}
+
     async def _get_current_metrics(self) -> Dict[str, Any]:
-        """Query Prometheus for current cluster metrics - Enhanced with network, disk, latency"""
+        """Get current testbed-wide metrics.
+
+        Strategy (priority order):
+        1. **PC v2 API** — weighted average CPU/memory across all physical
+           hypervisor hosts (works for single-node, multi-node, multi-cluster).
+        2. **Prometheus** — falls back to PCVM-only node_exporter data when
+           the PC v2 API is unavailable.
+        """
         try:
             # Reset the dead flag periodically (every 5th call) to allow retries
             if hasattr(self, '_prom_retry_counter'):
@@ -5606,46 +6253,52 @@ class SmartExecutionController:
             if self._prom_retry_counter % 5 == 0:
                 self._prometheus_dead = False
 
-            cpu_query = '100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100)'
-            cpu_percent = await self._query_prometheus(cpu_query)
-            if cpu_percent is None or cpu_percent < 0:
-                # Fallback to load average if CPU query fails
-                load1 = await self._query_prometheus('node_load1')
-                # Normalize by number of CPUs for a meaningful percentage
-                cpu_count = await self._query_prometheus('count(node_cpu_seconds_total{mode="idle"})')
-                if load1 is not None and cpu_count and cpu_count > 0:
-                    cpu_percent = min((load1 / cpu_count) * 100, 100)
-                else:
-                    cpu_percent = min((load1 or 0) * 10, 100) if load1 else 0
-            cpu_percent = max(0, min(cpu_percent, 100))
-            
-            # Memory: Calculate used percentage
-            mem_total = await self._query_prometheus('node_memory_MemTotal_bytes')
-            mem_available = await self._query_prometheus('node_memory_MemAvailable_bytes')
-            
-            if mem_total and mem_available:
-                mem_used = mem_total - mem_available
-                memory_percent = (mem_used / mem_total) * 100
-                memory_gb_total = mem_total / (1024**3)
-                memory_gb_used = mem_used / (1024**3)
-                memory_gb_available = mem_available / (1024**3)
-            else:
-                memory_percent = 0
+            # ── Strategy 1: PC v2 API (all physical hosts) ──────────────
+            v2_avg = self._compute_testbed_average_from_v2()
+            if v2_avg:
+                cpu_percent = v2_avg['cpu_percent']
+                memory_percent = v2_avg['memory_percent']
+                # Memory GB detail not available from v2 ppm stats; set to 0
                 memory_gb_total = 0
                 memory_gb_used = 0
                 memory_gb_available = 0
-            
-            # Network metrics
+            else:
+                # ── Strategy 2: Prometheus (single PCVM node) ────────────
+                cpu_query = '100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100)'
+                cpu_percent = await self._query_prometheus(cpu_query)
+                if cpu_percent is None or cpu_percent < 0:
+                    load1 = await self._query_prometheus('node_load1')
+                    cpu_count = await self._query_prometheus('count(node_cpu_seconds_total{mode="idle"})')
+                    if load1 is not None and cpu_count and cpu_count > 0:
+                        cpu_percent = min((load1 / cpu_count) * 100, 100)
+                    else:
+                        cpu_percent = min((load1 or 0) * 10, 100) if load1 else 0
+                cpu_percent = max(0, min(cpu_percent, 100))
+
+                mem_total = await self._query_prometheus('node_memory_MemTotal_bytes')
+                mem_available = await self._query_prometheus('node_memory_MemAvailable_bytes')
+                if mem_total and mem_available:
+                    mem_used = mem_total - mem_available
+                    memory_percent = (mem_used / mem_total) * 100
+                    memory_gb_total = mem_total / (1024**3)
+                    memory_gb_used = mem_used / (1024**3)
+                    memory_gb_available = mem_available / (1024**3)
+                else:
+                    memory_percent = 0
+                    memory_gb_total = 0
+                    memory_gb_used = 0
+                    memory_gb_available = 0
+
+            # Network metrics (Prometheus-only, best-effort)
             network_rx_bytes = await self._query_prometheus('rate(node_network_receive_bytes_total{device!="lo"}[1m])')
             network_tx_bytes = await self._query_prometheus('rate(node_network_transmit_bytes_total{device!="lo"}[1m])')
-            network_rx_mbps = (network_rx_bytes or 0) / (1024**2)  # Convert to MB/s
+            network_rx_mbps = (network_rx_bytes or 0) / (1024**2)
             network_tx_mbps = (network_tx_bytes or 0) / (1024**2)
-            
-            # Disk metrics
+
+            # Disk metrics (Prometheus-only, best-effort)
             disk_total_bytes = await self._query_prometheus('node_filesystem_size_bytes{mountpoint="/"}')
             disk_free_bytes = await self._query_prometheus('node_filesystem_free_bytes{mountpoint="/"}')
             disk_io_time = await self._query_prometheus('rate(node_disk_io_time_seconds_total[1m])')
-            
             if disk_total_bytes and disk_free_bytes:
                 disk_used_bytes = disk_total_bytes - disk_free_bytes
                 disk_usage_percent = (disk_used_bytes / disk_total_bytes) * 100
@@ -5655,16 +6308,11 @@ class SmartExecutionController:
                 disk_usage_percent = 0
                 disk_gb_total = 0
                 disk_gb_used = 0
-            
-            disk_io_percent = min((disk_io_time or 0) * 100, 100)  # Convert to percentage
-            
-            # Per-node metrics (simplified - get average across nodes)
-            # In a real implementation, you'd query per instance
+            disk_io_percent = min((disk_io_time or 0) * 100, 100)
+
             nodes_data = await self._get_per_node_metrics()
-            
-            # Resource allocation (if NCM client available)
             resources = await self._get_resource_allocation()
-            
+
             metrics = {
                 'cpu_percent': cpu_percent,
                 'memory_percent': memory_percent,
@@ -5684,19 +6332,20 @@ class SmartExecutionController:
                 },
                 'nodes': nodes_data,
                 'resources': resources,
+                'metrics_source': 'pc_v2_all_hosts' if v2_avg else 'prometheus',
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
-            
+
             if cpu_percent == 0 and memory_percent == 0:
-                logger.warning(f"⚠️  Prometheus not available for {self.testbed_info.get('testbed_label')} - metrics will show 0%")
+                logger.warning(f"⚠️  No metrics source available for {self.testbed_info.get('testbed_label')} - metrics will show 0%")
             else:
-                logger.debug(f"📊 Enhanced Metrics: CPU={cpu_percent:.1f}%, Memory={memory_percent:.1f}%, Network={network_rx_mbps + network_tx_mbps:.1f}MB/s")
-            
+                src = 'PC-v2' if v2_avg else 'Prometheus'
+                logger.debug(f"📊 Metrics ({src}): CPU={cpu_percent:.1f}%, Memory={memory_percent:.1f}%, Network={network_rx_mbps + network_tx_mbps:.1f}MB/s")
+
             return metrics
-            
+
         except Exception as e:
-            logger.warning(f"⚠️  Failed to get enhanced metrics from Prometheus: {e}")
-            # Return default values if Prometheus is unavailable
+            logger.warning(f"⚠️  Failed to get metrics: {e}")
             return {
                 'cpu_percent': 0,
                 'memory_percent': 0,
@@ -5707,36 +6356,72 @@ class SmartExecutionController:
                 'disk': {'usage_percent': 0, 'io_utilization_percent': 0, 'total_gb': 0, 'used_gb': 0},
                 'nodes': [],
                 'resources': {},
+                'metrics_source': 'none',
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
     
     async def _get_per_node_metrics(self) -> List[Dict]:
-        """Get metrics per node (simplified - returns aggregated if per-node unavailable)"""
-        try:
-            # Try to get per-instance metrics
-            # This is a simplified version - in production you'd query per instance
-            cpu_query = 'node_load1'
-            cpu_value = await self._query_prometheus(cpu_query)
-            
-            mem_total = await self._query_prometheus('node_memory_MemTotal_bytes')
-            mem_available = await self._query_prometheus('node_memory_MemAvailable_bytes')
-            
-            if mem_total and mem_available:
-                mem_percent = ((mem_total - mem_available) / mem_total) * 100
-            else:
-                mem_percent = 0
-            
-            # Return simplified node data (in production, iterate over instances)
-            return [{
-                'name': 'cluster-aggregate',
-                'cpu_percent': min((cpu_value or 0) * 25, 100) if cpu_value else 0,
-                'memory_percent': mem_percent,
-                'network_rx_mbps': 0,  # Would need per-instance query
-                'network_tx_mbps': 0
-            }]
-        except Exception as e:
-            logger.debug(f"Could not get per-node metrics: {e}")
-            return []
+        """Return real-time per-host CPU and memory utilisation across all clusters.
+
+        Strategy (works for single-node, multi-node, and multi-cluster):
+        1. **PC v2 API** — ``/PrismGateway/services/rest/v2.0/hosts/`` gives
+           ``hypervisor_cpu_usage_ppm`` / ``hypervisor_memory_usage_ppm`` for
+           every physical host registered with Prism Central, regardless of how
+           many PE clusters exist.
+        2. **Prometheus fallback** — original ``node_cpu_seconds_total`` query,
+           useful when PC v2 is unreachable but a local Prometheus is available
+           (typically only sees the PCVM node).
+
+        Each entry includes ``cluster_name`` so the UI can group by cluster.
+        """
+        # ── Strategy 1: PC v2 real-time stats (covers all PEs) ──────────
+        v2_nodes = self._get_host_stats_via_v2()
+        if v2_nodes:
+            return v2_nodes
+
+        # ── Strategy 2: Prometheus (limited to K8s-visible nodes) ────────
+        if self.prometheus_url:
+            try:
+                cpu_query = (
+                    'sum(rate(node_cpu_seconds_total{mode!="idle"}[5m])) by (instance) '
+                    '/ count(node_cpu_seconds_total{mode="idle"}) by (instance) * 100'
+                )
+                cpu_results = self._query_prometheus_multi(cpu_query)
+
+                mem_query = (
+                    '(1 - node_memory_MemAvailable_bytes '
+                    '/ node_memory_MemTotal_bytes) * 100'
+                )
+                mem_results = self._query_prometheus_multi(mem_query)
+
+                mem_map: Dict[str, float] = {}
+                for r in mem_results:
+                    inst = r.get('metric', {}).get('instance', '')
+                    try:
+                        mem_map[inst] = round(float(r['value'][1]), 1)
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        pass
+
+                nodes: List[Dict] = []
+                for r in cpu_results:
+                    inst = r.get('metric', {}).get('instance', 'unknown')
+                    try:
+                        cpu_pct = round(float(r['value'][1]), 1)
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        cpu_pct = 0.0
+                    nodes.append({
+                        'node_id': inst,
+                        'name': inst.split(':')[0],
+                        'cluster_name': getattr(self, '_ncm_cluster_name', '') or self.cluster_name or '',
+                        'cpu_percent': cpu_pct,
+                        'memory_percent': mem_map.get(inst, 0.0),
+                    })
+                if nodes:
+                    return nodes
+            except Exception as e:
+                logger.debug(f"Prometheus per-node query failed: {e}")
+
+        return []
     
     async def _get_resource_allocation(self) -> Dict:
         """Get current resource allocation (VMs, CPU cores, Memory)"""
@@ -6712,6 +7397,9 @@ spec:
             full_execution_data = dict(self.get_status())
             full_execution_data['cluster_health_snapshot'] = getattr(self, '_cluster_health_snapshot', {})
             full_execution_data['pod_restart_tracking'] = self._get_pod_restart_tracking()
+
+            # Persist testbed topology so reports can show cluster/host breakdown
+            full_execution_data['testbed_topology'] = self._build_topology_dict()
             
             # Prepare execution data
             execution_data = {
@@ -6799,6 +7487,21 @@ spec:
                         logger.info(f"📊 Report data persisted for {self.execution_id}")
                     except Exception as rpt_err:
                         logger.warning(f"⚠️ Report flag update failed (non-fatal): {rpt_err}")
+
+                    # Phase 2: populate normalized drill-down tables (best-effort)
+                    try:
+                        from database import (
+                            batch_insert_api_logs,
+                            batch_insert_pod_events,
+                            batch_insert_metrics_timeline,
+                        )
+                        batch_insert_api_logs(self.execution_id, self.operations_history)
+                        prt = self._get_pod_restart_tracking()
+                        batch_insert_pod_events(self.execution_id, prt.get('restart_events') or [])
+                        batch_insert_metrics_timeline(self.execution_id, self.metrics_history)
+                        logger.info(f"📊 Detail tables populated for {self.execution_id}")
+                    except Exception as dt_err:
+                        logger.warning(f"⚠️ Detail tables insert failed (non-fatal): {dt_err}")
             else:
                 logger.error(f"Failed to persist execution {self.execution_id} to database")
         except Exception as e:
@@ -6958,7 +7661,9 @@ spec:
                 'cluster_uuid': self.cluster_uuid,
                 'subnet_name': self.subnet_name
             },
-            
+
+            'testbed_topology': self._build_topology_dict(),
+
             'progress': {
                 'cpu_progress_percent': cpu_progress,
                 'memory_progress_percent': mem_progress,
@@ -7325,6 +8030,9 @@ spec:
                 'cluster_uuid': self.cluster_uuid,
                 'testbed_label': self.testbed_info.get('testbed_label')
             },
+
+            # Testbed topology (clusters + hosts)
+            'testbed_topology': self._build_topology_dict(),
             
             # Created entities
             'created_entities': [
@@ -7362,6 +8070,9 @@ spec:
             
             # Pod restart tracking (continuous monitoring during execution)
             'pod_restart_tracking': self._get_pod_restart_tracking(),
+
+            # Learning summary
+            'learning_summary': getattr(self, '_learning_summary', '') or '',
         }
     
     def _generate_analysis(self) -> Dict[str, Any]:

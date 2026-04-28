@@ -23,6 +23,13 @@ from models.testbed import Testbed
 # Import the SmartExecution model
 from models.smart_execution import SmartExecution
 
+# Import execution detail tables (Phase 2 — normalized drill-down data)
+from models.execution_detail_tables import (
+    ExecutionApiLog,
+    ExecutionPodEvent,
+    ExecutionMetricsTimeline,
+)
+
 # Use 127.0.0.1 (not localhost) so libpq uses TCP + md5/pg_hba "host" rules; "localhost" can use ::1 or socket.
 DATABASE_URL = os.environ.get(
     'DATABASE_URL',
@@ -1407,6 +1414,173 @@ def recover_orphaned_executions():
         session.close()
 
     return recovered_count
+
+
+# ============================================================================
+# EXECUTION DETAIL TABLES — batch helpers (Phase 2)
+# ============================================================================
+
+def batch_insert_api_logs(execution_id: str, operations: list):
+    """
+    Bulk-insert operation records into execution_api_logs.
+
+    Args:
+        execution_id: Smart-execution ID
+        operations: list of dicts from operations_history
+    Returns:
+        int: number of rows inserted (0 on failure)
+    """
+    if not operations:
+        return 0
+    session = SessionLocal()
+    try:
+        rows = []
+        for op in operations:
+            rows.append(ExecutionApiLog(
+                execution_id=execution_id,
+                iteration=op.get('iteration'),
+                entity_type=op.get('entity_type'),
+                operation=op.get('operation'),
+                entity_name=(op.get('entity_name') or '')[:255],
+                api_url=op.get('api_url'),
+                http_method=op.get('http_method'),
+                http_status_code=op.get('http_status_code'),
+                status=op.get('status'),
+                request_payload=op.get('request_payload'),
+                response_body=op.get('response_body'),
+                error_message=(op.get('error') or '')[:2000] or None,
+                duration_seconds=op.get('duration_seconds'),
+                timestamp=_parse_ts(op.get('start_time') or op.get('timestamp')),
+            ))
+        session.bulk_save_objects(rows)
+        session.commit()
+        logging.info(f"[Phase2] Inserted {len(rows)} api_log rows for {execution_id[:12]}")
+        return len(rows)
+    except Exception as e:
+        session.rollback()
+        logging.error(f"[Phase2] batch_insert_api_logs error: {e}")
+        return 0
+    finally:
+        session.close()
+
+
+def batch_insert_pod_events(execution_id: str, events: list):
+    """
+    Bulk-insert pod restart events into execution_pod_events.
+
+    Args:
+        execution_id: Smart-execution ID
+        events: list of restart-event dicts from pod_restart_tracking.restart_events
+    Returns:
+        int: number of rows inserted
+    """
+    if not events:
+        return 0
+    session = SessionLocal()
+    try:
+        rows = []
+        for ev in events:
+            log_snippet_raw = ev.get('log_snippet') or ''
+            if len(log_snippet_raw) > 2048:
+                log_snippet_raw = log_snippet_raw[:2048]
+            rows.append(ExecutionPodEvent(
+                execution_id=execution_id,
+                pod_name=(ev.get('pod') or '')[:255],
+                namespace=ev.get('namespace'),
+                container=ev.get('container'),
+                event_type='restart',
+                restart_reason=ev.get('restart_reason'),
+                exit_code=ev.get('exit_code'),
+                new_restarts=ev.get('new_restarts', 0),
+                total_since_start=ev.get('total_since_start', 0),
+                cumulative_total=ev.get('cumulative_total', 0),
+                log_snippet=log_snippet_raw or None,
+                execution_elapsed_min=ev.get('execution_elapsed_min'),
+                detected_at=_parse_ts(ev.get('detected_at')),
+            ))
+        session.bulk_save_objects(rows)
+        session.commit()
+        logging.info(f"[Phase2] Inserted {len(rows)} pod_event rows for {execution_id[:12]}")
+        return len(rows)
+    except Exception as e:
+        session.rollback()
+        logging.error(f"[Phase2] batch_insert_pod_events error: {e}")
+        return 0
+    finally:
+        session.close()
+
+
+def batch_insert_metrics_timeline(execution_id: str, metrics_history: list):
+    """
+    Bulk-insert metrics timeline (cluster + per-node) into execution_metrics_timeline.
+
+    For each metrics_history entry we write one cluster-level row and one row per node
+    in per_node (if present).
+
+    Args:
+        execution_id: Smart-execution ID
+        metrics_history: list of metric sample dicts
+    Returns:
+        int: number of rows inserted
+    """
+    if not metrics_history:
+        return 0
+    session = SessionLocal()
+    try:
+        rows = []
+        for m in metrics_history:
+            ts = _parse_ts(m.get('timestamp'))
+            iteration = m.get('iteration')
+            cpu = m.get('cpu_percent')
+            mem = m.get('memory_percent')
+
+            rows.append(ExecutionMetricsTimeline(
+                execution_id=execution_id,
+                iteration=iteration,
+                cluster_cpu_percent=cpu,
+                cluster_memory_percent=mem,
+                node_id=None,
+                node_name=None,
+                node_cpu_percent=None,
+                node_memory_percent=None,
+                timestamp=ts,
+            ))
+
+            for node in (m.get('per_node') or []):
+                rows.append(ExecutionMetricsTimeline(
+                    execution_id=execution_id,
+                    iteration=iteration,
+                    cluster_cpu_percent=cpu,
+                    cluster_memory_percent=mem,
+                    node_id=node.get('node_id'),
+                    node_name=node.get('name'),
+                    node_cpu_percent=node.get('cpu_percent'),
+                    node_memory_percent=node.get('memory_percent'),
+                    timestamp=ts,
+                ))
+
+        session.bulk_save_objects(rows)
+        session.commit()
+        logging.info(f"[Phase2] Inserted {len(rows)} metrics_timeline rows for {execution_id[:12]}")
+        return len(rows)
+    except Exception as e:
+        session.rollback()
+        logging.error(f"[Phase2] batch_insert_metrics_timeline error: {e}")
+        return 0
+    finally:
+        session.close()
+
+
+def _parse_ts(val):
+    """Best-effort parse an ISO-ish timestamp string into a datetime."""
+    if val is None:
+        return datetime.utcnow()
+    if isinstance(val, datetime):
+        return val
+    try:
+        return datetime.fromisoformat(str(val).replace('Z', '+00:00'))
+    except Exception:
+        return datetime.utcnow()
 
 
 if __name__ == "__main__":
