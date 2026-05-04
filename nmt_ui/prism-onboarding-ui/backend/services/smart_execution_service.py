@@ -142,7 +142,24 @@ class SmartExecutionController:
         """
         self.testbed_info = testbed_info
         self.target_config = target_config
-        self.entities_config = entities_config
+
+        # Normalize entities_config: {"vm": true} → {"vm": ["create","delete","list"]}
+        DEFAULT_OPS = {
+            'vm': ['create', 'delete', 'list'],
+            'image': ['create', 'delete', 'list'],
+            'subnet': ['create', 'delete', 'list'],
+            'category': ['create', 'delete', 'list'],
+            'project': ['create', 'delete', 'list'],
+        }
+        _ec = {}
+        for k, v in (entities_config or {}).items():
+            if v is True:
+                _ec[k] = DEFAULT_OPS.get(k.lower(), ['create', 'delete', 'list'])
+            elif v is False or v is None:
+                continue
+            else:
+                _ec[k] = v
+        self.entities_config = _ec if _ec else entities_config
         
         # Rule configuration for pod filtering and monitoring
         self.rule_config = rule_config or {
@@ -700,10 +717,12 @@ class SmartExecutionController:
     
     def _build_topology_dict(self) -> Dict:
         """Build a serialisable topology dict from the cached host discovery data."""
+        cluster_ip_map = {c['name']: c.get('external_ip', '') for c in getattr(self, '_all_clusters', [])}
         return {
             'topology_type': getattr(self, '_topology_type', 'unknown'),
             'clusters': [
-                {'name': cname, 'host_count': len(hosts),
+                {'name': cname, 'ip': cluster_ip_map.get(cname, ''),
+                 'host_count': len(hosts),
                  'hosts': [{'name': h['name'], 'uuid': h['uuid'],
                             'hypervisor_ip': h.get('hypervisor_ip', ''),
                             'num_cpu_cores': h.get('num_cpu_cores', 0),
@@ -857,6 +876,7 @@ class SmartExecutionController:
         url = f"https://{pc_ip}:{port}/PrismGateway/services/rest/v2.0/hosts/"
 
         cluster_name_map = {c['uuid']: c['name'] for c in self._all_clusters}
+        cluster_ip_map = {c['name']: c.get('external_ip', '') for c in self._all_clusters}
         try:
             resp = requests.get(url, auth=(username, password), verify=False, timeout=10)
             if resp.status_code != 200:
@@ -884,6 +904,7 @@ class SmartExecutionController:
                     'node_id': h_uuid,
                     'name': h_name,
                     'cluster_name': c_name,
+                    'cluster_ip': cluster_ip_map.get(c_name, ''),
                     'cpu_percent': cpu_pct,
                     'memory_percent': mem_pct,
                     'num_cpu_cores': num_cores,
@@ -1378,6 +1399,61 @@ class SmartExecutionController:
                             pod, namespace, container, restart_reason,
                             exit_code, k8s_events.get(pod, []),
                         )
+
+                        # Capture concurrent operation for correlation
+                        concurrent_op = None
+                        if self.operations_history:
+                            recent = [o for o in self.operations_history[-5:]
+                                      if o.get('status') in ('SUCCESS', 'FAILED', 'RUNNING')]
+                            if recent:
+                                last_op = recent[-1]
+                                concurrent_op = f"{last_op.get('entity_type','')}.{last_op.get('operation','')}"
+
+                        # Capture pod CPU & memory usage + limits (best-effort from Prometheus)
+                        pod_memory_mb = None
+                        pod_memory_limit_mb = None
+                        pod_memory_request_mb = None
+                        pod_cpu_cores = None
+                        pod_cpu_limit_cores = None
+                        pod_cpu_request_cores = None
+                        try:
+                            mem_q = f'container_memory_working_set_bytes{{pod="{pod}",container="{container}",namespace="{namespace}"}}'
+                            mem_r = self._query_prometheus_multi(mem_q)
+                            if mem_r:
+                                pod_memory_mb = round(float(mem_r[0].get('value', [0, 0])[1]) / (1024 * 1024), 1)
+                            lim_q = f'kube_pod_container_resource_limits{{pod="{pod}",container="{container}",resource="memory",namespace="{namespace}"}}'
+                            lim_r = self._query_prometheus_multi(lim_q)
+                            if lim_r:
+                                pod_memory_limit_mb = round(float(lim_r[0].get('value', [0, 0])[1]) / (1024 * 1024), 1)
+                            req_q = f'kube_pod_container_resource_requests{{pod="{pod}",container="{container}",resource="memory",namespace="{namespace}"}}'
+                            req_r = self._query_prometheus_multi(req_q)
+                            if req_r:
+                                pod_memory_request_mb = round(float(req_r[0].get('value', [0, 0])[1]) / (1024 * 1024), 1)
+                            cpu_q = f'rate(container_cpu_usage_seconds_total{{pod="{pod}",container="{container}",namespace="{namespace}"}}[2m])'
+                            cpu_r = self._query_prometheus_multi(cpu_q)
+                            if cpu_r:
+                                pod_cpu_cores = round(float(cpu_r[0].get('value', [0, 0])[1]), 3)
+                            cpu_lim_q = f'kube_pod_container_resource_limits{{pod="{pod}",container="{container}",resource="cpu",namespace="{namespace}"}}'
+                            cpu_lim_r = self._query_prometheus_multi(cpu_lim_q)
+                            if cpu_lim_r:
+                                pod_cpu_limit_cores = round(float(cpu_lim_r[0].get('value', [0, 0])[1]), 3)
+                            cpu_req_q = f'kube_pod_container_resource_requests{{pod="{pod}",container="{container}",resource="cpu",namespace="{namespace}"}}'
+                            cpu_req_r = self._query_prometheus_multi(cpu_req_q)
+                            if cpu_req_r:
+                                pod_cpu_request_cores = round(float(cpu_req_r[0].get('value', [0, 0])[1]), 3)
+                        except Exception:
+                            pass
+
+                        # Capture node the pod is running on (best-effort)
+                        pod_node = None
+                        try:
+                            node_q = f'kube_pod_info{{pod="{pod}",namespace="{namespace}"}}'
+                            node_r = self._query_prometheus_multi(node_q)
+                            if node_r:
+                                pod_node = node_r[0].get('metric', {}).get('node', '')
+                        except Exception:
+                            pass
+
                         event = {
                             'pod': pod,
                             'namespace': namespace,
@@ -1392,6 +1468,14 @@ class SmartExecutionController:
                             'execution_elapsed_min': round(
                                 (now - self.start_time).total_seconds() / 60, 1
                             ) if self.start_time else 0,
+                            'concurrent_operation': concurrent_op,
+                            'pod_memory_mb': pod_memory_mb,
+                            'pod_memory_limit_mb': pod_memory_limit_mb,
+                            'pod_memory_request_mb': pod_memory_request_mb,
+                            'pod_cpu_cores': pod_cpu_cores,
+                            'pod_cpu_limit_cores': pod_cpu_limit_cores,
+                            'pod_cpu_request_cores': pod_cpu_request_cores,
+                            'node': pod_node,
                         }
                         self._pod_restart_events.append(event)
                         self._emit_event(
@@ -1477,12 +1561,13 @@ class SmartExecutionController:
         pod: str, namespace: str, container: str,
         reason: str, exit_code: Optional[int],
         k8s_events: List[Dict],
-        max_bytes: int = 2048,
+        max_bytes: int = 4096,
     ) -> str:
         """Compose a human-readable log snippet for a pod restart event.
 
-        Combines Prometheus termination reason/exit code with any Kubernetes
-        warning events captured for this pod.  Truncated to *max_bytes*.
+        Combines Prometheus termination reason/exit code, Kubernetes warning
+        events, and previous container logs (kubectl logs --previous) into
+        a single diagnostic snippet.  Truncated to *max_bytes*.
         """
         lines: List[str] = []
         lines.append(f"=== Pod Restart Log ===")
@@ -1510,6 +1595,25 @@ class SmartExecutionController:
                 msg = ev.get('message', '')
                 cnt = ev.get('count', 1)
                 lines.append(f"[{ts}] {r} (x{cnt}): {msg}")
+
+        # Fetch previous container logs (the crashed container's last output)
+        try:
+            from kubernetes import client as k8s_client, config as k8s_config
+            try:
+                k8s_config.load_incluster_config()
+            except k8s_config.ConfigException:
+                k8s_config.load_kube_config()
+            v1 = k8s_client.CoreV1Api()
+            prev_logs = v1.read_namespaced_pod_log(
+                name=pod, namespace=namespace, container=container,
+                previous=True, tail_lines=30, _request_timeout=5,
+            )
+            if prev_logs and prev_logs.strip():
+                lines.append("")
+                lines.append("--- Previous Container Logs (last 30 lines) ---")
+                lines.append(prev_logs.strip())
+        except Exception:
+            pass
 
         snippet = "\n".join(lines)
         if len(snippet.encode('utf-8', errors='replace')) > max_bytes:
@@ -1781,7 +1885,9 @@ class SmartExecutionController:
     async def _execution_loop(self):
         """Main execution loop with feedback control"""
         iteration = 0
-        timeout_minutes = self.target_config.get('max_duration_minutes') or self.target_config.get('timeout_minutes', 0)
+        timeout_minutes = (self.target_config.get('max_duration_minutes')
+                          or self.target_config.get('duration_minutes')
+                          or self.target_config.get('timeout_minutes', 0))
         if self._longevity_enabled and self._longevity_duration_hours > 0:
             timeout_minutes = self._longevity_duration_hours * 60
         
@@ -2636,18 +2742,20 @@ class SmartExecutionController:
             # Filter out tasks if paused or stopped
             operation_tasks = [(e, o) for e, o in operation_tasks if self.is_running and not self.is_paused]
             
+            if not operation_tasks:
+                logger.warning(f"⚠️ Empty task list after filtering")
+                return batch_results
+            
             # Execute operations (parallel or sequential)
             if self.parallel_execution_enabled and len(operation_tasks) > 1:
-                # Phase 2: Parallel execution
                 batch_results = await self._execute_operations_parallel(operation_tasks, iteration)
             else:
-                # Sequential execution (original)
                 batch_results = await self._execute_operations_sequential(operation_tasks, iteration)
             
         except Exception as e:
             logger.error(f"❌ Error executing operations batch: {e}")
             import traceback
-            logger.debug(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
         
         return batch_results
     
@@ -3473,6 +3581,7 @@ class SmartExecutionController:
                     'stress_enabled': enable_stress,
                     'api_url': '/api/nutanix/v3/vms',
                     'http_method': 'POST',
+                    'http_status_code': response[0].status,
                     'request_payload': self._truncate_for_storage(vm_payload, 2048),
                     'response_body': self._truncate_for_storage(body, 4096, keys_only_on_success=True),
                 }
@@ -3489,6 +3598,7 @@ class SmartExecutionController:
                     'uuid': None,
                     'api_url': '/api/nutanix/v3/vms',
                     'http_method': 'POST',
+                    'http_status_code': status_code,
                     'request_payload': self._truncate_for_storage(vm_payload, 2048),
                     'response_body': self._truncate_for_storage(resp_body, 4096),
                 }
@@ -3502,7 +3612,10 @@ class SmartExecutionController:
                 'error': str(e),
                 'error_type': type(e).__name__,
                 'error_code': getattr(e, 'status_code', None),
-                'uuid': None
+                'http_status_code': getattr(e, 'status_code', None),
+                'uuid': None,
+                'api_url': '/api/nutanix/v3/vms',
+                'http_method': 'POST',
             }
     
     async def _delete_vm(self) -> Dict:
@@ -3516,12 +3629,13 @@ class SmartExecutionController:
                 vm_uuid = entry['uuid']
                 vm_name = entry.get('name', vm_uuid[:12])
                 logger.info(f"🗑️  Deleting tracked VM: {vm_name} ({vm_uuid})")
-                await pc.v3_request(endpoint=f"/vms/{vm_uuid}", method="DELETE")
+                del_resp = await pc.v3_request(endpoint=f"/vms/{vm_uuid}", method="DELETE")
                 logger.info(f"✅ VM deleted (tracked): {vm_uuid}")
                 return {
                     'status': 'SUCCESS', 'uuid': vm_uuid, 'error': None,
                     'api_url': f'/api/nutanix/v3/vms/{vm_uuid}',
                     'http_method': 'DELETE',
+                    'http_status_code': del_resp[0].status if del_resp else 200,
                     'request_payload': {'vm_name': vm_name, 'vm_uuid': vm_uuid},
                     'response_body': {'deleted': True},
                 }
@@ -3536,12 +3650,13 @@ class SmartExecutionController:
                     if vm_name.startswith('smart-vm-'):
                         vm_uuid = vm['metadata']['uuid']
                         logger.info(f"🗑️  Deleting VM: {vm_name} ({vm_uuid})")
-                        await pc.v3_request(endpoint=f"/vms/{vm_uuid}", method="DELETE")
+                        del_resp = await pc.v3_request(endpoint=f"/vms/{vm_uuid}", method="DELETE")
                         logger.info(f"✅ VM deleted: {vm_name}")
                         return {
                             'status': 'SUCCESS', 'uuid': vm_uuid, 'error': None,
                             'api_url': f'/api/nutanix/v3/vms/{vm_uuid}',
                             'http_method': 'DELETE',
+                            'http_status_code': del_resp[0].status if del_resp else 200,
                             'request_payload': {'vm_name': vm_name, 'vm_uuid': vm_uuid},
                             'response_body': {'deleted': True},
                         }
@@ -3553,25 +3668,44 @@ class SmartExecutionController:
     
     async def _list_vms(self) -> Dict:
         """List VMs — lightweight read operation for API load generation."""
+        list_payload = {"kind": "vm", "length": 20}
+        api_url = '/api/nutanix/v3/vms/list'
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
             response = await asyncio.wait_for(
                 pc.v3_request(endpoint="/vms/list", method="POST",
-                              payload={"kind": "vm", "length": 20}),
+                              payload=list_payload),
                 timeout=30.0
             )
             if response and response[0].status in (200, 202):
-                entities = response[0].body.get('entities', []) if isinstance(response[0].body, dict) else []
+                body = response[0].body if isinstance(response[0].body, dict) else {}
+                entities = body.get('entities', [])
                 logger.info(f"✅ VM list returned {len(entities)} VMs")
-                return {'status': 'SUCCESS', 'uuid': None, 'error': None, 'count': len(entities)}
+                return {
+                    'status': 'SUCCESS', 'uuid': None, 'error': None, 'count': len(entities),
+                    'api_url': api_url, 'http_method': 'POST',
+                    'http_status_code': response[0].status,
+                    'request_payload': list_payload,
+                    'response_body': {'metadata': body.get('metadata', {}), 'entity_count': len(entities)},
+                }
             else:
+                status_code = response[0].status if response else None
                 error_msg = self._extract_api_error(response)
-                return {'status': 'FAILED', 'error': f'VM list failed: {error_msg}', 'uuid': None}
+                resp_body = response[0].body if response else None
+                return {
+                    'status': 'FAILED', 'error': f'VM list failed: {error_msg}', 'uuid': None,
+                    'api_url': api_url, 'http_method': 'POST',
+                    'http_status_code': status_code,
+                    'request_payload': list_payload,
+                    'response_body': self._truncate_for_storage(resp_body, 4096),
+                }
         except asyncio.TimeoutError:
-            return {'status': 'FAILED', 'error': 'VM list timed out', 'uuid': None}
+            return {'status': 'FAILED', 'error': 'VM list timed out', 'uuid': None,
+                    'api_url': api_url, 'http_method': 'POST', 'request_payload': list_payload}
         except Exception as e:
             logger.error(f"VM list failed: {e}")
-            return {'status': 'FAILED', 'error': str(e), 'uuid': None}
+            return {'status': 'FAILED', 'error': str(e), 'uuid': None,
+                    'api_url': api_url, 'http_method': 'POST', 'request_payload': list_payload}
 
     async def _update_vm(self, vm_name: str) -> Dict:
         """Update a VM — prefer tracked UUID, fall back to API list."""
@@ -3614,21 +3748,35 @@ class SmartExecutionController:
             spec['description'] = f'Updated by smart execution {self.execution_id}'
             update_payload = {'spec': spec, 'metadata': vm_body.get('metadata', {})}
 
+            api_url = f'/api/nutanix/v3/vms/{target_uuid}'
             update_resp = await asyncio.wait_for(
                 pc.v3_request(endpoint=f"/vms/{target_uuid}", method="PUT", payload=update_payload),
                 timeout=30.0
             )
             if update_resp and update_resp[0].status in (200, 202):
                 logger.info(f"✅ VM updated: {target_uuid}")
-                return {'status': 'SUCCESS', 'uuid': target_uuid, 'error': None}
+                return {
+                    'status': 'SUCCESS', 'uuid': target_uuid, 'error': None,
+                    'api_url': api_url, 'http_method': 'PUT',
+                    'request_payload': self._truncate_for_storage(update_payload, 2048),
+                    'response_body': self._truncate_for_storage(update_resp[0].body, 4096, keys_only_on_success=True),
+                }
             else:
                 error_msg = self._extract_api_error(update_resp)
-                return {'status': 'FAILED', 'error': f'VM update failed: {error_msg}', 'uuid': None}
+                resp_body = update_resp[0].body if update_resp else None
+                return {
+                    'status': 'FAILED', 'error': f'VM update failed: {error_msg}', 'uuid': None,
+                    'api_url': api_url, 'http_method': 'PUT',
+                    'request_payload': self._truncate_for_storage(update_payload, 2048),
+                    'response_body': self._truncate_for_storage(resp_body, 4096),
+                }
         except asyncio.TimeoutError:
-            return {'status': 'FAILED', 'error': 'VM update timed out', 'uuid': None}
+            return {'status': 'FAILED', 'error': 'VM update timed out', 'uuid': None,
+                    'api_url': '/api/nutanix/v3/vms/<uuid>', 'http_method': 'PUT'}
         except Exception as e:
             logger.error(f"VM update failed: {e}")
-            return {'status': 'FAILED', 'error': str(e), 'uuid': None}
+            return {'status': 'FAILED', 'error': str(e), 'uuid': None,
+                    'api_url': '/api/nutanix/v3/vms/<uuid>', 'http_method': 'PUT'}
 
     async def _power_vm(self, power_state: str) -> Dict:
         """Power on/off a VM - HIGH IMPACT CPU OPERATION"""
@@ -4420,14 +4568,26 @@ class SmartExecutionController:
             if resp and resp[0].status in (200, 202):
                 uid = resp[0].body.get('metadata', {}).get('uuid') if isinstance(resp[0].body, dict) else None
                 logger.info(f"✅ Image create initiated: {image_name}")
-                return {'status': 'SUCCESS', 'uuid': uid, 'error': None}
+                return {'status': 'SUCCESS', 'uuid': uid, 'error': None,
+                        'api_url': '/api/nutanix/v3/images', 'http_method': 'POST',
+                        'http_status_code': resp[0].status,
+                        'request_payload': self._truncate_for_storage(payload, 2048),
+                        'response_body': self._truncate_for_storage(resp[0].body, 4096, keys_only_on_success=True)}
             else:
+                status_code = resp[0].status if resp else None
                 error_msg = self._extract_api_error(resp)
-                return {'status': 'FAILED', 'error': f'Image create: {error_msg}', 'uuid': None}
+                resp_body = resp[0].body if resp else None
+                return {'status': 'FAILED', 'error': f'Image create: {error_msg}', 'uuid': None,
+                        'api_url': '/api/nutanix/v3/images', 'http_method': 'POST',
+                        'http_status_code': status_code,
+                        'request_payload': self._truncate_for_storage(payload, 2048),
+                        'response_body': self._truncate_for_storage(resp_body, 4096)}
         except asyncio.TimeoutError:
-            return {'status': 'FAILED', 'error': 'Image create timed out', 'uuid': None}
+            return {'status': 'FAILED', 'error': 'Image create timed out', 'uuid': None,
+                    'api_url': '/api/nutanix/v3/images', 'http_method': 'POST'}
         except Exception as e:
-            return {'status': 'FAILED', 'error': str(e), 'uuid': None}
+            return {'status': 'FAILED', 'error': str(e), 'uuid': None,
+                    'api_url': '/api/nutanix/v3/images', 'http_method': 'POST'}
 
     async def _delete_image(self) -> Dict:
         """Delete an image — prefer tracked UUID, fall back to API list."""
@@ -4445,7 +4605,11 @@ class SmartExecutionController:
                 )
                 if del_resp and del_resp[0].status in (200, 202, 204):
                     logger.info(f"✅ Image deleted (tracked): {img_uuid}")
-                    return {'status': 'SUCCESS', 'uuid': img_uuid, 'error': None}
+                    return {'status': 'SUCCESS', 'uuid': img_uuid, 'error': None,
+                            'api_url': f'/api/nutanix/v3/images/{img_uuid}', 'http_method': 'DELETE',
+                            'http_status_code': del_resp[0].status,
+                            'request_payload': {'image_name': entry.get('name'), 'image_uuid': img_uuid},
+                            'response_body': {'deleted': True}}
 
             resp = await asyncio.wait_for(
                 pc.v3_request(endpoint="/images/list", method="POST",
@@ -4463,30 +4627,56 @@ class SmartExecutionController:
                         )
                         if del_resp and del_resp[0].status in (200, 202, 204):
                             logger.info(f"✅ Image deleted: {img_name}")
-                            return {'status': 'SUCCESS', 'uuid': img_uuid, 'error': None}
-            return {'status': 'SKIPPED', 'error': 'No smart- image exists yet — nothing to delete', 'uuid': None}
+                            return {'status': 'SUCCESS', 'uuid': img_uuid, 'error': None,
+                                    'api_url': f'/api/nutanix/v3/images/{img_uuid}', 'http_method': 'DELETE',
+                                    'http_status_code': del_resp[0].status,
+                                    'request_payload': {'image_name': img_name, 'image_uuid': img_uuid},
+                                    'response_body': {'deleted': True}}
+            return {'status': 'SKIPPED', 'error': 'No smart- image exists yet — nothing to delete', 'uuid': None,
+                    'api_url': '/api/nutanix/v3/images', 'http_method': 'DELETE'}
         except asyncio.TimeoutError:
-            return {'status': 'FAILED', 'error': 'Image delete timed out', 'uuid': None}
+            return {'status': 'FAILED', 'error': 'Image delete timed out', 'uuid': None,
+                    'api_url': '/api/nutanix/v3/images', 'http_method': 'DELETE'}
         except Exception as e:
-            return {'status': 'FAILED', 'error': str(e), 'uuid': None}
+            return {'status': 'FAILED', 'error': str(e), 'uuid': None,
+                    'api_url': '/api/nutanix/v3/images', 'http_method': 'DELETE'}
 
     async def _list_images(self) -> Dict:
         """List images — lightweight read operation."""
+        list_payload = {"kind": "image", "length": 20}
+        api_url = '/api/nutanix/v3/images/list'
         try:
             pc = getattr(self, 'pc_client', self.ncm_client) or self.ncm_client
             resp = await asyncio.wait_for(
                 pc.v3_request(endpoint="/images/list", method="POST",
-                              payload={"kind": "image", "length": 20}),
+                              payload=list_payload),
                 timeout=30.0
             )
             if resp and resp[0].status in (200, 202):
-                count = len(resp[0].body.get('entities', [])) if isinstance(resp[0].body, dict) else 0
-                return {'status': 'SUCCESS', 'uuid': None, 'error': None, 'count': count}
-            return {'status': 'FAILED', 'error': 'Image list failed', 'uuid': None}
+                body = resp[0].body if isinstance(resp[0].body, dict) else {}
+                count = len(body.get('entities', []))
+                return {
+                    'status': 'SUCCESS', 'uuid': None, 'error': None, 'count': count,
+                    'api_url': api_url, 'http_method': 'POST',
+                    'http_status_code': resp[0].status,
+                    'request_payload': list_payload,
+                    'response_body': {'metadata': body.get('metadata', {}), 'entity_count': count},
+                }
+            status_code = resp[0].status if resp else None
+            resp_body = resp[0].body if resp else None
+            return {
+                'status': 'FAILED', 'error': 'Image list failed', 'uuid': None,
+                'api_url': api_url, 'http_method': 'POST',
+                'http_status_code': status_code,
+                'request_payload': list_payload,
+                'response_body': self._truncate_for_storage(resp_body, 4096),
+            }
         except asyncio.TimeoutError:
-            return {'status': 'FAILED', 'error': 'Image list timed out', 'uuid': None}
+            return {'status': 'FAILED', 'error': 'Image list timed out', 'uuid': None,
+                    'api_url': api_url, 'http_method': 'POST', 'request_payload': list_payload}
         except Exception as e:
-            return {'status': 'FAILED', 'error': str(e), 'uuid': None}
+            return {'status': 'FAILED', 'error': str(e), 'uuid': None,
+                    'api_url': api_url, 'http_method': 'POST', 'request_payload': list_payload}
 
     async def _execute_subnet_operation(self, operation: str, subnet_name: str) -> Dict:
         """Execute Subnet operation"""
@@ -6485,10 +6675,13 @@ class SmartExecutionController:
                         cpu_pct = round(float(r['value'][1]), 1)
                     except (KeyError, IndexError, TypeError, ValueError):
                         cpu_pct = 0.0
+                    prom_cluster = getattr(self, '_ncm_cluster_name', '') or self.cluster_name or ''
+                    prom_cluster_ip_map = {c['name']: c.get('external_ip', '') for c in getattr(self, '_all_clusters', [])}
                     nodes.append({
                         'node_id': inst,
                         'name': inst.split(':')[0],
-                        'cluster_name': getattr(self, '_ncm_cluster_name', '') or self.cluster_name or '',
+                        'cluster_name': prom_cluster,
+                        'cluster_ip': prom_cluster_ip_map.get(prom_cluster, ''),
                         'cpu_percent': cpu_pct,
                         'memory_percent': mem_map.get(inst, 0.0),
                     })
@@ -7646,6 +7839,14 @@ spec:
 
             # Persist testbed topology so reports can show cluster/host breakdown
             full_execution_data['testbed_topology'] = self._build_topology_dict()
+
+            # Persist FULL data (not truncated) so completed reports are complete
+            full_execution_data['event_timeline'] = list(self._event_timeline)
+            full_execution_data['event_timeline_total'] = len(self._event_timeline)
+            full_execution_data['resource_lifecycle'] = self._get_resource_lifecycle_summary()
+            full_execution_data['data_quality'] = self._compute_data_quality()
+            full_execution_data['metrics_stats'] = self._compute_metrics_stats()
+            full_execution_data['cleanup_results'] = self._cleanup_results
             
             # Prepare execution data
             execution_data = {
@@ -8759,6 +8960,10 @@ spec:
         
         if not self.ncm_client:
             logger.warning("⚠️  No NCM client available for cleanup")
+            for r in self._resource_lifecycle:
+                if r['deleted_at'] is None and r['cleanup_status'] == 'pending':
+                    r['cleanup_status'] = 'cleanup_skipped'
+                    r['cleanup_error'] = 'NCM client not available'
             return {
                 'total': total_entities,
                 'success': 0,
@@ -8802,6 +9007,10 @@ spec:
                             'entity_name': entity_name,
                             'reason': 'Cleanup not implemented (simulated entity)'
                         })
+                        for r in self._resource_lifecycle:
+                            if r['entity_uuid'] == entity_uuid:
+                                r['cleanup_status'] = 'cleanup_skipped'
+                                r['cleanup_error'] = f'Cleanup not implemented for {entity_type}'
                         continue
                     
                     if result['success']:
@@ -8848,6 +9057,7 @@ spec:
             'skipped': len(cleanup_results['skipped']),
             'results': cleanup_results
         }
+        self._cleanup_results = summary
         
         logger.info(f"🧹 Cleanup complete: {summary['success']}/{total_entities} deleted, {summary['failed']} failed, {summary['skipped']} skipped")
         return summary

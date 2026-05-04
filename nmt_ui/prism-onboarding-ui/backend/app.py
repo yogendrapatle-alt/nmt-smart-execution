@@ -4059,17 +4059,27 @@ def start_smart_execution_api():
         if not entities_config:
             return jsonify({'success': False, 'error': 'entities_config is required'}), 400
         
-        # Handle both old and new entity_config formats
-        # Old: {"VM": ["create", "delete"]}
-        # New: {"vm": {"create": 5, "delete": 5}}
+        # Handle multiple entity_config formats:
+        # Boolean: {"vm": true}  → expand to default ops
+        # List:    {"VM": ["create", "delete"]}
+        # Dict:    {"vm": {"create": 5, "delete": 5}}
+        DEFAULT_ENTITY_OPS = {
+            'vm': {'create': 5, 'delete': 3, 'list': 2},
+            'image': {'create': 3, 'delete': 2, 'list': 2},
+            'subnet': {'create': 3, 'delete': 2, 'list': 2},
+            'category': {'create': 3, 'delete': 2, 'list': 2},
+            'project': {'create': 3, 'delete': 2, 'list': 2},
+        }
         normalized_entities = {}
         for entity, ops in entities_config.items():
             entity_lower = entity.lower().replace(' ', '_')
-            if isinstance(ops, list):
-                # Old format - convert to new format with default counts
+            if ops is True:
+                normalized_entities[entity_lower] = DEFAULT_ENTITY_OPS.get(entity_lower, {'create': 5, 'delete': 3, 'list': 2})
+            elif ops is False or ops is None:
+                continue
+            elif isinstance(ops, list):
                 normalized_entities[entity_lower] = {op: 5 for op in ops}
             elif isinstance(ops, dict):
-                # New format - use as is
                 normalized_entities[entity_lower] = ops
         
         # Get testbed details
@@ -5554,8 +5564,8 @@ def get_enhanced_smart_execution_report(execution_id):
                 status = {
                     'status': engine.phase,
                     'total_operations': engine.total_operations_executed,
-                    'metrics_history': [{'cpu_percent': m.get('cpu',0), 'memory_percent': m.get('memory',0), 'timestamp': m.get('timestamp','')} for m in engine.metrics_history[-50:]],
-                    'operations_history': engine.operation_history[-100:],
+                    'metrics_history': [{'cpu_percent': m.get('cpu',0), 'memory_percent': m.get('memory',0), 'timestamp': m.get('timestamp','')} for m in engine.metrics_history],
+                    'operations_history': list(engine.operation_history),
                     'target_config': summary.get('target_config', {}),
                     'current_metrics': summary.get('current_metrics', {}),
                 }
@@ -5568,6 +5578,8 @@ def get_enhanced_smart_execution_report(execution_id):
                 status = controller.get_status()
                 report_data = controller.get_report()
                 prometheus_url = getattr(controller, 'prometheus_url', None)
+                status['operations_history'] = list(getattr(controller, 'operations_history', []))
+                status['metrics_history'] = list(getattr(controller, 'metrics_history', []))
 
         if not report_data:
             db_data = None
@@ -5619,6 +5631,12 @@ def get_enhanced_smart_execution_report(execution_id):
                 'cluster_health_snapshot': full_execution_data.get('cluster_health_snapshot') or {},
                 'pod_restart_tracking': full_execution_data.get('pod_restart_tracking') or {},
                 'testbed_topology': full_execution_data.get('testbed_topology') or {},
+                'event_timeline': full_execution_data.get('event_timeline') or [],
+                'resource_lifecycle': full_execution_data.get('resource_lifecycle') or {},
+                'data_quality': full_execution_data.get('data_quality') or _derive_data_quality_from_legacy(db_data),
+                'metrics_stats': full_execution_data.get('metrics_stats') or _derive_metrics_stats_from_legacy(
+                    db_data.get('metrics_history') or [], db_data.get('baseline_metrics') or {}, db_data.get('final_metrics') or {}),
+                'cleanup_results': full_execution_data.get('cleanup_results') or {},
             }
             report_data = status
 
@@ -5803,7 +5821,6 @@ def get_enhanced_smart_execution_report(execution_id):
             baseline_metrics=baseline_metrics,
             final_metrics=final_metrics,
             operations_history=operations_history,
-            entity_breakdown=entity_breakdown,
             operation_effectiveness=operation_effectiveness if isinstance(operation_effectiveness, list) else [],
             threshold_reached=status.get('threshold_reached', False),
             # Enhanced data
@@ -5813,16 +5830,14 @@ def get_enhanced_smart_execution_report(execution_id):
             operation_heatmap=enhanced_data['operation_heatmap'],
             pod_stability=enhanced_data['pod_stability'],
             node_stability=enhanced_data.get('node_stability') or [],
-            restart_timestamps=enhanced_data.get('restart_timestamps') or [],
-            health_assessment=enhanced_data.get('health_assessment') or {},
             cluster_health=enhanced_data['cluster_health'],
-            capacity_planning=enhanced_data['capacity_planning'],
             historical_comparison=enhanced_data['historical_comparison'],
             iteration_timeline=enhanced_data.get('iteration_timeline') or {},
             entity_operation_counts=enhanced_data.get('entity_operation_counts') or [],
             report_metadata=enhanced_data.get('report_metadata') or {},
             metrics_resolution_note=effm.get('resolution_note') or 'stored',
             pod_restart_tracking=enhanced_data.get('pod_restart_tracking') or {},
+            testbed_topology=status.get('testbed_topology') or report_data.get('testbed_topology') or {},
             # New unified report sections
             data_quality=status.get('data_quality') or report_data.get('data_quality') or {},
             metrics_stats=status.get('metrics_stats') or report_data.get('metrics_stats') or {},
@@ -5831,6 +5846,7 @@ def get_enhanced_smart_execution_report(execution_id):
             # JSON for charts
             metrics_history_json=json_mod.dumps(metrics_history),
             operations_history_json=json_mod.dumps(operations_history),
+            failure_timeline_json=json_mod.dumps(enhanced_data.get('failure_analysis', {}).get('failure_timeline', [])),
         )
 
         fmt = request.args.get('format', 'download')
@@ -5858,6 +5874,8 @@ def get_enhanced_smart_execution_report(execution_id):
 def _smart_execution_legacy_download_response(execution_id):
     """Reuse enhanced HTML report for /download (parity with UI); shorter attachment filename."""
     resp = get_enhanced_smart_execution_report(execution_id)
+    if isinstance(resp, tuple):
+        return resp
     if resp.status_code != 200:
         return resp
     ct = resp.headers.get('Content-Type', '')
@@ -6128,16 +6146,32 @@ def get_execution_metrics_timeline(execution_id):
 # Phase 12: New drill-down APIs
 # ===========================
 
+def _load_full_execution_data_from_db(execution_id):
+    """Load full_execution_data from smart_executions table (DB fallback)."""
+    try:
+        from services.smart_execution_db import load_smart_execution
+        db_data = load_smart_execution(execution_id)
+        if db_data:
+            return db_data.get('full_execution_data') or {}
+    except Exception:
+        pass
+    return None
+
+
 @app.route('/api/smart-execution/<execution_id>/timeline', methods=['GET'])
 def get_execution_timeline(execution_id):
     """Return the full structured event timeline for an execution."""
     from services.smart_execution_service import get_smart_execution
     svc = get_smart_execution(execution_id)
-    if not svc:
-        return jsonify({'success': False, 'error': 'Execution not found'}), 404
+    if svc:
+        events = list(svc._event_timeline)
+    else:
+        fd = _load_full_execution_data_from_db(execution_id)
+        if fd is None:
+            return jsonify({'success': False, 'error': 'Execution not found'}), 404
+        events = fd.get('event_timeline') or []
     event_type = request.args.get('event_type')
     severity = request.args.get('severity')
-    events = list(svc._event_timeline)
     if event_type:
         events = [e for e in events if e.get('event_type') == event_type]
     if severity:
@@ -6155,9 +6189,13 @@ def get_execution_operations_filtered(execution_id):
     """Return operations with optional filters (status, entity_type, iteration)."""
     from services.smart_execution_service import get_smart_execution
     svc = get_smart_execution(execution_id)
-    if not svc:
-        return jsonify({'success': False, 'error': 'Execution not found'}), 404
-    ops = list(svc.operations_history)
+    if svc:
+        ops = list(svc.operations_history)
+    else:
+        fd = _load_full_execution_data_from_db(execution_id)
+        if fd is None:
+            return jsonify({'success': False, 'error': 'Execution not found'}), 404
+        ops = fd.get('operations_history') or []
     if request.args.get('status'):
         ops = [o for o in ops if o.get('status') == request.args['status']]
     if request.args.get('entity_type'):
@@ -6180,9 +6218,15 @@ def get_execution_resources(execution_id):
     """Return resource lifecycle summary."""
     from services.smart_execution_service import get_smart_execution
     svc = get_smart_execution(execution_id)
-    if not svc:
+    if svc:
+        return jsonify({'success': True, **svc._get_resource_lifecycle_summary()})
+    fd = _load_full_execution_data_from_db(execution_id)
+    if fd is None:
         return jsonify({'success': False, 'error': 'Execution not found'}), 404
-    return jsonify({'success': True, **svc._get_resource_lifecycle_summary()})
+    rl = fd.get('resource_lifecycle') or {'total_created': 0, 'deleted_during_execution': 0,
+        'cleanup_attempted': 0, 'cleanup_success': 0, 'cleanup_failed': 0,
+        'potentially_leaked': 0, 'leak_verdict': 'No data', 'resources': []}
+    return jsonify({'success': True, **rl})
 
 
 # ===========================
@@ -6535,6 +6579,61 @@ def _build_entity_breakdown(operation_history: list) -> dict:
     return breakdown
 
 
+def _derive_data_quality_from_legacy(report: dict) -> dict:
+    """Build a best-effort data_quality dict for old executions that lack one."""
+    ops = report.get('total_operations', 0)
+    mh = report.get('metrics_history') or []
+    issues = []
+    if ops == 0:
+        issues.append('No operations recorded')
+    if not mh:
+        issues.append('No metrics collected')
+    score = 'HIGH' if ops > 0 and len(mh) > 0 else ('MEDIUM' if ops > 0 else 'LOW')
+    return {
+        'score': score,
+        'operations_recorded': ops,
+        'metrics_samples': len(mh),
+        'missing_metric_samples': 0,
+        'prometheus_configured': False,
+        'real_operations': ops,
+        'simulated_operations': 0,
+        'real_operations_percent': 100 if ops else 0,
+        'pod_events_captured': 0,
+        'cleanup_tracked': False,
+        'timeline_events': 0,
+        'issues': issues,
+    }
+
+
+def _derive_metrics_stats_from_legacy(mh: list, baseline: dict, final: dict) -> dict:
+    """Build metrics_stats from raw metrics_history for old executions."""
+    if not mh:
+        return {}
+    cpu_vals = [m.get('cpu_percent', 0) for m in mh if m.get('cpu_percent') is not None]
+    mem_vals = [m.get('memory_percent', 0) for m in mh if m.get('memory_percent') is not None]
+
+    def _stats(vals, bl, fn):
+        if not vals:
+            return {}
+        s = sorted(vals)
+        n = len(s)
+        return {
+            'baseline': round(bl, 2),
+            'final': round(fn, 2),
+            'min': round(s[0], 2),
+            'max': round(s[-1], 2),
+            'avg': round(sum(s) / n, 2),
+            'p50': round(s[int(n * 0.5)], 2),
+            'p95': round(s[min(int(n * 0.95), n - 1)], 2),
+            'samples': n,
+        }
+
+    return {
+        'cpu': _stats(cpu_vals, baseline.get('cpu_percent', 0), final.get('cpu_percent', 0)),
+        'memory': _stats(mem_vals, baseline.get('memory_percent', 0), final.get('memory_percent', 0)),
+    }
+
+
 @app.route('/api/smart-execution/report/<execution_id>', methods=['GET'])
 def get_smart_execution_report(execution_id):
     """
@@ -6778,6 +6877,24 @@ def get_smart_execution_report(execution_id):
                     report['longevity'] = longevity
             fd = db_data.get('full_execution_data')
             report['cluster_health_snapshot'] = (fd.get('cluster_health_snapshot') or {}) if isinstance(fd, dict) else {}
+
+            # Restore new report sections from persisted full_execution_data
+            if isinstance(fd, dict):
+                report['event_timeline'] = fd.get('event_timeline') or []
+                report['event_timeline_total'] = fd.get('event_timeline_total') or len(report['event_timeline'])
+                report['resource_lifecycle'] = fd.get('resource_lifecycle') or {}
+                report['data_quality'] = fd.get('data_quality') or {}
+                report['metrics_stats'] = fd.get('metrics_stats') or {}
+                report['cleanup_results'] = fd.get('cleanup_results') or {}
+                report['pod_restart_tracking'] = fd.get('pod_restart_tracking') or {}
+            else:
+                report['event_timeline'] = []
+                report['resource_lifecycle'] = {}
+                report['data_quality'] = _derive_data_quality_from_legacy(report)
+                report['metrics_stats'] = _derive_metrics_stats_from_legacy(report.get('metrics_history', []), report.get('baseline_metrics', {}), report.get('current_metrics', {}))
+                report['cleanup_results'] = {}
+                report['pod_restart_tracking'] = {}
+
             return jsonify(report), 200
         
         return jsonify({'success': False, 'error': 'Execution not found'}), 404

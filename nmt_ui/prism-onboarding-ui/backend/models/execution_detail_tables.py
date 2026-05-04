@@ -94,6 +94,15 @@ class ExecutionPodEvent(Base):
     cumulative_total = Column(Integer, default=0)
     log_snippet = Column(Text, nullable=True)
 
+    concurrent_operation = Column(String(128), nullable=True)
+    pod_memory_mb = Column(Float, nullable=True)
+    pod_memory_limit_mb = Column(Float, nullable=True)
+    pod_memory_request_mb = Column(Float, nullable=True)
+    pod_cpu_cores = Column(Float, nullable=True)
+    pod_cpu_limit_cores = Column(Float, nullable=True)
+    pod_cpu_request_cores = Column(Float, nullable=True)
+    node = Column(String(255), nullable=True)
+
     execution_elapsed_min = Column(Float, nullable=True)
     detected_at = Column(DateTime, default=datetime.datetime.utcnow)
 
@@ -117,6 +126,14 @@ class ExecutionPodEvent(Base):
             'total_since_start': self.total_since_start,
             'cumulative_total': self.cumulative_total,
             'log_snippet': self.log_snippet,
+            'concurrent_operation': self.concurrent_operation,
+            'pod_memory_mb': self.pod_memory_mb,
+            'pod_memory_limit_mb': self.pod_memory_limit_mb,
+            'pod_memory_request_mb': self.pod_memory_request_mb,
+            'pod_cpu_cores': self.pod_cpu_cores,
+            'pod_cpu_limit_cores': self.pod_cpu_limit_cores,
+            'pod_cpu_request_cores': self.pod_cpu_request_cores,
+            'node': self.node,
             'execution_elapsed_min': self.execution_elapsed_min,
             'detected_at': self.detected_at.isoformat() if self.detected_at else None,
         }

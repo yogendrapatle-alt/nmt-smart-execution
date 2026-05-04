@@ -126,7 +126,6 @@ class EnhancedReportService:
         execution_mode_summary = self._build_execution_mode_summary(operations_history)
         learning = status_data.get('learning_summary') or report_data.get('learning_summary') or ''
         health_assessment = self._build_health_assessment(cluster_health, pod_stability, node_stability)
-        health_assessment['_deprecated'] = True
 
         report_metadata = self._build_report_metadata(
             metrics_history=metrics_history,
@@ -577,13 +576,17 @@ class EnhancedReportService:
             throttle_data = self._prom_query(url, throttle_query)
             for r in throttle_data:
                 m = r.get('metric', {})
-                ratio = float(r.get('value', [0, 0])[1])
+                val = r.get('value', [0, 0])
+                ratio = float(val[1])
                 if ratio > 0.01:
+                    ts_epoch = float(val[0]) if val[0] else 0
+                    ts_str = datetime.fromtimestamp(ts_epoch, tz=timezone.utc).isoformat() if ts_epoch else ''
                     health['cpu_throttling'].append({
                         'pod': m.get('pod', 'unknown'),
                         'namespace': m.get('namespace', 'unknown'),
                         'container': m.get('container', 'unknown'),
                         'throttle_ratio': round(ratio * 100, 1),
+                        'timestamp': ts_str,
                     })
 
             restart_query = (
@@ -728,14 +731,31 @@ class EnhancedReportService:
             health['terminated_containers'] = []
             for r in term_data:
                 m = r.get('metric', {})
-                val = float(r.get('value', [0, 0])[1])
+                val_pair = r.get('value', [0, 0])
+                val = float(val_pair[1])
                 if val >= 1:
+                    ts_epoch = float(val_pair[0]) if val_pair[0] else 0
+                    sampled_at = datetime.fromtimestamp(ts_epoch, tz=timezone.utc).isoformat() if ts_epoch else ''
                     health['terminated_containers'].append({
                         'pod': m.get('pod', 'unknown'),
                         'namespace': m.get('namespace', 'unknown'),
                         'container': m.get('container', 'unknown'),
                         'reason': m.get('reason', 'unknown'),
+                        'sampled_at': sampled_at,
                     })
+
+            # ----- Exit codes for terminated containers -----
+            exitcode_query = 'kube_pod_container_status_last_terminated_exitcode{container!=""}'
+            exitcode_data = self._prom_query(url, exitcode_query)
+            exitcode_map = {}
+            for r in exitcode_data:
+                m = r.get('metric', {})
+                code = int(float(r.get('value', [0, 0])[1]))
+                key = f"{m.get('pod','')}/{m.get('namespace','')}/{m.get('container','')}"
+                exitcode_map[key] = code
+            for tc in health['terminated_containers']:
+                key = f"{tc['pod']}/{tc['namespace']}/{tc['container']}"
+                tc['exit_code'] = exitcode_map.get(key, None)
 
             # ----- Cumulative restart count (total restarts ever, not just last 1h) -----
             total_restart_query = (
@@ -910,6 +930,75 @@ class EnhancedReportService:
             )
             health['restart_timestamps'] = health['restart_timestamps'][:30]
 
+            # Build a map of pod/ns/container → last_terminated_at from restart_timestamps
+            ts_map = {}
+            for rt in health['restart_timestamps']:
+                key = f"{rt.get('pod')}/{rt.get('namespace')}/{rt.get('container')}"
+                ts_map[key] = rt.get('last_terminated_at', '')
+
+            # Enrich terminated_containers with actual termination timestamp
+            for tc in health['terminated_containers']:
+                key = f"{tc.get('pod')}/{tc.get('namespace')}/{tc.get('container')}"
+                tc['last_terminated_at'] = ts_map.get(key, tc.get('sampled_at', ''))
+
+            # Enrich total_restarts with last restart timestamp
+            for tr in health['total_restarts']:
+                key = f"{tr.get('pod')}/{tr.get('namespace')}/{tr.get('container')}"
+                tr['last_restart_at'] = ts_map.get(key, '')
+
+            # Collect restart event history via range query (last 48h)
+            restart_event_map: Dict[str, List[str]] = {}
+            try:
+                now_epoch = datetime.now(tz=timezone.utc).timestamp()
+                start_48h = now_epoch - 48 * 3600
+                range_results = self._prom_range_query(
+                    url,
+                    'kube_pod_container_status_restarts_total{container!=""}',
+                    start_48h, now_epoch, step='120s'
+                )
+                restart_event_map = self._extract_restart_events(range_results)
+            except Exception as e:
+                logger.debug(f"Restart event range query failed: {e}")
+
+            for tr in health['total_restarts']:
+                key = f"{tr['pod']}/{tr['namespace']}/{tr['container']}"
+                tr['restart_history'] = restart_event_map.get(key, [])
+
+            for tc in health['terminated_containers']:
+                key = f"{tc['pod']}/{tc['namespace']}/{tc['container']}"
+                tc['restart_history'] = restart_event_map.get(key, [])
+
+            # For CPU throttling, collect throttle history via range query (last 6h)
+            throttle_history_map: Dict[str, List[dict]] = defaultdict(list)
+            try:
+                start_6h = now_epoch - 6 * 3600
+                throttle_range_q = (
+                    'rate(container_cpu_cfs_throttled_periods_total'
+                    '{container!="", image!=""}[5m]) / '
+                    'rate(container_cpu_cfs_periods_total'
+                    '{container!="", image!=""}[5m])'
+                )
+                throttle_range_results = self._prom_range_query(
+                    url, throttle_range_q, start_6h, now_epoch, step='300s'
+                )
+                for series in throttle_range_results:
+                    m = series.get('metric', {})
+                    key = f"{m.get('pod','')}/{m.get('namespace','')}/{m.get('container','')}"
+                    for ts_epoch, val_str in series.get('values', []):
+                        ratio = float(val_str)
+                        if ratio > 0.01:
+                            dt = datetime.fromtimestamp(float(ts_epoch), tz=timezone.utc)
+                            throttle_history_map[key].append({
+                                'timestamp': dt.isoformat(),
+                                'throttle_pct': round(ratio * 100, 1),
+                            })
+            except Exception as e:
+                logger.debug(f"Throttle range query failed: {e}")
+
+            for t in health['cpu_throttling']:
+                key = f"{t['pod']}/{t['namespace']}/{t['container']}"
+                t['throttle_history'] = throttle_history_map.get(key, [])
+
             health['collection_status'] = 'success'
             health['collection_reason'] = ''
         except Exception as e:
@@ -929,6 +1018,44 @@ class EnhancedReportService:
         except Exception as e:
             logger.debug(f"Prometheus query failed ({query[:60]}...): {e}")
         return []
+
+    def _prom_range_query(self, base_url: str, query: str,
+                          start_epoch: float, end_epoch: float,
+                          step: str = '60s') -> List:
+        """Prometheus range query (/api/v1/query_range)."""
+        range_url = base_url.replace('/api/v1/query', '/api/v1/query_range')
+        try:
+            resp = requests.get(range_url, params={
+                'query': query,
+                'start': start_epoch,
+                'end': end_epoch,
+                'step': step,
+            }, verify=False, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('status') == 'success':
+                    return data.get('data', {}).get('result', [])
+        except Exception as e:
+            logger.debug(f"Prometheus range query failed ({query[:60]}...): {e}")
+        return []
+
+    def _extract_restart_events(self, range_results: List) -> Dict[str, List[str]]:
+        """Given range query results for kube_pod_container_status_restarts_total,
+        find timestamps where the counter incremented (i.e. a restart occurred).
+        Returns {pod/namespace/container: [iso_timestamps]}."""
+        events: Dict[str, List[str]] = defaultdict(list)
+        for series in range_results:
+            m = series.get('metric', {})
+            key = f"{m.get('pod','')}/{m.get('namespace','')}/{m.get('container','')}"
+            values = series.get('values', [])
+            prev_val = None
+            for ts_epoch, val_str in values:
+                cur_val = float(val_str)
+                if prev_val is not None and cur_val > prev_val:
+                    dt = datetime.fromtimestamp(float(ts_epoch), tz=timezone.utc)
+                    events[key].append(dt.isoformat())
+                prev_val = cur_val
+        return dict(events)
 
     # ------------------------------------------------------------------
     #  3. FAILURE ROOT CAUSE GROUPING
@@ -966,9 +1093,9 @@ class EnhancedReportService:
                 code = op.get('http_status_code')
                 status_counter[str(code) if code else 'N/A'] += 1
 
-            # First 5 failures with full API details for triage drill-down
+            # ALL failures with full API details for triage drill-down
             sample_failures = []
-            for op in ops[:5]:
+            for op in ops:
                 sample_failures.append({
                     'entity_type': op.get('entity_type'),
                     'operation': op.get('operation'),
@@ -1654,6 +1781,11 @@ class EnhancedReportService:
 
         threshold_reached = report_data.get('threshold_reached', False) or status_data.get('threshold_reached', False)
         oom_count = len(cluster_health.get('oom_killed', []))
+        if oom_count == 0:
+            prt = report_data.get('pod_restart_tracking') or status_data.get('pod_restart_tracking') or {}
+            for rev in (prt.get('restart_events') or []):
+                if rev.get('restart_reason') == 'OOMKilled' or rev.get('exit_code') == 137:
+                    oom_count += 1
         restart_count = sum(r.get('restart_count', 0) for r in cluster_health.get('container_restarts', []))
         high_risk_spikes = spike_analysis.get('high_risk_count', 0)
 

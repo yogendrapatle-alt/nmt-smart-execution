@@ -7,6 +7,7 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
     <style>
+        html { scroll-behavior: smooth; }
         :root {
             --pass: #22c55e; --warn: #f59e0b; --fail: #ef4444;
             --blue: #3b82f6; --purple: #8b5cf6; --teal: #14b8a6;
@@ -128,6 +129,16 @@
 
         /* Footer */
         .report-footer { text-align: center; color: var(--muted); padding: 32px; font-size: 13px; }
+
+        /* Expandable timestamp history */
+        .ts-toggle { cursor:pointer; color:#3b82f6; text-decoration:underline dotted; font-size:11px; white-space:nowrap; }
+        .ts-toggle:hover { color:#2563eb; }
+        .ts-history { display:none; margin-top:6px; padding:6px 8px; background:#f8fafc; border:1px solid var(--border); border-radius:6px; max-height:180px; overflow-y:auto; }
+        .ts-history.open { display:block; }
+        .ts-history ul { list-style:none; padding:0; margin:0; }
+        .ts-history li { font-size:11px; color:#475569; padding:2px 0; border-bottom:1px solid #f1f5f9; }
+        .ts-history li:last-child { border-bottom:none; }
+        .ts-history li .ts-idx { display:inline-block; width:20px; color:#94a3b8; font-size:10px; }
     </style>
 </head>
 <body>
@@ -151,33 +162,6 @@
         </div>
     </div>
 
-    <!-- REPORT DATA QUALITY / PROVENANCE -->
-    {% if report_metadata %}
-    <div class="card">
-        <div class="card-header">
-            <div class="icon" style="background: linear-gradient(135deg, #0ea5e9, #0369a1);">📋</div>
-            <h2>Report data quality</h2>
-        </div>
-        <div class="card-body">
-            <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">
-                Sample counts, metric time span, and how cluster health was sourced (live Prometheus vs persisted snapshot).
-            </p>
-            <table>
-                <tr><td style="width:220px;font-weight:600;">Execution</td><td><code>{{ report_metadata.get('execution_id', execution_id) }}</code></td></tr>
-                <tr><td style="font-weight:600;">Generated (UTC)</td><td>{{ report_metadata.get('generated_at_utc', '')|fmtts }}</td></tr>
-                <tr><td style="font-weight:600;">Metrics samples</td><td>{{ report_metadata.get('metrics_samples', 0) }}</td></tr>
-                <tr><td style="font-weight:600;">Operations recorded</td><td>{{ report_metadata.get('operations_recorded', 0) }}</td></tr>
-                {% if report_metadata.get('metrics_time_range') %}
-                <tr><td style="font-weight:600;">Metric time range</td><td>{{ report_metadata.metrics_time_range.first_timestamp|fmtts }} → {{ report_metadata.metrics_time_range.last_timestamp|fmtts }}</td></tr>
-                {% endif %}
-                <tr><td style="font-weight:600;">Cluster health source</td><td><span class="badge badge-info">{{ report_metadata.get('cluster_health_source', 'unknown') }}</span></td></tr>
-                <tr><td style="font-weight:600;">Prometheus configured</td><td>{{ 'Yes' if report_metadata.get('prometheus_configured') else 'No' }}</td></tr>
-                <tr><td style="font-weight:600;">Baseline / final resolution</td><td>{{ report_metadata.get('baseline_final_resolution', metrics_resolution_note) }}</td></tr>
-            </table>
-        </div>
-    </div>
-    {% endif %}
-
     <!-- EXECUTIVE SUMMARY (anchor-linked to detail sections) -->
     <div class="stat-grid">
         <a class="stat-card-link" href="#ops-log">
@@ -192,6 +176,13 @@
             <div class="stat-label">Success Rate</div>
         </div>
         </a>
+        <a class="stat-card-link" href="#section-failures">
+        <div class="stat-card">
+            {% set failed_ops_count = failure_analysis.total_failures if failure_analysis and failure_analysis.total_failures is defined else 0 %}
+            <div class="stat-value" style="color: {% if failed_ops_count > 0 %}var(--fail){% else %}var(--pass){% endif %};">{{ failed_ops_count }}</div>
+            <div class="stat-label">Failed Operations</div>
+        </div>
+        </a>
         <div class="stat-card">
             <div class="stat-value" style="color: var(--teal);">{{ duration_minutes|round(1) }}m</div>
             <div class="stat-label">Duration</div>
@@ -204,6 +195,13 @@
         <div class="stat-card">
             <div class="stat-value" style="color: var(--fail);">{{ spike_analysis.total_spikes }}</div>
             <div class="stat-label">Metric Spikes</div>
+        </div>
+        </a>
+        <a class="stat-card-link" href="#section-restarts">
+        <div class="stat-card">
+            {% set total_restarts = (pod_restart_tracking.total_restarts_during_execution if pod_restart_tracking and pod_restart_tracking.total_restarts_during_execution is defined else 0) %}
+            <div class="stat-value" style="color: {% if total_restarts > 0 %}var(--warn){% else %}var(--pass){% endif %};">{{ total_restarts }}</div>
+            <div class="stat-label">Container Restarts</div>
         </div>
         </a>
         <a class="stat-card-link" href="#section-restarts">
@@ -231,9 +229,40 @@
                 <tr><td style="font-weight:600;">Target CPU</td><td>{{ target_config.get('cpu_threshold', 'N/A') }}%</td></tr>
                 <tr><td style="font-weight:600;">Target Memory</td><td>{{ target_config.get('memory_threshold', 'N/A') }}%</td></tr>
                 <tr><td style="font-weight:600;">Stop Condition</td><td>{{ target_config.get('stop_condition', 'any')|upper }}</td></tr>
+                {% if testbed_topology and testbed_topology.clusters %}
+                <tr><td style="font-weight:600;">Clusters ({{ testbed_topology.clusters|length }})</td>
+                    <td>
+                        {% for c in testbed_topology.clusters %}
+                        <span class="badge badge-info" style="margin-right:4px;">{{ c.name }}{% if c.ip %} ({{ c.ip }}){% endif %}</span>
+                        {% endfor %}
+                    </td>
+                </tr>
+                {% endif %}
             </table>
         </div>
     </div>
+
+    <!-- REPORT DATA QUALITY / PROVENANCE -->
+    {% if report_metadata %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #0ea5e9, #0369a1);">📋</div>
+            <h2>Report Data Quality</h2>
+        </div>
+        <div class="card-body">
+            <table>
+                <tr><td style="width:220px;font-weight:600;">Generated (UTC)</td><td>{{ report_metadata.get('generated_at_utc', '')|fmtts }}</td></tr>
+                <tr><td style="font-weight:600;">Metrics samples</td><td>{{ report_metadata.get('metrics_samples', 0) }}</td></tr>
+                {% if report_metadata.get('metrics_time_range') %}
+                <tr><td style="font-weight:600;">Metric time range</td><td>{{ report_metadata.metrics_time_range.first_timestamp|fmtts }} → {{ report_metadata.metrics_time_range.last_timestamp|fmtts }}</td></tr>
+                {% endif %}
+                <tr><td style="font-weight:600;">Cluster health source</td><td><span class="badge badge-info">{{ report_metadata.get('cluster_health_source', 'unknown') }}</span></td></tr>
+                <tr><td style="font-weight:600;">Prometheus configured</td><td>{{ 'Yes' if report_metadata.get('prometheus_configured') else 'No' }}</td></tr>
+                <tr><td style="font-weight:600;">Start / End of Test resolution</td><td>{{ report_metadata.get('baseline_final_resolution', metrics_resolution_note) }}</td></tr>
+            </table>
+        </div>
+    </div>
+    {% endif %}
 
     <!-- METRICS TIMELINE WITH OPERATIONS -->
     <div class="card">
@@ -242,15 +271,12 @@
             <h2>Metrics Timeline with Operation Events</h2>
         </div>
         <div class="card-body">
-            <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">
-                CPU &amp; Memory over time. Vertical markers show when operations executed. Red markers = failures. Hover for details.
-            </p>
             <div class="chart-container">
                 <canvas id="timelineChart"></canvas>
             </div>
             <table style="margin-top:16px;">
                 <tr>
-                    <th>Metric</th><th>Start</th><th>Final</th><th>Change</th>
+                    <th>Metric</th><th>Start of Test</th><th>End of Test</th><th>Change</th>
                 </tr>
                 <tr>
                     <td><strong>CPU</strong></td>
@@ -277,6 +303,8 @@
         </div>
     </div>
 
+    <!-- FAILURE TIMELINE CHART (disabled) -->
+
     <!-- PER-NODE METRICS — ONE CHART PER CLUSTER -->
     <div class="card" id="section-per-node">
         <div class="card-header">
@@ -296,12 +324,12 @@
         </div>
     </div>
 
-    <!-- AI SPIKE ANALYSIS -->
+    <!-- SPIKE ANALYSIS -->
     {% if spike_analysis.spikes %}
     <div class="card" id="section-spikes">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">🔍</div>
-            <h2>AI Spike Analysis ({{ spike_analysis.total_spikes }} detected)</h2>
+            <h2>Spike Analysis ({{ spike_analysis.total_spikes }} detected)</h2>
         </div>
         <div class="card-body">
             <div class="stat-grid" style="margin-bottom: 20px;">
@@ -376,15 +404,14 @@
                 <div class="spike-ops">
                     <div class="spike-detail-label" style="margin-bottom:6px;">Causal Operations — {{ spike.causal_operations|length }} event(s) near this spike</div>
                     <table>
-                        <tr><th>Timestamp</th><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Timing</th></tr>
+                        <tr><th>Entity</th><th>Operation</th><th>Name</th><th>Status</th><th>Timestamp</th></tr>
                         {% for op in spike.causal_operations[:5] %}
                         <tr>
-                            <td style="font-size:11px;color:var(--muted);white-space:nowrap;">{{ op.timestamp|fmtts }}</td>
                             <td>{{ op.entity_type }}</td>
                             <td>{{ op.operation }}</td>
                             <td><code>{{ op.entity_name[:40] }}</code></td>
                             <td><span class="badge badge-{% if op.status == 'SUCCESS' %}pass{% else %}fail{% endif %}">{{ op.status }}</span></td>
-                            <td>{{ op.seconds_before_spike }}s before spike</td>
+                            <td style="font-size:11px;color:var(--muted);white-space:nowrap;">🕐 {{ op.timestamp|fmtts }}</td>
                         </tr>
                         {% endfor %}
                     </table>
@@ -395,14 +422,13 @@
                 <div class="spike-pods">
                     <div class="spike-detail-label" style="margin-bottom:6px;">Most Affected Pods</div>
                     <table>
-                        <tr><th>Pod</th><th>Namespace</th><th>CPU Δ</th><th>Memory Δ</th><th>Impact</th></tr>
+                        <tr><th>Pod</th><th>Namespace</th><th>CPU Δ</th><th>Memory Δ</th></tr>
                         {% for pod in spike.affected_pods[:5] %}
                         <tr>
                             <td><code>{{ pod.pod_name[:35] }}</code></td>
                             <td>{{ pod.namespace }}</td>
                             <td style="color:{% if pod.cpu_delta > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:600;">{{ '%+.2f'|format(pod.cpu_delta) }}%</td>
                             <td style="color:{% if pod.memory_delta > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:600;">{{ '%+.2f'|format(pod.memory_delta) }}MB</td>
-                            <td>{{ pod.impact_score }}</td>
                         </tr>
                         {% endfor %}
                     </table>
@@ -411,6 +437,14 @@
             </div>
             {% endfor %}
         </div>
+    </div>
+    {% else %}
+    <div class="card" id="section-spikes">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">🔍</div>
+            <h2>Spike Analysis</h2>
+        </div>
+        <div class="card-body"><p style="color:var(--muted);">No metric spikes detected during this execution.</p></div>
     </div>
     {% endif %}
 
@@ -452,7 +486,7 @@
                     {% endif %}
 
                     {% if group.sample_failures %}
-                    <div class="section-title" style="margin-top:8px;">Sample Failures ({{ group.sample_failures|length }} of {{ group.count }})</div>
+                    <div class="section-title" style="margin-top:8px;">All Failures ({{ group.sample_failures|length }})</div>
                     {% for sf in group.sample_failures %}
                     <div style="border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:10px; background:white;">
                         <div style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
@@ -495,117 +529,155 @@
             {% endfor %}
         </div>
     </div>
+    {% else %}
+    <div class="card" id="section-failures">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #ef4444, #dc2626);">🔍</div>
+            <h2>Failure Root Cause Analysis</h2>
+        </div>
+        <div class="card-body"><p style="color:var(--pass);">No failures detected — all operations succeeded.</p></div>
+    </div>
     {% endif %}
 
-    <!-- OPERATION TIMING HEATMAP -->
-    {% if operation_heatmap.buckets %}
-    <div class="card">
+    <!-- POD RESTARTS & OOM KILLS (Expandable Accordion) -->
+    {% if pod_restart_tracking and pod_restart_tracking.total_restarts_during_execution is defined and pod_restart_tracking.total_restarts_during_execution > 0 %}
+    <div class="card" id="section-restarts">
         <div class="card-header">
-            <div class="icon" style="background: linear-gradient(135deg, #8b5cf6, #6d28d9);">🗺️</div>
-            <h2>Operation Timing Heatmap</h2>
+            <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">🔄</div>
+            <h2>Pod Restarts &amp; OOM Kills ({{ pod_restart_tracking.total_restarts_during_execution }} events)</h2>
         </div>
         <div class="card-body">
-            <p style="color:var(--muted); font-size:13px; margin-bottom:12px;">
-                Each cell shows avg duration (seconds). Darker = slower. Red = high failure rate.
-            </p>
-            <div style="overflow-x:auto;">
-                <table class="heatmap-table">
-                    <thead>
-                        <tr>
-                            <th style="min-width:160px;">Entity.Operation</th>
-                            {% for bucket in operation_heatmap.buckets %}
-                            <th>{{ bucket }}</th>
-                            {% endfor %}
-                        </tr>
-                    </thead>
+            <div style="display:flex; gap:24px; flex-wrap:wrap; margin-bottom:24px;">
+                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#fef2f2;">
+                    <div style="font-size:28px;font-weight:700;color:#dc2626;">{{ pod_restart_tracking.total_restarts_during_execution }}</div>
+                    <div style="font-size:12px;color:#64748b;font-weight:600;">Total Restarts</div>
+                </div>
+                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#fef2f2;">
+                    <div style="font-size:28px;font-weight:700;color:#991b1b;">{{ verdict.oom_kills }}</div>
+                    <div style="font-size:12px;color:#64748b;font-weight:600;">OOM Kills</div>
+                </div>
+                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#fff7ed;">
+                    <div style="font-size:28px;font-weight:700;color:#ea580c;">{{ pod_restart_tracking.pods_restarted }}</div>
+                    <div style="font-size:12px;color:#64748b;font-weight:600;">Pods Affected</div>
+                </div>
+                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#f0fdf4;">
+                    <div style="font-size:28px;font-weight:700;color:#16a34a;">{{ pod_restart_tracking.baseline_containers_tracked }}</div>
+                    <div style="font-size:12px;color:#64748b;font-weight:600;">Containers Monitored</div>
+                </div>
+            </div>
+            {% if pod_restart_tracking.restart_events %}
+            <div class="section-title">All Restart Events ({{ pod_restart_tracking.restart_events|length }}) — click to expand</div>
+            {% for ev in pod_restart_tracking.restart_events %}
+            <div style="border:1px solid var(--border); border-radius:10px; margin-bottom:10px; border-left:4px solid {% if ev.restart_reason == 'OOMKilled' or ev.exit_code == 137 %}#dc2626{% elif ev.restart_reason == 'Error' %}#f59e0b{% else %}#6366f1{% endif %}; overflow:hidden;">
+                <div class="accordion-toggle" onclick="toggleAccordion(this)" style="padding:14px 16px; display:flex; justify-content:space-between; align-items:center; {% if ev.restart_reason == 'OOMKilled' or ev.exit_code == 137 %}background:#fef2f2;{% endif %}">
+                    <div>
+                        <span class="arrow">▶</span>
+                        <strong>Restart #{{ loop.index }}</strong>
+                        <code style="margin-left:8px;font-size:12px;">{{ ev.pod[:45] }}</code>
+                        <span style="color:var(--muted);font-size:11px;margin-left:8px;">🕐 {{ ev.detected_at|fmtts }}</span>
+                    </div>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        {% if ev.restart_reason %}
+                        <span class="badge {% if ev.restart_reason == 'OOMKilled' %}badge-fail{% elif ev.restart_reason == 'Error' %}badge-warn{% else %}badge-info{% endif %}">{{ ev.restart_reason }}</span>
+                        {% endif %}
+                        {% if ev.exit_code is defined and ev.exit_code is not none %}
+                        <span class="badge {% if ev.exit_code == 137 %}badge-fail{% elif ev.exit_code == 0 %}badge-pass{% else %}badge-warn{% endif %}">Exit {{ ev.exit_code }}</span>
+                        {% endif %}
+                        <span class="badge badge-warn">+{{ ev.new_restarts }}</span>
+                    </div>
+                </div>
+                <div class="accordion-body">
+                    <div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:12px; margin-bottom:16px;">
+                        <div style="background:white; border:1px solid var(--border); border-radius:8px; padding:10px;"><div style="font-size:11px;color:#64748b;font-weight:600;margin-bottom:2px;">Pod</div><code style="font-size:12px;word-break:break-all;">{{ ev.pod }}</code></div>
+                        <div style="background:white; border:1px solid var(--border); border-radius:8px; padding:10px;"><div style="font-size:11px;color:#64748b;font-weight:600;margin-bottom:2px;">Container</div><code style="font-size:12px;">{{ ev.container }}</code></div>
+                        <div style="background:white; border:1px solid var(--border); border-radius:8px; padding:10px;"><div style="font-size:11px;color:#64748b;font-weight:600;margin-bottom:2px;">Namespace</div><code style="font-size:12px;">{{ ev.namespace }}</code></div>
+                        <div style="background:white; border:1px solid var(--border); border-radius:8px; padding:10px;"><div style="font-size:11px;color:#64748b;font-weight:600;margin-bottom:2px;">Node</div>{% if ev.node %}<code style="font-size:12px;">{{ ev.node }}</code>{% else %}<span style="color:#94a3b8;">—</span>{% endif %}</div>
+                        <div style="background:white; border:1px solid var(--border); border-radius:8px; padding:10px;"><div style="font-size:11px;color:#64748b;font-weight:600;margin-bottom:2px;">Timestamp</div><span style="font-size:12px;font-weight:600;">{{ ev.detected_at|fmtts }}</span></div>
+                        <div style="background:white; border:1px solid var(--border); border-radius:8px; padding:10px;"><div style="font-size:11px;color:#64748b;font-weight:600;margin-bottom:2px;">Elapsed Since Start</div><span style="font-size:12px;">{{ ev.execution_elapsed_min }} min</span></div>
+                    </div>
+                    <div style="font-size:13px;font-weight:700;color:#334155;margin-bottom:8px;">Resource Usage at Time of Restart</div>
+                    <table style="margin-bottom:16px;">
+                        <thead><tr><th>Resource</th><th>Current Usage</th><th>Request</th><th>Limit</th><th>Usage %</th></tr></thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>CPU</strong></td>
+                                <td>{% if ev.pod_cpu_cores is defined and ev.pod_cpu_cores %}{{ ev.pod_cpu_cores }} cores{% else %}<span style="color:#94a3b8;">—</span>{% endif %}</td>
+                                <td>{% if ev.pod_cpu_request_cores is defined and ev.pod_cpu_request_cores %}{{ ev.pod_cpu_request_cores }} cores{% else %}<span style="color:#94a3b8;">—</span>{% endif %}</td>
+                                <td>{% if ev.pod_cpu_limit_cores is defined and ev.pod_cpu_limit_cores %}{{ ev.pod_cpu_limit_cores }} cores{% else %}<span style="color:#94a3b8;">—</span>{% endif %}</td>
+                                <td>{% if ev.pod_cpu_cores is defined and ev.pod_cpu_cores and ev.pod_cpu_limit_cores is defined and ev.pod_cpu_limit_cores and ev.pod_cpu_limit_cores > 0 %}{% set cpu_pct = (ev.pod_cpu_cores / ev.pod_cpu_limit_cores * 100)|round(1) %}<span style="font-weight:700;color:{% if cpu_pct > 90 %}#dc2626{% elif cpu_pct > 70 %}#f59e0b{% else %}#16a34a{% endif %};">{{ cpu_pct }}%</span>{% else %}<span style="color:#94a3b8;">—</span>{% endif %}</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Memory</strong></td>
+                                <td>{% if ev.pod_memory_mb %}<span style="font-weight:700;color:{% if ev.restart_reason == 'OOMKilled' or ev.exit_code == 137 %}#dc2626{% else %}#334155{% endif %};">{{ ev.pod_memory_mb }} MB</span>{% else %}<span style="color:#94a3b8;">—</span>{% endif %}</td>
+                                <td>{% if ev.pod_memory_request_mb is defined and ev.pod_memory_request_mb %}{{ ev.pod_memory_request_mb }} MB{% else %}<span style="color:#94a3b8;">—</span>{% endif %}</td>
+                                <td>{% if ev.pod_memory_limit_mb %}{{ ev.pod_memory_limit_mb }} MB{% else %}<span style="color:#94a3b8;">—</span>{% endif %}</td>
+                                <td>{% if ev.pod_memory_mb and ev.pod_memory_limit_mb and ev.pod_memory_limit_mb > 0 %}{% set mem_pct = (ev.pod_memory_mb / ev.pod_memory_limit_mb * 100)|round(1) %}<span style="font-weight:700;color:{% if mem_pct > 90 %}#dc2626{% elif mem_pct > 70 %}#f59e0b{% else %}#16a34a{% endif %};">{{ mem_pct }}%</span>{% else %}<span style="color:#94a3b8;">—</span>{% endif %}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px;">
+                        <div style="background:{% if ev.restart_reason == 'OOMKilled' %}#fef2f2{% else %}#fef3c7{% endif %}; padding:8px 14px; border-radius:6px; font-size:13px;">
+                            <strong>Reason:</strong> {{ ev.restart_reason or 'Unknown' }}
+                            {% if ev.exit_code is defined and ev.exit_code is not none %}&nbsp;·&nbsp; <strong>Exit Code:</strong> {{ ev.exit_code }}
+                            {% if ev.exit_code == 137 %} <span style="color:#991b1b;">(SIGKILL — OOM or external kill)</span>{% elif ev.exit_code == 143 %} <span style="color:#92400e;">(SIGTERM — graceful termination)</span>{% elif ev.exit_code == 1 %} <span style="color:#92400e;">(General error)</span>{% elif ev.exit_code == 139 %} <span style="color:#991b1b;">(SIGSEGV — segfault)</span>{% endif %}{% endif %}
+                        </div>
+                        {% if ev.concurrent_operation %}
+                        <div style="background:#eff6ff; padding:8px 14px; border-radius:6px; font-size:13px;"><strong>Concurrent Operation:</strong> <span class="badge badge-info">{{ ev.concurrent_operation }}</span></div>
+                        {% endif %}
+                    </div>
+                    {% if ev.log_snippet %}
+                    <details style="margin-top:4px;">
+                        <summary style="cursor:pointer; font-size:13px; font-weight:700; color:#334155;">📋 Container Logs (previous instance)</summary>
+                        <pre style="max-height:300px;overflow:auto;font-size:0.78em;background:#1e293b;color:#e2e8f0;padding:12px;border-radius:6px;margin-top:6px;white-space:pre-wrap;word-break:break-all;">{{ ev.log_snippet }}</pre>
+                    </details>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+            {% endif %}
+            {% if pod_restart_tracking.pod_summary %}
+            <div style="margin-top:20px;">
+                <div class="section-title">Restart Summary Per Pod</div>
+                <table style="margin-bottom:24px;">
+                    <thead><tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Restarts</th><th>Reason</th><th>Start of Test</th><th>Current Total</th><th>Last Seen</th></tr></thead>
                     <tbody>
-                        {% for eo in operation_heatmap.entity_ops %}
+                        {% for ps in pod_restart_tracking.pod_summary %}
                         <tr>
-                            <td style="font-weight:600; font-size:13px;">{{ eo }} <span style="color:var(--muted); font-weight:500;">(n={% if operation_heatmap.row_totals and eo in operation_heatmap.row_totals %}{{ operation_heatmap.row_totals[eo] }}{% else %}0{% endif %})</span></td>
-                            {% for bi in range(operation_heatmap.buckets|length) %}
-                            {% set cell = operation_heatmap.data[eo][bi|string] or operation_heatmap.data[eo][bi] %}
-                            {% if cell and cell.count > 0 %}
-                            {% set intensity = [cell.avg_duration / 120, 1.0]|min %}
-                            {% if cell.failure_rate > 30 %}
-                            <td><div class="heatmap-cell" style="background: rgba(239,68,68,{{ [intensity * 0.8 + 0.2, 1.0]|min }});">
-                                {{ cell.avg_duration }}s<br><small style="font-size:10px;">{{ cell.count }} ops, {{ cell.failure_rate }}% fail</small>
-                            </div></td>
-                            {% else %}
-                            <td><div class="heatmap-cell" style="background: rgba(59,130,246,{{ [intensity * 0.6 + 0.1, 0.8]|min }});">
-                                {{ cell.avg_duration }}s<br><small style="font-size:10px;">{{ cell.count }} ops</small>
-                            </div></td>
-                            {% endif %}
-                            {% else %}
-                            <td><div class="heatmap-cell" style="background: #f1f5f9;">—</div></td>
-                            {% endif %}
-                            {% endfor %}
+                            <td><code>{{ ps.pod[:40] }}</code></td><td>{{ ps.namespace }}</td><td>{{ ps.container }}</td>
+                            <td><span class="badge {% if ps.delta > 3 %}badge-fail{% elif ps.delta > 1 %}badge-warn{% else %}badge-info{% endif %}">+{{ ps.delta }}</span></td>
+                            <td>{% if ps.restart_reason %}<span class="badge {% if ps.restart_reason == 'OOMKilled' %}badge-fail{% elif ps.restart_reason == 'Error' %}badge-warn{% else %}badge-info{% endif %}">{{ ps.restart_reason }}</span>{% else %}—{% endif %}</td>
+                            <td style="color:#64748b;">{{ ps.baseline }}</td><td><strong>{{ ps.current }}</strong></td>
+                            <td style="font-size:0.85em;font-weight:600;color:#64748b;">🕐 {{ ps.last_seen|fmtts }}</td>
                         </tr>
                         {% endfor %}
                     </tbody>
                 </table>
             </div>
+            {% endif %}
         </div>
     </div>
-    {% endif %}
-
-    <!-- QA HEALTH ASSESSMENT (deprecated — hidden when _deprecated flag is set) -->
-    {% if health_assessment and health_assessment.findings and not health_assessment.get('_deprecated') %}
-    <div class="card">
+    {% else %}
+    <div class="card" id="section-restarts">
         <div class="card-header">
-            <div class="icon" style="background: linear-gradient(135deg, {% if health_assessment.overall_status == 'CRITICAL' %}#ef4444, #dc2626{% elif health_assessment.overall_status == 'DEGRADED' %}#f59e0b, #d97706{% elif health_assessment.overall_status == 'ATTENTION' %}#f59e0b, #eab308{% else %}#22c55e, #16a34a{% endif %});">🔍</div>
-            <h2>QA Health Assessment</h2>
+            <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">🔄</div>
+            <h2>Pod Restarts / OOM Kills</h2>
         </div>
-        <div class="card-body">
-            <div style="display:flex; gap:16px; margin-bottom:20px; align-items:center; flex-wrap:wrap;">
-                <div style="padding:10px 24px; border-radius:8px; font-weight:700; font-size:18px;
-                    background:{% if health_assessment.overall_status == 'CRITICAL' %}#fecaca; color:#991b1b{% elif health_assessment.overall_status == 'DEGRADED' %}#fef3c7; color:#92400e{% elif health_assessment.overall_status == 'ATTENTION' %}#fef9c3; color:#854d0e{% else %}#dcfce7; color:#166534{% endif %};">
-                    {{ health_assessment.overall_status }}
-                </div>
-                {% if health_assessment.critical_count > 0 %}
-                <span class="badge badge-fail">{{ health_assessment.critical_count }} Critical</span>
-                {% endif %}
-                {% if health_assessment.warning_count > 0 %}
-                <span class="badge badge-warn">{{ health_assessment.warning_count }} Warning</span>
-                {% endif %}
-                {% if health_assessment.info_count > 0 %}
-                <span class="badge badge-info">{{ health_assessment.info_count }} Info</span>
-                {% endif %}
-            </div>
-            <table>
-                <thead>
-                    <tr><th style="width:90px;">Severity</th><th style="width:120px;">Category</th><th>Finding</th><th>Recommendation</th></tr>
-                </thead>
-                <tbody>
-                    {% for f in health_assessment.findings %}
-                    <tr>
-                        <td>
-                            {% if f.severity == 'critical' %}<span class="badge badge-fail">CRITICAL</span>
-                            {% elif f.severity == 'warning' %}<span class="badge badge-warn">WARNING</span>
-                            {% else %}<span class="badge badge-info">INFO</span>{% endif %}
-                        </td>
-                        <td><strong>{{ f.category }}</strong></td>
-                        <td>{{ f.finding }}</td>
-                        <td style="font-size:0.9em; color:var(--muted);">{{ f.recommendation }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
+        <div class="card-body"><p style="color:var(--pass);">No pod restarts or OOM kills detected during this execution.</p></div>
     </div>
     {% endif %}
 
-    <!-- POD STABILITY SCORES (deprecated — redundant with Pod Restarts During Execution) -->
-    {% if pod_stability and not (health_assessment and health_assessment.get('_deprecated')) %}
+    <!-- POD STABILITY -->
+    {% if pod_stability %}
     <div class="card">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #14b8a6, #0d9488);">🛡️</div>
-            <h2>Pod Stability Scores</h2>
+            <h2>Pod Stability</h2>
         </div>
         <div class="card-body">
             <table>
                 <thead>
                     <tr>
-                        <th>Pod</th><th>Namespace</th><th>Score</th><th>Restarts (1h / Total)</th>
+                        <th>Pod</th><th>Namespace</th><th>Restarts (1h / Total)</th>
                         <th>Throttle %</th><th>OOMKill</th><th>State</th><th>Max CPU</th><th>Max Mem</th>
                     </tr>
                 </thead>
@@ -614,14 +686,6 @@
                     <tr>
                         <td><code>{{ pod.pod_name[:35] }}</code></td>
                         <td>{{ pod.namespace }}</td>
-                        <td>
-                            <div style="display:flex; align-items:center; gap:8px;">
-                                <div class="stability-bar" style="width:80px;">
-                                    <div class="stability-fill" style="width:{{ pod.stability_score }}%; background: {% if pod.stability_score >= 80 %}var(--pass){% elif pod.stability_score >= 50 %}var(--warn){% else %}var(--fail){% endif %};"></div>
-                                </div>
-                                <strong>{{ pod.stability_score }}/100</strong>
-                            </div>
-                        </td>
                         <td>
                             {% if pod.restarts > 0 %}<span class="badge badge-fail">{{ pod.restarts }}</span>{% else %}0{% endif %}
                             / {% if pod.total_restarts > 0 %}<span style="color:#f59e0b;font-weight:600">{{ pod.total_restarts }}</span>{% else %}0{% endif %}
@@ -668,117 +732,18 @@
     </div>
     {% endif %}
 
-    <!-- POD RESTARTS DURING EXECUTION (Continuous Monitoring) -->
-    {% if pod_restart_tracking and pod_restart_tracking.total_restarts_during_execution is defined and pod_restart_tracking.total_restarts_during_execution > 0 %}
-    <div class="card" id="section-restarts">
-        <div class="card-header">
-            <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">🔄</div>
-            <h2>Pod Restarts During Execution</h2>
-        </div>
-        <div class="card-body">
-            <div style="display:flex; gap:24px; flex-wrap:wrap; margin-bottom:20px;">
-                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#fef2f2;">
-                    <div style="font-size:28px;font-weight:700;color:#dc2626;">{{ pod_restart_tracking.total_restarts_during_execution }}</div>
-                    <div style="font-size:12px;color:#64748b;font-weight:600;">Total Restarts</div>
-                </div>
-                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#fff7ed;">
-                    <div style="font-size:28px;font-weight:700;color:#ea580c;">{{ pod_restart_tracking.pods_restarted }}</div>
-                    <div style="font-size:12px;color:#64748b;font-weight:600;">Pods Affected</div>
-                </div>
-                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:#f0fdf4;">
-                    <div style="font-size:28px;font-weight:700;color:#16a34a;">{{ pod_restart_tracking.baseline_containers_tracked }}</div>
-                    <div style="font-size:12px;color:#64748b;font-weight:600;">Containers Monitored</div>
-                </div>
-            </div>
-
-            {% if pod_restart_tracking.pod_summary %}
-            <div class="section-title">Restart Summary Per Pod</div>
-            <table style="margin-bottom:24px;">
-                <thead>
-                    <tr>
-                        <th>Pod</th><th>Namespace</th><th>Container</th>
-                        <th>Restarts During Execution</th><th>Reason</th><th>Baseline</th><th>Current Total</th><th>Last Seen</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for ps in pod_restart_tracking.pod_summary %}
-                    <tr>
-                        <td><code>{{ ps.pod[:40] }}</code></td>
-                        <td>{{ ps.namespace }}</td>
-                        <td>{{ ps.container }}</td>
-                        <td>
-                            <span class="badge {% if ps.delta > 3 %}badge-fail{% elif ps.delta > 1 %}badge-warn{% else %}badge-info{% endif %}">+{{ ps.delta }}</span>
-                        </td>
-                        <td>
-                            {% if ps.restart_reason %}
-                            <span class="badge {% if ps.restart_reason == 'OOMKilled' %}badge-fail{% elif ps.restart_reason == 'Error' %}badge-warn{% else %}badge-info{% endif %}">{{ ps.restart_reason }}</span>
-                            {% else %}—{% endif %}
-                        </td>
-                        <td style="color:#64748b;">{{ ps.baseline }}</td>
-                        <td><strong>{{ ps.current }}</strong></td>
-                        <td style="font-size:0.85em;font-weight:600;color:#64748b;">🕐 {{ ps.last_seen|fmtts }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            {% endif %}
-
-            {% if pod_restart_tracking.restart_events %}
-            <div class="section-title">Restart Event Timeline</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Time</th><th>Pod</th><th>Namespace</th><th>Container</th>
-                        <th>New Restarts</th><th>Reason</th><th>Exit Code</th><th>Total Since Start</th><th>Elapsed</th><th>Logs</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for ev in pod_restart_tracking.restart_events %}
-                    <tr>
-                        <td style="font-size:0.85em;font-weight:600;white-space:nowrap;">🕐 {{ ev.detected_at|fmtts }}</td>
-                        <td><code>{{ ev.pod[:35] }}</code></td>
-                        <td>{{ ev.namespace }}</td>
-                        <td>{{ ev.container }}</td>
-                        <td><span class="badge badge-warn">+{{ ev.new_restarts }}</span></td>
-                        <td>
-                            {% if ev.restart_reason %}
-                            <span class="badge {% if ev.restart_reason == 'OOMKilled' %}badge-fail{% elif ev.restart_reason == 'Error' %}badge-warn{% else %}badge-info{% endif %}">{{ ev.restart_reason }}</span>
-                            {% else %}—{% endif %}
-                        </td>
-                        <td>
-                            {% if ev.exit_code is defined and ev.exit_code is not none %}
-                            <span class="badge {% if ev.exit_code == 137 %}badge-fail{% elif ev.exit_code == 0 %}badge-pass{% else %}badge-warn{% endif %}">{{ ev.exit_code }}</span>
-                            {% else %}—{% endif %}
-                        </td>
-                        <td>{{ ev.total_since_start }}</td>
-                        <td>{{ ev.execution_elapsed_min }} min</td>
-                        <td>
-                            {% if ev.log_snippet %}
-                            <button class="toggle-btn" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none';" style="font-size:0.8em;padding:2px 8px;cursor:pointer;border:1px solid #cbd5e1;border-radius:4px;background:#f8fafc;">View</button>
-                            <pre style="display:none;max-height:200px;overflow:auto;font-size:0.78em;background:#1e293b;color:#e2e8f0;padding:8px;border-radius:6px;margin-top:4px;white-space:pre-wrap;word-break:break-all;">{{ ev.log_snippet }}</pre>
-                            {% else %}—{% endif %}
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            {% endif %}
-        </div>
-    </div>
-    {% endif %}
-
     <!-- NODE STABILITY SCORES -->
     {% if node_stability %}
     <div class="card">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #8b5cf6, #6d28d9);">🖥️</div>
-            <h2>Node Stability Scores</h2>
+            <h2>Node Stability</h2>
         </div>
         <div class="card-body">
             <table>
                 <thead>
                     <tr>
-                        <th>Node</th><th>Score</th><th>Ready</th><th>CPU %</th>
+                        <th>Node</th><th>Ready</th><th>CPU %</th>
                         <th>Memory %</th><th>Disk %</th><th>Pressures</th>
                     </tr>
                 </thead>
@@ -786,14 +751,6 @@
                     {% for node in node_stability %}
                     <tr>
                         <td><strong>{{ node.node_name }}</strong></td>
-                        <td>
-                            <div style="display:flex; align-items:center; gap:8px;">
-                                <div class="stability-bar" style="width:80px;">
-                                    <div class="stability-fill" style="width:{{ node.stability_score }}%; background: {% if node.stability_score >= 80 %}var(--pass){% elif node.stability_score >= 50 %}var(--warn){% else %}var(--fail){% endif %};"></div>
-                                </div>
-                                <strong>{{ node.stability_score }}/100</strong>
-                            </div>
-                        </td>
                         <td>{% if node.ready %}<span class="badge badge-pass">Ready</span>{% else %}<span class="badge badge-fail">NotReady</span>{% endif %}</td>
                         <td>
                             {% if node.cpu_percent > 85 %}<span style="color:#ef4444;font-weight:bold">{{ node.cpu_percent }}%</span>
@@ -819,36 +776,6 @@
     </div>
     {% endif %}
 
-    <!-- POD RESTART TIMELINE -->
-    {% if restart_timestamps %}
-    <div class="card">
-        <div class="card-header">
-            <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">🔄</div>
-            <h2>Pod Restart Timeline</h2>
-        </div>
-        <div class="card-body">
-            <p style="color:var(--muted);margin-bottom:16px;">Most recent container terminations. All timestamps are in UTC.</p>
-            <table>
-                <thead>
-                    <tr><th>Terminated At</th><th>Pod</th><th>Namespace</th><th>Container</th><th>Reason</th><th>Exit Code</th></tr>
-                </thead>
-                <tbody>
-                    {% for rt in restart_timestamps[:20] %}
-                    <tr>
-                        <td style="white-space:nowrap;font-weight:600;font-size:12px;">🕐 {{ rt.last_terminated_at|fmtts }}</td>
-                        <td><code>{{ rt.pod[:40] }}</code></td>
-                        <td>{{ rt.namespace }}</td>
-                        <td>{{ rt.container }}</td>
-                        <td>{% if rt.reason %}<span class="badge badge-{% if rt.reason == 'OOMKilled' %}fail{% else %}warn{% endif %}">{{ rt.reason }}</span>{% else %}—{% endif %}</td>
-                        <td>{% if rt.exit_code is defined and rt.exit_code is not none %}<span class="badge badge-{% if rt.exit_code == 137 %}fail{% elif rt.exit_code == 0 %}pass{% else %}warn{% endif %}">{{ rt.exit_code }}</span>{% else %}—{% endif %}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-    </div>
-    {% endif %}
-
     <!-- CLUSTER HEALTH SNAPSHOT -->
     {% if cluster_health.collection_status == 'success' %}
     <div class="card">
@@ -858,16 +785,13 @@
         </div>
         <div class="card-body">
             {% if cluster_health.node_conditions %}
-            <div class="section-title">Node Conditions</div>
+            <div class="section-title">Node Health</div>
             <table style="margin-bottom:24px;">
-                <tr><th>Node</th><th>Ready</th><th>Disk Pressure</th><th>Memory Pressure</th><th>PID Pressure</th></tr>
+                <tr><th>Node</th><th>Ready</th></tr>
                 {% for node in cluster_health.node_conditions %}
                 <tr>
                     <td><strong>{{ node.node }}</strong></td>
                     <td>{% if node.ready %}<span class="badge badge-pass">Ready</span>{% else %}<span class="badge badge-fail">NotReady</span>{% endif %}</td>
-                    <td>{% if node.disk_pressure %}<span class="badge badge-fail">YES</span>{% else %}<span class="badge badge-pass">No</span>{% endif %}</td>
-                    <td>{% if node.memory_pressure %}<span class="badge badge-fail">YES</span>{% else %}<span class="badge badge-pass">No</span>{% endif %}</td>
-                    <td>{% if node.pid_pressure %}<span class="badge badge-fail">YES</span>{% else %}<span class="badge badge-pass">No</span>{% endif %}</td>
                 </tr>
                 {% endfor %}
             </table>
@@ -876,42 +800,95 @@
             {% if cluster_health.cpu_throttling %}
             <div class="section-title">CPU Throttling (Top Pods)</div>
             <table style="margin-bottom:24px;">
-                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Throttle %</th></tr>
+                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Throttle %</th><th>Timestamp</th></tr>
                 {% for t in cluster_health.cpu_throttling[:10] %}
                 <tr>
                     <td><code>{{ t.pod }}</code></td>
                     <td>{{ t.namespace }}</td>
                     <td>{{ t.container }}</td>
                     <td><span class="badge {% if t.throttle_ratio > 30 %}badge-fail{% elif t.throttle_ratio > 10 %}badge-warn{% else %}badge-info{% endif %}">{{ t.throttle_ratio }}%</span></td>
+                    <td>
+                        <div style="font-size:11px;white-space:nowrap;color:var(--muted);">{{ t.get('timestamp', '')|fmtts }}</div>
+                        {% set th = t.get('throttle_history', []) %}
+                        {% if th|length > 0 %}
+                        <span class="ts-toggle" onclick="this.nextElementSibling.classList.toggle('open')">▶ {{ th|length }} samples</span>
+                        <div class="ts-history">
+                            <ul>{% for h in th %}<li><span class="ts-idx">{{ loop.index }}.</span> {{ h.timestamp|fmtts }} — <strong>{{ h.throttle_pct }}%</strong></li>{% endfor %}</ul>
+                        </div>
+                        {% endif %}
+                    </td>
                 </tr>
                 {% endfor %}
             </table>
             {% endif %}
 
-            {% if cluster_health.oom_killed %}
-            <div class="section-title">OOMKilled Containers</div>
+            {% if cluster_health.terminated_containers %}
+            <div class="section-title" id="terminated-containers">Terminated Containers (Last Termination Reason)</div>
             <table style="margin-bottom:24px;">
-                <tr><th>Pod</th><th>Namespace</th><th>Container</th></tr>
-                {% for o in cluster_health.oom_killed %}
+                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Reason</th><th>Exit Code</th><th>Timestamp</th></tr>
+                {% for tc in cluster_health.terminated_containers %}
                 <tr>
-                    <td><code>{{ o.pod }}</code></td>
-                    <td>{{ o.namespace }}</td>
-                    <td>{{ o.container }}</td>
+                    <td><code>{{ tc.pod }}</code></td>
+                    <td>{{ tc.namespace }}</td>
+                    <td>{{ tc.container }}</td>
+                    <td>
+                        <span class="badge {% if tc.reason == 'OOMKilled' %}badge-fail{% elif tc.reason == 'Error' %}badge-fail{% elif tc.reason == 'Completed' %}badge-pass{% else %}badge-warn{% endif %}">{{ tc.reason }}</span>
+                        {% if tc.reason == 'OOMKilled' %}<span style="color:#991b1b;font-size:0.85em;margin-left:4px;">(Out of Memory — exceeded memory limit)</span>
+                        {% elif tc.reason == 'Error' %}<span style="color:#991b1b;font-size:0.85em;margin-left:4px;">(Process exited with non-zero code)</span>
+                        {% elif tc.reason == 'Completed' %}<span style="color:#16a34a;font-size:0.85em;margin-left:4px;">(Finished successfully)</span>
+                        {% elif tc.reason == 'ContainerCannotRun' %}<span style="color:#991b1b;font-size:0.85em;margin-left:4px;">(Container failed to start)</span>
+                        {% elif tc.reason == 'DeadlineExceeded' %}<span style="color:#92400e;font-size:0.85em;margin-left:4px;">(Job exceeded active deadline)</span>
+                        {% endif %}
+                    </td>
+                    <td style="text-align:center;">
+                        {% set ec = tc.get('exit_code') %}
+                        {% if ec is not none %}
+                        <code style="{% if ec == 137 %}color:#991b1b{% elif ec == 143 %}color:#92400e{% elif ec == 0 %}color:#16a34a{% else %}color:#991b1b{% endif %}">{{ ec }}</code>
+                        {% if ec == 137 %} <span style="font-size:0.8em;color:#991b1b;">SIGKILL</span>
+                        {% elif ec == 143 %} <span style="font-size:0.8em;color:#92400e;">SIGTERM</span>
+                        {% elif ec == 139 %} <span style="font-size:0.8em;color:#991b1b;">SIGSEGV</span>
+                        {% elif ec == 1 %} <span style="font-size:0.8em;color:#991b1b;">General error</span>
+                        {% elif ec == 2 %} <span style="font-size:0.8em;color:#991b1b;">Misuse</span>
+                        {% endif %}
+                        {% else %}—{% endif %}
+                    </td>
+                    <td>
+                        <div style="font-size:11px;white-space:nowrap;color:var(--muted);">{{ (tc.get('last_terminated_at') or '')|fmtts }}</div>
+                        {% set rh = tc.get('restart_history', []) %}
+                        {% if rh|length > 0 %}
+                        <span class="ts-toggle" onclick="this.nextElementSibling.classList.toggle('open')">▶ {{ rh|length }} restart{{ 's' if rh|length != 1 else '' }}</span>
+                        <div class="ts-history">
+                            <ul>{% for ts in rh %}<li><span class="ts-idx">{{ loop.index }}.</span> {{ ts|fmtts }}</li>{% endfor %}</ul>
+                        </div>
+                        {% endif %}
+                    </td>
                 </tr>
                 {% endfor %}
             </table>
             {% endif %}
 
-            {% if cluster_health.container_restarts %}
-            <div class="section-title">Container Restarts (Last Hour)</div>
+            {% if cluster_health.total_restarts %}
+            <div class="section-title">Cumulative Container Restarts (All-Time)</div>
             <table style="margin-bottom:24px;">
-                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Restarts</th></tr>
-                {% for r in cluster_health.container_restarts[:10] %}
+                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Total Restarts</th><th>Last Restart Timestamp</th></tr>
+                {% for tr in cluster_health.total_restarts %}
                 <tr>
-                    <td><code>{{ r.pod }}</code></td>
-                    <td>{{ r.namespace }}</td>
-                    <td>{{ r.container }}</td>
-                    <td><span class="badge badge-warn">{{ r.restart_count }}</span></td>
+                    <td><code>{{ tr.pod }}</code></td>
+                    <td>{{ tr.namespace }}</td>
+                    <td>{{ tr.container }}</td>
+                    <td style="text-align:center;">
+                        <span class="badge {% if tr.total_restarts > 10 %}badge-fail{% elif tr.total_restarts > 3 %}badge-warn{% else %}badge-info{% endif %}">{{ tr.total_restarts }}</span>
+                    </td>
+                    <td>
+                        <div style="font-size:11px;white-space:nowrap;color:var(--muted);">{{ (tr.get('last_restart_at') or '')|fmtts }}</div>
+                        {% set rh = tr.get('restart_history', []) %}
+                        {% if rh|length > 0 %}
+                        <span class="ts-toggle" onclick="this.nextElementSibling.classList.toggle('open')">▶ {{ rh|length }} restart{{ 's' if rh|length != 1 else '' }}</span>
+                        <div class="ts-history">
+                            <ul>{% for ts in rh %}<li><span class="ts-idx">{{ loop.index }}.</span> {{ ts|fmtts }}</li>{% endfor %}</ul>
+                        </div>
+                        {% endif %}
+                    </td>
                 </tr>
                 {% endfor %}
             </table>
@@ -948,47 +925,7 @@
             </table>
             {% endif %}
 
-            {% if cluster_health.terminated_containers %}
-            <div class="section-title">Terminated Containers (Last Termination Reason)</div>
-            <table style="margin-bottom:24px;">
-                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Reason</th></tr>
-                {% for tc in cluster_health.terminated_containers %}
-                <tr>
-                    <td><code>{{ tc.pod }}</code></td>
-                    <td>{{ tc.namespace }}</td>
-                    <td>{{ tc.container }}</td>
-                    <td><span class="badge {% if tc.reason == 'OOMKilled' %}badge-fail{% elif tc.reason == 'Error' %}badge-warn{% else %}badge-info{% endif %}">{{ tc.reason }}</span></td>
-                </tr>
-                {% endfor %}
-            </table>
-            {% endif %}
-
-            {% if cluster_health.total_restarts %}
-            <div class="section-title">Cumulative Container Restarts (All-Time)</div>
-            <table style="margin-bottom:24px;">
-                <tr><th>Pod</th><th>Namespace</th><th>Container</th><th>Total Restarts</th></tr>
-                {% for tr in cluster_health.total_restarts[:15] %}
-                <tr>
-                    <td><code>{{ tr.pod }}</code></td>
-                    <td>{{ tr.namespace }}</td>
-                    <td>{{ tr.container }}</td>
-                    <td><span class="badge {% if tr.total_restarts > 5 %}badge-fail{% elif tr.total_restarts > 2 %}badge-warn{% else %}badge-info{% endif %}">{{ tr.total_restarts }}</span></td>
-                </tr>
-                {% endfor %}
-            </table>
-            {% endif %}
-
-            {% if cluster_health.pod_phase_summary %}
-            <div class="section-title">Pod Phase Distribution</div>
-            <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:24px;">
-                {% for phase, count in cluster_health.pod_phase_summary.items() %}
-                <div style="text-align:center; padding:12px 20px; border-radius:8px; background:{% if phase == 'Running' %}#dcfce7{% elif phase == 'Pending' %}#fef9c3{% elif phase == 'Failed' %}#fecaca{% elif phase == 'Succeeded' %}#dbeafe{% else %}#f1f5f9{% endif %};">
-                    <div style="font-size:24px;font-weight:700;">{{ count }}</div>
-                    <div style="font-size:12px;color:#64748b;font-weight:600;">{{ phase }}</div>
-                </div>
-                {% endfor %}
-            </div>
-            {% endif %}
+            {# Pod Phase Distribution — disabled #}
 
             {% if cluster_health.problem_pods %}
             <div class="section-title">Problem Pods (Pending / Failed / Unknown)</div>
@@ -1004,18 +941,7 @@
             </table>
             {% endif %}
 
-            {% if cluster_health.pods_not_ready %}
-            <div class="section-title">Pods Not Ready (Readiness Probe Failing)</div>
-            <table style="margin-bottom:24px;">
-                <tr><th>Pod</th><th>Namespace</th></tr>
-                {% for nr in cluster_health.pods_not_ready %}
-                <tr>
-                    <td><code>{{ nr.pod }}</code></td>
-                    <td>{{ nr.namespace }}</td>
-                </tr>
-                {% endfor %}
-            </table>
-            {% endif %}
+            {# Pods Not Ready (Readiness Probe Failing) — disabled #}
 
             {% if cluster_health.api_server_latency %}
             <div class="section-title">API Server Latency (P99 &gt; 1s)</div>
@@ -1031,15 +957,7 @@
             </table>
             {% endif %}
 
-            {% if cluster_health.etcd_healthy is defined %}
-            <div class="section-title">Infrastructure Health</div>
-            <div style="display:flex; gap:16px; margin-bottom:24px;">
-                <div style="padding:12px 24px; border-radius:8px; background:{% if cluster_health.etcd_healthy %}#dcfce7{% else %}#fecaca{% endif %};">
-                    <strong>etcd:</strong>
-                    {% if cluster_health.etcd_healthy %}<span class="badge badge-pass">Healthy (has leader)</span>{% else %}<span class="badge badge-fail">NO LEADER</span>{% endif %}
-                </div>
-            </div>
-            {% endif %}
+            {# Infrastructure Health — disabled #}
         </div>
     </div>
     {% else %}
@@ -1064,77 +982,53 @@
     </div>
     {% endif %}
 
-    <!-- CAPACITY PLANNING (deprecated — estimates were unreliable) -->
-    {% if capacity_planning.available and not (health_assessment and health_assessment.get('_deprecated')) %}
+    <!-- OPERATION TIMING HEATMAP -->
+    {% if operation_heatmap.buckets %}
     <div class="card">
         <div class="card-header">
-            <div class="icon" style="background: linear-gradient(135deg, #a855f7, #7c3aed);">📐</div>
-            <h2>Capacity Planning Estimate</h2>
+            <div class="icon" style="background: linear-gradient(135deg, #8b5cf6, #6d28d9);">🗺️</div>
+            <h2>Operation Timing Heatmap</h2>
         </div>
         <div class="card-body">
-            <div class="stat-grid">
-                <div class="stat-card">
-                    <div class="stat-value" style="color:var(--blue);">{{ capacity_planning.total_ops_executed }}</div>
-                    <div class="stat-label">Ops Executed</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" style="color:var(--purple);">{{ capacity_planning.cpu_per_operation }}%</div>
-                    <div class="stat-label">CPU / Operation</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" style="color:var(--teal);">{{ capacity_planning.memory_per_operation }}%</div>
-                    <div class="stat-label">Memory / Operation</div>
-                </div>
-                {% if capacity_planning.estimated_total_capacity_ops %}
-                <div class="stat-card">
-                    <div class="stat-value" style="color:var(--warn);">~{{ capacity_planning.estimated_total_capacity_ops }}</div>
-                    <div class="stat-label">Est. Max Ops</div>
-                </div>
-                {% endif %}
-            </div>
-            <p style="color: var(--muted); font-size: 13px; margin-top: 12px;">
-                <strong>Note:</strong> CPU/Memory per operation = average <em>magnitude</em> of cluster usage change per op (or average step-change when start/end metrics cancel out). Higher values mean each operation tends to move metrics more.
+            <p style="color:var(--muted); font-size:13px; margin-bottom:12px;">
+                Each cell shows avg duration (seconds) per time bucket. Time buckets divide the execution duration into equal intervals. Darker blue = slower. Red = high failure rate (&gt;30%).
             </p>
-            <div style="background:#f0f9ff; padding:16px; border-radius:8px; margin-top:8px;">
-                <strong>Bottleneck:</strong> {{ capacity_planning.bottleneck|upper }}<br>
-                <strong>Recommendation:</strong> {{ capacity_planning.recommendation }}
+            <div style="overflow-x:auto;">
+                <table class="heatmap-table">
+                    <thead>
+                        <tr>
+                            <th style="min-width:160px;">Entity.Operation</th>
+                            {% for bucket in operation_heatmap.buckets %}
+                            <th>{{ bucket }}</th>
+                            {% endfor %}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for eo in operation_heatmap.entity_ops %}
+                        <tr>
+                            <td style="font-weight:600; font-size:13px;">{{ eo }} <span style="color:var(--muted); font-weight:500;">(n={% if operation_heatmap.row_totals and eo in operation_heatmap.row_totals %}{{ operation_heatmap.row_totals[eo] }}{% else %}0{% endif %})</span></td>
+                            {% for bi in range(operation_heatmap.buckets|length) %}
+                            {% set cell = operation_heatmap.data[eo][bi|string] or operation_heatmap.data[eo][bi] %}
+                            {% if cell and cell.count > 0 %}
+                            {% set intensity = [cell.avg_duration / 120, 1.0]|min %}
+                            {% if cell.failure_rate > 30 %}
+                            <td><div class="heatmap-cell" style="background: rgba(239,68,68,{{ [intensity * 0.8 + 0.2, 1.0]|min }});">
+                                {{ cell.avg_duration }}s<br><small style="font-size:10px;">{{ cell.count }} ops, {{ cell.failure_rate }}% fail</small>
+                            </div></td>
+                            {% else %}
+                            <td><div class="heatmap-cell" style="background: rgba(59,130,246,{{ [intensity * 0.6 + 0.1, 0.8]|min }});">
+                                {{ cell.avg_duration }}s<br><small style="font-size:10px;">{{ cell.count }} ops</small>
+                            </div></td>
+                            {% endif %}
+                            {% else %}
+                            <td><div class="heatmap-cell" style="background: #f1f5f9;">—</div></td>
+                            {% endif %}
+                            {% endfor %}
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
             </div>
-            {% if capacity_planning.entities_created %}
-            <div style="margin-top:16px;">
-                <div class="section-title">Entities Created</div>
-                <div style="display:flex; gap:12px; flex-wrap:wrap;">
-                    {% for etype, count in capacity_planning.entities_created.items() %}
-                    <div class="badge badge-info">{{ etype }}: {{ count }}</div>
-                    {% endfor %}
-                </div>
-            </div>
-            {% endif %}
-        </div>
-    </div>
-    {% endif %}
-
-    <!-- ENTITY × OPERATION COUNTS (how many times each was executed) -->
-    {% if entity_operation_counts and entity_operation_counts|length > 0 %}
-    <div class="card">
-        <div class="card-header">
-            <div class="icon" style="background: linear-gradient(135deg, #0ea5e9, #0369a1);">🔢</div>
-            <h2>Entity × Operation — Execution Counts</h2>
-        </div>
-        <div class="card-body">
-            <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">
-                Number of times each <strong>entity type</strong> and <strong>operation</strong> pair was run in this execution (same as summing rows in the operations log).
-            </p>
-            <table>
-                <thead><tr><th>Entity.Operation</th><th>Count</th></tr></thead>
-                <tbody>
-                    {% for row in entity_operation_counts %}
-                    <tr>
-                        <td><strong>{{ row.key }}</strong></td>
-                        <td><span class="badge badge-info">{{ row.count }}</span></td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
         </div>
     </div>
     {% endif %}
@@ -1195,85 +1089,21 @@
     </div>
     {% endif %}
 
-    <!-- HISTORICAL COMPARISON -->
-    {% if historical_comparison.available %}
-    <div class="card">
-        <div class="card-header">
-            <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">📊</div>
-            <h2>Historical Comparison (Last {{ historical_comparison.count }} runs on this testbed)</h2>
-        </div>
-        <div class="card-body">
-            <table>
-                <thead>
-                    <tr><th>Execution</th><th>Status</th><th>Duration</th><th>Iterations</th><th>Total Ops</th><th>Success Rate</th><th>Start CPU</th><th>End CPU</th></tr>
-                </thead>
-                <tbody>
-                    {% for h in historical_comparison.previous_executions %}
-                    <tr>
-                        <td><code>{{ h.execution_id[:12] }}...</code></td>
-                        <td><span class="badge badge-{% if h.status == 'COMPLETED' %}pass{% else %}warn{% endif %}">{{ h.status }}</span></td>
-                        <td>{{ h.duration_minutes }}m</td>
-                        <td>{{ h.iterations|default('—') }}</td>
-                        <td>{{ h.total_operations }}</td>
-                        <td>{{ h.success_rate }}%</td>
-                        <td>{{ h.baseline_cpu|round(1) }}%</td>
-                        <td>{{ h.final_cpu|round(1) }}%</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-    </div>
-    {% endif %}
-
-    <!-- ENTITY BREAKDOWN -->
-    {% if entity_breakdown %}
-    <div class="card">
-        <div class="card-header">
-            <div class="icon" style="background: linear-gradient(135deg, #10b981, #059669);">📋</div>
-            <h2>Entity Breakdown (counts per entity type)</h2>
-        </div>
-        <div class="card-body">
-            <p style="color: var(--muted); font-size: 13px; margin-bottom: 12px;">
-                <strong>Total</strong> = how many operations targeted that entity type. See <em>Entity × Operation — Execution Counts</em> above for per-operation-type totals.
-            </p>
-            <table>
-                <thead><tr><th>Entity Type</th><th>Total ops</th><th>Success</th><th>Failed</th><th>Success Rate</th></tr></thead>
-                <tbody>
-                    {% for etype, stats in entity_breakdown.items() %}
-                    <tr>
-                        <td><strong>{{ etype }}</strong></td>
-                        <td>{{ stats.get('total', 0) }}</td>
-                        <td style="color:var(--pass); font-weight:600;">{{ stats.get('success', 0) }}</td>
-                        <td style="color:var(--fail); font-weight:600;">{{ stats.get('failed', 0) }}</td>
-                        <td>
-                            {% set sr = ((stats.get('success', 0) / [stats.get('total', 1), 1]|max) * 100)|round(1) %}
-                            <span class="badge badge-{% if sr > 90 %}pass{% elif sr > 70 %}warn{% else %}fail{% endif %}">{{ sr }}%</span>
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-    </div>
-    {% endif %}
-
-    <!-- OPERATION EFFECTIVENESS -->
+    <!-- OPERATION RESOURCE IMPACT -->
     {% if operation_effectiveness %}
     <div class="card">
         <div class="card-header">
             <div class="icon" style="background: linear-gradient(135deg, #6366f1, #4f46e5);">⚡</div>
-            <h2>Most Effective Operations</h2>
+            <h2>Operation Resource Impact</h2>
         </div>
         <div class="card-body">
             <table>
-                <thead><tr><th>Operation</th><th>Executions</th><th>Impact Score</th><th>Avg CPU Δ</th><th>Avg Memory Δ</th></tr></thead>
+                <thead><tr><th>Operation</th><th>Executions</th><th>Avg CPU Δ</th><th>Avg Memory Δ</th></tr></thead>
                 <tbody>
                     {% for eff in operation_effectiveness[:10] %}
                     <tr>
                         <td><strong>{{ eff.get('key', eff.get('entity_type', '?') + '.' + eff.get('operation', '?')) }}</strong></td>
                         <td><span class="badge badge-info">{{ eff.get('execution_count', eff.get('count', '—')) }}</span></td>
-                        <td>{{ eff.get('effectiveness_score', eff.get('impact_score', 0))|round(2) }}</td>
                         <td style="color:{% if eff.get('avg_cpu_delta', 0) > 0 %}var(--fail){% else %}var(--pass){% endif %}; font-weight:600;">
                             {{ '%+.2f'|format(eff.get('avg_cpu_delta', 0)) }}%
                         </td>
@@ -1288,72 +1118,70 @@
     </div>
     {% endif %}
 
-    <!-- FULL OPERATIONS LOG (collapsible) -->
-    <div class="card">
-        <div class="card-header collapsible-header" onclick="toggleSection('ops-log')">
-            <div class="icon" style="background: linear-gradient(135deg, #64748b, #475569);">📝</div>
-            <h2>All Operations ({{ operations_history|length }})</h2>
-        </div>
-        <div id="ops-log" class="collapsible-content">
-            <div class="card-body" style="padding:0;">
-                <div style="max-height:600px; overflow-y:auto;">
-                    <table>
-                        <thead><tr><th>#</th><th>Timestamp</th><th>Iter</th><th>Entity</th><th>Operation</th><th>Name</th><th>HTTP</th><th>Duration</th><th>Status</th></tr></thead>
-                        <tbody>
-                            {% for op in operations_history %}
-                            <tr>
-                                <td>{{ loop.index }}</td>
-                                <td style="font-size:11px;white-space:nowrap;color:var(--muted);">{{ op.get('timestamp', '')|fmtts }}</td>
-                                <td>{{ op.get('iteration', '—') }}</td>
-                                <td>{{ op.get('entity_type', 'N/A') }}</td>
-                                <td>{{ op.get('operation', 'N/A') }}</td>
-                                <td><code>{{ op.get('entity_name', 'N/A')[:40] }}</code></td>
-                                <td>
-                                    {% set hcode = op.get('http_status_code') %}
-                                    {% if hcode %}
-                                    <span class="status-pill {% if hcode >= 200 and hcode < 300 %}s2xx{% elif hcode >= 400 and hcode < 500 %}s4xx{% elif hcode >= 500 %}s5xx{% else %}sna{% endif %}">{{ hcode }}</span>
-                                    {% else %}—{% endif %}
-                                </td>
-                                <td>{{ op.get('duration_seconds', 0)|round(2) }}s</td>
-                                <td><span class="badge badge-{% if op.get('status') == 'SUCCESS' %}pass{% else %}fail{% endif %}">{{ op.get('status', '?') }}</span></td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- DATA QUALITY SCORE -->
-    {% if data_quality %}
+    <!-- ENTITY × OPERATION COUNTS -->
+    {% if entity_operation_counts and entity_operation_counts|length > 0 %}
     <div class="card">
         <div class="card-header">
-            <div class="icon" style="background:{% if data_quality.score == 'HIGH' %}var(--pass){% elif data_quality.score == 'MEDIUM' %}var(--warn){% else %}var(--fail){% endif %};">📊</div>
-            <h2>Data Quality Score: {{ data_quality.score }}</h2>
+            <div class="icon" style="background: linear-gradient(135deg, #0ea5e9, #0369a1);">🔢</div>
+            <h2>Entity × Operation — Execution Counts</h2>
         </div>
         <div class="card-body">
-            <div class="stat-grid">
-                <div class="stat-card"><div class="stat-value">{{ data_quality.operations_recorded }}</div><div class="stat-label">Operations</div></div>
-                <div class="stat-card"><div class="stat-value">{{ data_quality.metrics_samples }}</div><div class="stat-label">Metric Samples</div></div>
-                <div class="stat-card"><div class="stat-value">{{ data_quality.real_operations_percent|round(1) }}%</div><div class="stat-label">Real Ops</div></div>
-                <div class="stat-card"><div class="stat-value">{{ data_quality.pod_events_captured }}</div><div class="stat-label">Pod Events</div></div>
-                <div class="stat-card"><div class="stat-value">{{ data_quality.timeline_events }}</div><div class="stat-label">Timeline Events</div></div>
-                <div class="stat-card"><div class="stat-value">{{ data_quality.missing_metric_samples }}</div><div class="stat-label">Missing Samples</div></div>
-            </div>
-            {% if data_quality.issues %}
-            <div style="margin-top:12px;">
-                <strong style="color:var(--warn);">Issues:</strong>
-                <ul style="margin-top:6px;padding-left:20px;">
-                {% for issue in data_quality.issues %}
-                    <li style="color:var(--muted);font-size:13px;">{{ issue }}</li>
-                {% endfor %}
-                </ul>
-            </div>
-            {% endif %}
+            <table>
+                <thead><tr><th>Entity.Operation</th><th>Count</th></tr></thead>
+                <tbody>
+                    {% for row in entity_operation_counts %}
+                    <tr>
+                        <td><strong>{{ row.key }}</strong></td>
+                        <td><span class="badge badge-info">{{ row.count }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
         </div>
     </div>
     {% endif %}
+
+    <!-- FULL OPERATIONS LOG -->
+    <div class="card" id="ops-log">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #64748b, #475569);">📝</div>
+            <h2>All Operations ({{ operations_history|length }})</h2>
+        </div>
+        <div class="card-body" style="padding:0;">
+            <div style="padding:12px 16px; display:flex; gap:8px; align-items:center; border-bottom:1px solid var(--border);">
+                <button onclick="toggleOpsFilter('all')" id="ops-filter-all" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--dark);color:white;font-size:12px;font-weight:600;cursor:pointer;">Show All</button>
+                <button onclick="toggleOpsFilter('failed')" id="ops-filter-failed" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:white;color:var(--dark);font-size:12px;font-weight:600;cursor:pointer;">Failures Only</button>
+                <button onclick="toggleOpsFilter('success')" id="ops-filter-success" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:white;color:var(--dark);font-size:12px;font-weight:600;cursor:pointer;">Success Only</button>
+                <span style="margin-left:auto;font-size:12px;color:var(--muted);" id="ops-filter-count"></span>
+            </div>
+            <div style="max-height:600px; overflow-y:auto;">
+                <table id="ops-log-table">
+                    <thead><tr><th>#</th><th>Timestamp</th><th>Iter</th><th>Entity</th><th>Operation</th><th>Name</th><th>API URL</th><th>HTTP</th><th>Duration</th><th>Status</th></tr></thead>
+                    <tbody>
+                        {% for op in operations_history %}
+                        <tr class="ops-row {% if op.get('status') != 'SUCCESS' %}ops-failed{% else %}ops-success{% endif %}" {% if op.get('status') != 'SUCCESS' %}style="background:#fef2f2;"{% endif %}>
+                            <td>{{ loop.index }}</td>
+                            <td style="font-size:11px;white-space:nowrap;color:var(--muted);">{{ op.get('timestamp', '')|fmtts }}</td>
+                            <td>{{ op.get('iteration', '—') }}</td>
+                            <td>{{ op.get('entity_type', 'N/A') }}</td>
+                            <td>{{ op.get('operation', 'N/A') }}</td>
+                            <td><code>{{ op.get('entity_name', 'N/A')[:40] }}</code></td>
+                            <td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{{ op.get('api_url') or '' }}"><code>{{ (op.get('api_url') or '—')[-50:] }}</code></td>
+                            <td>
+                                {% set hcode = op.get('http_status_code') %}
+                                {% if hcode %}
+                                <span class="status-pill {% if hcode >= 200 and hcode < 300 %}s2xx{% elif hcode >= 400 and hcode < 500 %}s4xx{% elif hcode >= 500 %}s5xx{% else %}sna{% endif %}">{{ hcode }}</span>
+                                {% else %}—{% endif %}
+                            </td>
+                            <td>{{ op.get('duration_seconds', 0)|round(2) }}s</td>
+                            <td><span class="badge badge-{% if op.get('status') == 'SUCCESS' %}pass{% else %}fail{% endif %}">{{ op.get('status', '?') }}</span></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
 
     <!-- METRICS STATISTICS -->
     {% if metrics_stats and metrics_stats.cpu %}
@@ -1361,10 +1189,41 @@
         <div class="card-header"><div class="icon" style="background:var(--blue);">📈</div><h2>Metrics Statistics</h2></div>
         <div class="card-body">
             <table>
-                <thead><tr><th>Metric</th><th>Baseline</th><th>Min</th><th>Avg</th><th>P50</th><th>P95</th><th>Max</th><th>Final</th><th>Samples</th></tr></thead>
+                <thead><tr><th>Metric</th><th>Start of Test</th><th>Min</th><th>Avg</th><th>P50</th><th>P95</th><th>Max</th><th>End of Test</th><th>Samples</th></tr></thead>
                 <tbody>
                     <tr><td><strong>CPU %</strong></td><td>{{ metrics_stats.cpu.baseline }}</td><td>{{ metrics_stats.cpu.min }}</td><td>{{ metrics_stats.cpu.avg }}</td><td>{{ metrics_stats.cpu.p50 }}</td><td>{{ metrics_stats.cpu.p95 }}</td><td>{{ metrics_stats.cpu.max }}</td><td>{{ metrics_stats.cpu.final }}</td><td>{{ metrics_stats.cpu.samples }}</td></tr>
                     <tr><td><strong>Memory %</strong></td><td>{{ metrics_stats.memory.baseline }}</td><td>{{ metrics_stats.memory.min }}</td><td>{{ metrics_stats.memory.avg }}</td><td>{{ metrics_stats.memory.p50 }}</td><td>{{ metrics_stats.memory.p95 }}</td><td>{{ metrics_stats.memory.max }}</td><td>{{ metrics_stats.memory.final }}</td><td>{{ metrics_stats.memory.samples }}</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- HISTORICAL COMPARISON -->
+    {% if historical_comparison.available %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #f97316, #ea580c);">📊</div>
+            <h2>Historical Comparison (Last {{ historical_comparison.count }} runs on this testbed)</h2>
+        </div>
+        <div class="card-body">
+            <table>
+                <thead>
+                    <tr><th>Execution</th><th>Status</th><th>Duration</th><th>Iterations</th><th>Total Ops</th><th>Success Rate</th><th>Start of Test CPU</th><th>End of Test CPU</th></tr>
+                </thead>
+                <tbody>
+                    {% for h in historical_comparison.previous_executions %}
+                    <tr>
+                        <td><code>{{ h.execution_id[:12] }}...</code></td>
+                        <td><span class="badge badge-{% if h.status == 'COMPLETED' %}pass{% else %}warn{% endif %}">{{ h.status }}</span></td>
+                        <td>{{ h.duration_minutes }}m</td>
+                        <td>{{ h.iterations|default('—') }}</td>
+                        <td>{{ h.total_operations }}</td>
+                        <td>{{ h.success_rate }}%</td>
+                        <td>{{ h.baseline_cpu|round(1) }}%</td>
+                        <td>{{ h.final_cpu|round(1) }}%</td>
+                    </tr>
+                    {% endfor %}
                 </tbody>
             </table>
         </div>
@@ -1433,9 +1292,39 @@
     </div>
     {% endif %}
 
+    <!-- DATA COLLECTION SUMMARY -->
+    {% if data_quality %}
+    <div class="card">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #64748b, #475569);">📊</div>
+            <h2>Data Collection Summary</h2>
+        </div>
+        <div class="card-body">
+            <div class="stat-grid">
+                <div class="stat-card"><div class="stat-value">{{ data_quality.operations_recorded }}</div><div class="stat-label">Operations</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.metrics_samples }}</div><div class="stat-label">Metric Samples</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.real_operations_percent|round(1) }}%</div><div class="stat-label">Real Ops</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.pod_events_captured }}</div><div class="stat-label">Pod Events</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.timeline_events }}</div><div class="stat-label">Timeline Events</div></div>
+                <div class="stat-card"><div class="stat-value">{{ data_quality.missing_metric_samples }}</div><div class="stat-label">Missing Samples</div></div>
+            </div>
+            {% if data_quality.issues %}
+            <div style="margin-top:12px;">
+                <strong style="color:var(--warn);">Issues:</strong>
+                <ul style="margin-top:6px;padding-left:20px;">
+                {% for issue in data_quality.issues %}
+                    <li style="color:var(--muted);font-size:13px;">{{ issue }}</li>
+                {% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
     <!-- FOOTER -->
     <div class="report-footer">
-        Generated by <strong>NMT Smart Execution Tool (Enhanced AI Report)</strong> — {{ timestamp|fmtts }}
+        Generated by <strong>NMT Smart Execution Report</strong> — {{ timestamp|fmtts }}
     </div>
 </div>
 
@@ -1445,6 +1334,28 @@ function toggleSection(id) {
     el.classList.toggle('open');
 }
 
+function scrollToSection(id) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (el.classList.contains('collapsible-content') && !el.classList.contains('open')) {
+        el.classList.add('open');
+    }
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('a.stat-card-link[href^="#"]').forEach(function(link) {
+        link.addEventListener('click', function(e) {
+            e.preventDefault();
+            scrollToSection(this.getAttribute('href').substring(1));
+        });
+    });
+
+    if (window.location.hash) {
+        scrollToSection(window.location.hash.substring(1));
+    }
+});
+
 function toggleAccordion(header) {
     header.classList.toggle('open');
     var body = header.nextElementSibling;
@@ -1452,6 +1363,23 @@ function toggleAccordion(header) {
         body.classList.toggle('open');
     }
 }
+
+function toggleOpsFilter(mode) {
+    var rows = document.querySelectorAll('#ops-log-table .ops-row');
+    var shown = 0;
+    rows.forEach(function(row) {
+        if (mode === 'all') { row.style.display = ''; shown++; }
+        else if (mode === 'failed') { row.style.display = row.classList.contains('ops-failed') ? '' : 'none'; if (row.classList.contains('ops-failed')) shown++; }
+        else if (mode === 'success') { row.style.display = row.classList.contains('ops-success') ? '' : 'none'; if (row.classList.contains('ops-success')) shown++; }
+    });
+    var countEl = document.getElementById('ops-filter-count');
+    if (countEl) countEl.textContent = 'Showing ' + shown + ' of ' + rows.length + ' operations';
+    ['all','failed','success'].forEach(function(m) {
+        var btn = document.getElementById('ops-filter-' + m);
+        if (btn) { btn.style.background = (m === mode) ? '#1e293b' : 'white'; btn.style.color = (m === mode) ? 'white' : '#1e293b'; }
+    });
+}
+document.addEventListener('DOMContentLoaded', function() { toggleOpsFilter('all'); });
 
 // Build Timeline Chart
 (function() {
@@ -1573,6 +1501,8 @@ function toggleAccordion(header) {
     });
 })();
 
+// Failure Timeline Chart (disabled)
+
 // Per-Node Metrics — one chart per cluster
 (function() {
     var metricsHistory = {{ metrics_history_json|safe }};
@@ -1587,12 +1517,16 @@ function toggleAccordion(header) {
 
     var nodeCluster = {};
     var nodeLabel = {};
+    var clusterIpMap = {};
     metricsHistory.forEach(function(m) {
         (m.per_node || []).forEach(function(n) {
             var id = n.node_id || n.name || 'unknown';
             if (!nodeCluster[id]) {
                 nodeCluster[id] = n.cluster_name || '';
                 nodeLabel[id] = n.name || id;
+            }
+            if (n.cluster_name && n.cluster_ip && !clusterIpMap[n.cluster_name]) {
+                clusterIpMap[n.cluster_name] = n.cluster_ip;
             }
         });
     });
@@ -1601,6 +1535,11 @@ function toggleAccordion(header) {
         var emptyEl2 = document.getElementById('perNodeEmpty');
         if (emptyEl2) emptyEl2.style.display = 'block';
         return;
+    }
+
+    function clusterLabel(cname) {
+        var ip = clusterIpMap[cname];
+        return ip ? cname + ' (' + ip + ')' : cname;
     }
 
     var clusterNamesSet = {};
@@ -1636,8 +1575,12 @@ function toggleAccordion(header) {
     var topoType = clusterNames.length > 1 ? 'Multi-Cluster' : (allNodeIds.length > 1 ? 'Multi-Node' : 'Single Node');
     var badgeEl = document.getElementById('perNodeTopologyBadge');
     if (badgeEl) {
+        var clusterBadges = clusterNames.map(function(cn) {
+            return '<span style="display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;background:#f0fdf4;color:#166534;margin-right:4px;">' + clusterLabel(cn) + '</span>';
+        }).join('');
         badgeEl.innerHTML = '<span style="display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;background:#e0f2fe;color:#0369a1;margin-right:8px;">' + topoType + '</span>' +
-            '<span style="font-size:12px;color:#64748b;">' + allNodeIds.length + ' host(s)' + (clusterNames.length > 1 ? ' across ' + clusterNames.length + ' clusters' : '') + '</span>';
+            '<span style="font-size:12px;color:#64748b;margin-right:8px;">' + allNodeIds.length + ' host(s)' + (clusterNames.length > 1 ? ' across ' + clusterNames.length + ' clusters' : '') + '</span>' +
+            clusterBadges;
     }
 
     // Host summary table
@@ -1653,7 +1596,7 @@ function toggleAccordion(header) {
             var mem = (n.memory_percent || nodeData[id].mem.slice(-1)[0] || 0).toFixed(1);
             var cpuColor = cpu > 80 ? '#ef4444' : cpu > 50 ? '#f59e0b' : '#22c55e';
             var memColor = mem > 80 ? '#ef4444' : mem > 50 ? '#f59e0b' : '#22c55e';
-            tHtml += '<tr><td><span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;background:' + (clusterColorMap[nodeCluster[id]] || '#64748b') + ';color:white;">' + (nodeCluster[id] || 'N/A') + '</span></td>';
+            tHtml += '<tr><td><span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;background:' + (clusterColorMap[nodeCluster[id]] || '#64748b') + ';color:white;">' + clusterLabel(nodeCluster[id] || 'N/A') + '</span></td>';
             tHtml += '<td style="font-weight:600;">' + nodeLabel[id] + '</td>';
             tHtml += '<td style="font-weight:700;color:' + cpuColor + ';">' + cpu + '%</td>';
             tHtml += '<td><div style="background:#e2e8f0;border-radius:4px;height:8px;width:100%;"><div style="background:' + cpuColor + ';border-radius:4px;height:8px;width:' + Math.min(cpu, 100) + '%;"></div></div></td>';
@@ -1675,7 +1618,7 @@ function toggleAccordion(header) {
         wrapper.style.cssText = 'border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px;border-left:4px solid ' + (clusterColorMap[cname] || '#64748b');
         wrapper.innerHTML = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">' +
             '<span style="width:12px;height:12px;border-radius:50%;background:' + (clusterColorMap[cname] || '#64748b') + ';display:inline-block;"></span>' +
-            '<strong>' + (cname || 'Cluster') + '</strong>' +
+            '<strong>' + clusterLabel(cname || 'Cluster') + '</strong>' +
             '<span style="font-size:10px;color:#64748b;background:#f1f5f9;padding:2px 8px;border-radius:10px;">' + cNodes.length + ' host' + (cNodes.length !== 1 ? 's' : '') + '</span></div>';
         var chartDiv = document.createElement('div');
         chartDiv.style.cssText = 'position:relative;height:250px;width:100%;';

@@ -73,6 +73,36 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db():
     """Create all tables in the database."""
     Base.metadata.create_all(bind=engine)
+    _migrate_pod_events_columns()
+
+
+def _migrate_pod_events_columns():
+    """Add new OOM-context columns to execution_pod_events if they don't exist."""
+    new_cols = {
+        'concurrent_operation': 'VARCHAR(128)',
+        'pod_memory_mb': 'FLOAT',
+        'pod_memory_limit_mb': 'FLOAT',
+        'pod_memory_request_mb': 'FLOAT',
+        'pod_cpu_cores': 'FLOAT',
+        'pod_cpu_limit_cores': 'FLOAT',
+        'pod_cpu_request_cores': 'FLOAT',
+        'node': 'VARCHAR(255)',
+    }
+    try:
+        with engine.connect() as conn:
+            for col, dtype in new_cols.items():
+                try:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE execution_pod_events ADD COLUMN {col} {dtype}"
+                        )
+                    )
+                    conn.commit()
+                    logging.info(f"[migrate] Added column execution_pod_events.{col}")
+                except Exception:
+                    conn.rollback()
+    except Exception as e:
+        logging.debug(f"[migrate] pod_events column migration skipped: {e}")
 
 
 
@@ -1434,11 +1464,55 @@ def batch_insert_api_logs(execution_id: str, operations: list):
         return 0
     session = SessionLocal()
     try:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
         rows = []
         for op in operations:
-            rows.append(ExecutionApiLog(
+            rows.append({
+                'execution_id': execution_id,
+                'iteration': op.get('iteration'),
+                'operation_id': op.get('operation_id'),
+                'sequence_number': op.get('sequence_number'),
+                'entity_type': op.get('entity_type'),
+                'operation': op.get('operation'),
+                'entity_name': (op.get('entity_name') or '')[:255],
+                'api_url': op.get('api_url'),
+                'http_method': op.get('http_method'),
+                'http_status_code': op.get('http_status_code'),
+                'status': op.get('status'),
+                'request_payload': op.get('request_payload'),
+                'response_body': op.get('response_body'),
+                'error_message': (op.get('error') or '')[:2000] or None,
+                'duration_seconds': op.get('duration_seconds'),
+                'timestamp': _parse_ts(op.get('start_time') or op.get('timestamp')),
+            })
+        stmt = pg_insert(ExecutionApiLog).values(rows)
+        stmt = stmt.on_conflict_do_nothing(constraint='uq_api_logs_exec_op')
+        session.execute(stmt)
+        session.commit()
+        logging.info(f"[Phase2] Upserted {len(rows)} api_log rows for {execution_id[:12]}")
+        return len(rows)
+    except Exception as e:
+        session.rollback()
+        logging.error(f"[Phase2] batch_insert_api_logs error: {e}")
+        try:
+            _fallback_bulk_insert_api_logs(session, execution_id, operations)
+        except Exception:
+            pass
+        return 0
+    finally:
+        session.close()
+
+
+def _fallback_bulk_insert_api_logs(session, execution_id, operations):
+    """Row-by-row fallback when pg upsert is unavailable or constraint missing."""
+    inserted = 0
+    for op in operations:
+        try:
+            session.add(ExecutionApiLog(
                 execution_id=execution_id,
                 iteration=op.get('iteration'),
+                operation_id=op.get('operation_id'),
+                sequence_number=op.get('sequence_number'),
                 entity_type=op.get('entity_type'),
                 operation=op.get('operation'),
                 entity_name=(op.get('entity_name') or '')[:255],
@@ -1452,55 +1526,53 @@ def batch_insert_api_logs(execution_id: str, operations: list):
                 duration_seconds=op.get('duration_seconds'),
                 timestamp=_parse_ts(op.get('start_time') or op.get('timestamp')),
             ))
-        session.bulk_save_objects(rows)
+            session.flush()
+            inserted += 1
+        except Exception:
+            session.rollback()
+    if inserted:
         session.commit()
-        logging.info(f"[Phase2] Inserted {len(rows)} api_log rows for {execution_id[:12]}")
-        return len(rows)
-    except Exception as e:
-        session.rollback()
-        logging.error(f"[Phase2] batch_insert_api_logs error: {e}")
-        return 0
-    finally:
-        session.close()
+        logging.info(f"[Phase2] Fallback inserted {inserted} api_log rows for {execution_id[:12]}")
 
 
 def batch_insert_pod_events(execution_id: str, events: list):
-    """
-    Bulk-insert pod restart events into execution_pod_events.
-
-    Args:
-        execution_id: Smart-execution ID
-        events: list of restart-event dicts from pod_restart_tracking.restart_events
-    Returns:
-        int: number of rows inserted
-    """
+    """Bulk-insert pod restart events into execution_pod_events (idempotent)."""
     if not events:
         return 0
     session = SessionLocal()
     try:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
         rows = []
         for ev in events:
-            log_snippet_raw = ev.get('log_snippet') or ''
-            if len(log_snippet_raw) > 2048:
-                log_snippet_raw = log_snippet_raw[:2048]
-            rows.append(ExecutionPodEvent(
-                execution_id=execution_id,
-                pod_name=(ev.get('pod') or '')[:255],
-                namespace=ev.get('namespace'),
-                container=ev.get('container'),
-                event_type='restart',
-                restart_reason=ev.get('restart_reason'),
-                exit_code=ev.get('exit_code'),
-                new_restarts=ev.get('new_restarts', 0),
-                total_since_start=ev.get('total_since_start', 0),
-                cumulative_total=ev.get('cumulative_total', 0),
-                log_snippet=log_snippet_raw or None,
-                execution_elapsed_min=ev.get('execution_elapsed_min'),
-                detected_at=_parse_ts(ev.get('detected_at')),
-            ))
-        session.bulk_save_objects(rows)
+            log_snippet_raw = (ev.get('log_snippet') or '')[:2048]
+            rows.append({
+                'execution_id': execution_id,
+                'pod_name': (ev.get('pod') or '')[:255],
+                'namespace': ev.get('namespace'),
+                'container': ev.get('container'),
+                'event_type': 'restart',
+                'restart_reason': ev.get('restart_reason'),
+                'exit_code': ev.get('exit_code'),
+                'new_restarts': ev.get('new_restarts', 0),
+                'total_since_start': ev.get('total_since_start', 0),
+                'cumulative_total': ev.get('cumulative_total', 0),
+                'log_snippet': log_snippet_raw or None,
+                'concurrent_operation': ev.get('concurrent_operation'),
+                'pod_memory_mb': ev.get('pod_memory_mb'),
+                'pod_memory_limit_mb': ev.get('pod_memory_limit_mb'),
+                'pod_memory_request_mb': ev.get('pod_memory_request_mb'),
+                'pod_cpu_cores': ev.get('pod_cpu_cores'),
+                'pod_cpu_limit_cores': ev.get('pod_cpu_limit_cores'),
+                'pod_cpu_request_cores': ev.get('pod_cpu_request_cores'),
+                'node': ev.get('node'),
+                'execution_elapsed_min': ev.get('execution_elapsed_min'),
+                'detected_at': _parse_ts(ev.get('detected_at')),
+            })
+        stmt = pg_insert(ExecutionPodEvent).values(rows)
+        stmt = stmt.on_conflict_do_nothing(constraint='uq_pod_events_natural')
+        session.execute(stmt)
         session.commit()
-        logging.info(f"[Phase2] Inserted {len(rows)} pod_event rows for {execution_id[:12]}")
+        logging.info(f"[Phase2] Upserted {len(rows)} pod_event rows for {execution_id[:12]}")
         return len(rows)
     except Exception as e:
         session.rollback()
@@ -1511,22 +1583,12 @@ def batch_insert_pod_events(execution_id: str, events: list):
 
 
 def batch_insert_metrics_timeline(execution_id: str, metrics_history: list):
-    """
-    Bulk-insert metrics timeline (cluster + per-node) into execution_metrics_timeline.
-
-    For each metrics_history entry we write one cluster-level row and one row per node
-    in per_node (if present).
-
-    Args:
-        execution_id: Smart-execution ID
-        metrics_history: list of metric sample dicts
-    Returns:
-        int: number of rows inserted
-    """
+    """Bulk-insert metrics timeline (cluster + per-node) idempotently."""
     if not metrics_history:
         return 0
     session = SessionLocal()
     try:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
         rows = []
         for m in metrics_history:
             ts = _parse_ts(m.get('timestamp'))
@@ -1534,34 +1596,36 @@ def batch_insert_metrics_timeline(execution_id: str, metrics_history: list):
             cpu = m.get('cpu_percent')
             mem = m.get('memory_percent')
 
-            rows.append(ExecutionMetricsTimeline(
-                execution_id=execution_id,
-                iteration=iteration,
-                cluster_cpu_percent=cpu,
-                cluster_memory_percent=mem,
-                node_id=None,
-                node_name=None,
-                node_cpu_percent=None,
-                node_memory_percent=None,
-                timestamp=ts,
-            ))
+            rows.append({
+                'execution_id': execution_id,
+                'iteration': iteration,
+                'cluster_cpu_percent': cpu,
+                'cluster_memory_percent': mem,
+                'node_id': '__cluster__',
+                'node_name': None,
+                'node_cpu_percent': None,
+                'node_memory_percent': None,
+                'timestamp': ts,
+            })
 
             for node in (m.get('per_node') or []):
-                rows.append(ExecutionMetricsTimeline(
-                    execution_id=execution_id,
-                    iteration=iteration,
-                    cluster_cpu_percent=cpu,
-                    cluster_memory_percent=mem,
-                    node_id=node.get('node_id'),
-                    node_name=node.get('name'),
-                    node_cpu_percent=node.get('cpu_percent'),
-                    node_memory_percent=node.get('memory_percent'),
-                    timestamp=ts,
-                ))
+                rows.append({
+                    'execution_id': execution_id,
+                    'iteration': iteration,
+                    'cluster_cpu_percent': cpu,
+                    'cluster_memory_percent': mem,
+                    'node_id': node.get('node_id') or '__unknown__',
+                    'node_name': node.get('name'),
+                    'node_cpu_percent': node.get('cpu_percent'),
+                    'node_memory_percent': node.get('memory_percent'),
+                    'timestamp': ts,
+                })
 
-        session.bulk_save_objects(rows)
+        stmt = pg_insert(ExecutionMetricsTimeline).values(rows)
+        stmt = stmt.on_conflict_do_nothing(constraint='uq_metrics_tl_natural')
+        session.execute(stmt)
         session.commit()
-        logging.info(f"[Phase2] Inserted {len(rows)} metrics_timeline rows for {execution_id[:12]}")
+        logging.info(f"[Phase2] Upserted {len(rows)} metrics_timeline rows for {execution_id[:12]}")
         return len(rows)
     except Exception as e:
         session.rollback()

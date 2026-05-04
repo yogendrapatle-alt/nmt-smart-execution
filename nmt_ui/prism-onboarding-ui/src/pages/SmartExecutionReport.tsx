@@ -1012,6 +1012,7 @@ const SmartExecutionReport: React.FC = () => {
                     // Build node→cluster mapping from first non-empty sample
                     const nodeCluster: Record<string, string> = {};
                     const nodeLabel: Record<string, string> = {};
+                    const clusterIpMap: Record<string, string> = {};
                     mh.forEach((m: any) => {
                       (m.per_node || []).forEach((n: any) => {
                         const id = n.node_id || n.name || 'unknown';
@@ -1019,8 +1020,12 @@ const SmartExecutionReport: React.FC = () => {
                           nodeCluster[id] = n.cluster_name || '';
                           nodeLabel[id] = n.name || id.split(':')[0];
                         }
+                        if (n.cluster_name && n.cluster_ip && !clusterIpMap[n.cluster_name]) {
+                          clusterIpMap[n.cluster_name] = n.cluster_ip;
+                        }
                       });
                     });
+                    const clLabel = (cn: string) => clusterIpMap[cn] ? `${cn} (${clusterIpMap[cn]})` : cn;
                     const allNodeIds = Object.keys(nodeCluster);
                     if (allNodeIds.length === 0) return null;
 
@@ -1069,6 +1074,9 @@ const SmartExecutionReport: React.FC = () => {
                           <span className={`badge ${topoType === 'multi_cluster' ? 'bg-success' : topoType === 'multi_node' ? 'bg-info' : 'bg-secondary'} text-white rounded-pill`} style={{ fontSize: 10 }}>{topoLabels[topoType] || topoType}</span>
                           <span className="badge bg-primary bg-opacity-10 text-primary rounded-pill" style={{ fontSize: 10 }}>{allNodeIds.length} host{allNodeIds.length !== 1 ? 's' : ''}</span>
                           {clusterNames.length > 1 && <span className="badge bg-warning bg-opacity-15 text-warning rounded-pill" style={{ fontSize: 10 }}>{clusterNames.length} clusters</span>}
+                          {clusterNames.map((cn, i) => (
+                            <span key={i} className="badge bg-success bg-opacity-10 text-success rounded-pill" style={{ fontSize: 10 }}>{clLabel(cn)}</span>
+                          ))}
                         </div>
 
                         {/* Live snapshot table */}
@@ -1084,7 +1092,7 @@ const SmartExecutionReport: React.FC = () => {
                                 const mem = n.memory_percent || nodeData[id]?.mem?.slice(-1)[0] || 0;
                                 return (
                                   <tr key={id}>
-                                    <td><span className="badge rounded-pill" style={{ background: clusterColorMap[nodeCluster[id]] || '#64748b', color: '#fff', fontSize: 10 }}>{nodeCluster[id] || 'N/A'}</span></td>
+                                    <td><span className="badge rounded-pill" style={{ background: clusterColorMap[nodeCluster[id]] || '#64748b', color: '#fff', fontSize: 10 }}>{clLabel(nodeCluster[id] || 'N/A')}</span></td>
                                     <td className="fw-semibold">{nodeLabel[id]}</td>
                                     <td className="fw-bold" style={{ color: cpu > 80 ? '#ef4444' : cpu > 50 ? '#f59e0b' : '#22c55e' }}>{cpu.toFixed(1)}%</td>
                                     <td><div style={{ background: '#e2e8f0', borderRadius: 4, height: 8, width: '100%' }}><div style={{ background: cpu > 80 ? '#ef4444' : cpu > 50 ? '#f59e0b' : '#22c55e', borderRadius: 4, height: 8, width: `${Math.min(cpu, 100)}%` }} /></div></td>
@@ -1115,7 +1123,7 @@ const SmartExecutionReport: React.FC = () => {
                             <div key={ci} className="mb-3 border rounded-3 p-3" style={{ borderLeft: `4px solid ${clusterColorMap[cname] || '#64748b'}` }}>
                               <div className="d-flex align-items-center gap-2 mb-2">
                                 <span style={{ width: 12, height: 12, borderRadius: '50%', background: clusterColorMap[cname] || '#64748b', display: 'inline-block' }} />
-                                <h6 className="fw-bold mb-0">{cname || 'Cluster'}</h6>
+                                <h6 className="fw-bold mb-0">{clLabel(cname || 'Cluster')}</h6>
                                 <span className="badge bg-light text-muted rounded-pill" style={{ fontSize: 10 }}>{cNodes.length} host{cNodes.length !== 1 ? 's' : ''}</span>
                               </div>
                               <ReactApexChart
@@ -1991,29 +1999,103 @@ const SmartExecutionReport: React.FC = () => {
                         </div>
                       )}
 
-                      {/* Pod Restart Events with Log Snippets (Phase 2 data) */}
+                      {/* OOM Kill Details Table (filtered from podEvents) */}
+                      {(() => {
+                        const oomEvents = podEvents.filter((ev: any) => ev.restart_reason === 'OOMKilled' || ev.exit_code === 137);
+                        if (oomEvents.length === 0) return null;
+                        return (
+                          <div className="mt-4">
+                            <h6 className="fw-bold mb-3 text-danger">
+                              <i className="material-icons-outlined align-middle me-1" style={{ fontSize: 18 }}>dangerous</i>
+                              OOM Kill Details ({oomEvents.length} events)
+                            </h6>
+                            <div className="table-responsive" style={{ maxHeight: 400, overflowY: 'auto' }}>
+                              <table className="table table-sm table-bordered">
+                                <thead style={{ background: '#fef2f2' }}>
+                                  <tr>
+                                    <th>Time</th><th>Pod</th><th>Container</th><th>Namespace</th>
+                                    <th>Memory Usage</th><th>Memory Limit</th><th>Node</th>
+                                    <th>Concurrent Operation</th><th>Elapsed</th><th>Logs</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {oomEvents.map((ev: any) => (
+                                    <React.Fragment key={`oom-${ev.id}`}>
+                                      <tr>
+                                        <td className="small fw-semibold" style={{ whiteSpace: 'nowrap' }}><i className="material-icons-outlined align-middle me-1" style={{ fontSize: 12 }}>schedule</i>{fmtTs(ev.detected_at)}</td>
+                                        <td><code className="small text-danger">{ev.pod_name?.substring(0, 35)}</code></td>
+                                        <td>{ev.container}</td>
+                                        <td>{ev.namespace}</td>
+                                        <td className="fw-bold text-danger">{ev.pod_memory_mb != null ? `${ev.pod_memory_mb} MB` : '—'}</td>
+                                        <td>{ev.pod_memory_limit_mb != null ? `${ev.pod_memory_limit_mb} MB` : '—'}</td>
+                                        <td>{ev.node ? <code className="small">{ev.node}</code> : '—'}</td>
+                                        <td>{ev.concurrent_operation ? <span className="badge bg-info">{ev.concurrent_operation}</span> : '—'}</td>
+                                        <td>{ev.execution_elapsed_min != null ? `${ev.execution_elapsed_min} min` : '—'}</td>
+                                        <td>
+                                          {ev.log_snippet ? (
+                                            <button
+                                              className="btn btn-sm btn-outline-danger py-0 px-2"
+                                              style={{ fontSize: '0.75rem' }}
+                                              onClick={() => {
+                                                setExpandedLogSnippets(prev => {
+                                                  const next = new Set(prev);
+                                                  if (next.has(`oom-${ev.id}`)) next.delete(`oom-${ev.id}`);
+                                                  else next.add(`oom-${ev.id}`);
+                                                  return next;
+                                                });
+                                              }}
+                                            >
+                                              {expandedLogSnippets.has(`oom-${ev.id}`) ? 'Hide' : 'View'}
+                                            </button>
+                                          ) : '—'}
+                                        </td>
+                                      </tr>
+                                      {expandedLogSnippets.has(`oom-${ev.id}`) && ev.log_snippet && (
+                                        <tr>
+                                          <td colSpan={10} style={{ padding: 0 }}>
+                                            <pre className="mb-0" style={{
+                                              maxHeight: 200, overflow: 'auto', fontSize: '0.75rem',
+                                              background: '#1e293b', color: '#e2e8f0', padding: '8px 12px',
+                                              whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                                            }}>
+                                              {ev.log_snippet}
+                                            </pre>
+                                          </td>
+                                        </tr>
+                                      )}
+                                    </React.Fragment>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {/* All Pod Restart Events with enriched data */}
                       {podEvents.length > 0 && (
                         <div className="mt-4">
-                          <h6 className="fw-bold mb-3">Pod Restart Events &mdash; Captured Logs</h6>
+                          <h6 className="fw-bold mb-3">All Restart Events ({podEvents.length})</h6>
                           <p className="text-muted small mb-2">
-                            Restart events detected during execution with exit codes and captured log snippets from Kubernetes.
+                            Every restart event detected during execution with memory, node, and operation context.
                           </p>
-                          <div className="table-responsive">
+                          <div className="table-responsive" style={{ maxHeight: 500, overflowY: 'auto' }}>
                             <table className="table table-sm table-bordered">
                               <thead className="table-light">
                                 <tr>
-                                  <th>Time</th><th>Pod</th><th>Namespace</th><th>Container</th>
-                                  <th>Restarts</th><th>Reason</th><th>Exit Code</th><th>Elapsed</th><th>Logs</th>
+                                  <th>Time</th><th>Pod</th><th>Container</th><th>Namespace</th>
+                                  <th>Restarts</th><th>Reason</th><th>Exit Code</th>
+                                  <th>Memory</th><th>Node</th><th>Operation</th><th>Elapsed</th><th>Logs</th>
                                 </tr>
                               </thead>
                               <tbody>
                                 {podEvents.map((ev: any) => (
                                   <React.Fragment key={ev.id}>
-                                    <tr>
+                                    <tr style={ev.restart_reason === 'OOMKilled' || ev.exit_code === 137 ? { background: '#fef2f2' } : {}}>
                                       <td className="small fw-semibold" style={{ whiteSpace: 'nowrap' }}><i className="material-icons-outlined align-middle me-1" style={{ fontSize: 12 }}>schedule</i>{fmtTs(ev.detected_at)}</td>
                                       <td><code className="small">{ev.pod_name?.substring(0, 35)}</code></td>
-                                      <td>{ev.namespace}</td>
                                       <td>{ev.container}</td>
+                                      <td>{ev.namespace}</td>
                                       <td><span className="badge bg-warning text-dark">+{ev.new_restarts}</span></td>
                                       <td>
                                         {ev.restart_reason ? (
@@ -2029,6 +2111,9 @@ const SmartExecutionReport: React.FC = () => {
                                           </span>
                                         ) : '—'}
                                       </td>
+                                      <td className="small">{ev.pod_memory_mb != null ? `${ev.pod_memory_mb}${ev.pod_memory_limit_mb != null ? `/${ev.pod_memory_limit_mb}` : ''} MB` : '—'}</td>
+                                      <td className="small">{ev.node ? <code>{ev.node?.substring(0, 20)}</code> : '—'}</td>
+                                      <td className="small">{ev.concurrent_operation ? <span className="badge bg-info" style={{ fontSize: 10 }}>{ev.concurrent_operation}</span> : '—'}</td>
                                       <td>{ev.execution_elapsed_min != null ? `${ev.execution_elapsed_min} min` : '—'}</td>
                                       <td>
                                         {ev.log_snippet ? (
@@ -2051,7 +2136,7 @@ const SmartExecutionReport: React.FC = () => {
                                     </tr>
                                     {expandedLogSnippets.has(ev.id) && ev.log_snippet && (
                                       <tr>
-                                        <td colSpan={9} style={{ padding: 0 }}>
+                                        <td colSpan={12} style={{ padding: 0 }}>
                                           <pre className="mb-0" style={{
                                             maxHeight: 200, overflow: 'auto', fontSize: '0.75rem',
                                             background: '#1e293b', color: '#e2e8f0', padding: '8px 12px',
@@ -2809,7 +2894,7 @@ const SmartExecutionReport: React.FC = () => {
                       <h6 className="fw-semibold mt-4 mb-3">Metrics Statistics</h6>
                       <div className="table-responsive">
                         <table className="table table-sm table-bordered mb-0" style={{ fontSize: 13 }}>
-                          <thead className="table-light"><tr><th>Metric</th><th>Baseline</th><th>Min</th><th>Avg</th><th>P50</th><th>P95</th><th>Max</th><th>Final</th><th>Samples</th></tr></thead>
+                          <thead className="table-light"><tr><th>Metric</th><th>Start of Test</th><th>Min</th><th>Avg</th><th>P50</th><th>P95</th><th>Max</th><th>End of Test</th><th>Samples</th></tr></thead>
                           <tbody>
                             <tr><td className="fw-semibold">CPU %</td><td>{report.metrics_stats.cpu.baseline}</td><td>{report.metrics_stats.cpu.min}</td><td>{report.metrics_stats.cpu.avg}</td><td>{report.metrics_stats.cpu.p50}</td><td>{report.metrics_stats.cpu.p95}</td><td>{report.metrics_stats.cpu.max}</td><td>{report.metrics_stats.cpu.final}</td><td>{report.metrics_stats.cpu.samples}</td></tr>
                             {report.metrics_stats.memory && <tr><td className="fw-semibold">Memory %</td><td>{report.metrics_stats.memory.baseline}</td><td>{report.metrics_stats.memory.min}</td><td>{report.metrics_stats.memory.avg}</td><td>{report.metrics_stats.memory.p50}</td><td>{report.metrics_stats.memory.p95}</td><td>{report.metrics_stats.memory.max}</td><td>{report.metrics_stats.memory.final}</td><td>{report.metrics_stats.memory.samples}</td></tr>}
@@ -2908,8 +2993,8 @@ const SmartExecutionReport: React.FC = () => {
                 <thead className="table-light">
                   <tr>
                     <th className="ps-4">Metric</th>
-                    <th className="text-center">Start</th>
-                    <th className="text-center pe-4">Final</th>
+                    <th className="text-center">Start of Test</th>
+                    <th className="text-center pe-4">End of Test</th>
                   </tr>
                 </thead>
                 <tbody>
