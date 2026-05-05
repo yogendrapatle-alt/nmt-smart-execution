@@ -262,43 +262,89 @@ def expose_prometheus():
 
         # Get NCM IP and node information
         logging.info("[NCM] Getting NCM IP and node information...")
-        # ncm_ip, ncm_node = kube_client.get_ncm_ip_and_node(kubeconfig_path)
         ncm_ip, ncm_node = kube_client.get_ncm_ip_and_node()
         logging.info(f"[NCM] Found NCM IP: {ncm_ip}, Node: {ncm_node}")
 
-        # Expose the Prometheus service (if not already exposed)
-        logging.info("[NCM] Exposing Prometheus service...")
-        try:
-            kube_client.expose_service( prom_namespace, svc_name, new_svc_name)
-            logging.info("[NCM] Service exposed successfully")
-        except Exception as expose_error:
-            # Service might already exist, that's okay
-            logging.warning(f"[NCM] Service already exists or exposure failed: {str(expose_error)}")
+        node_port = None
+        if ncm_ip:
+            # Expose the Prometheus service (if not already exposed)
+            logging.info("[NCM] Exposing Prometheus service...")
+            try:
+                kube_client.expose_service(prom_namespace, svc_name, new_svc_name)
+                logging.info("[NCM] Service exposed successfully")
+            except Exception as expose_error:
+                logging.warning(f"[NCM] Service already exists or exposure failed: {str(expose_error)}")
 
-        # Get the exposed port
-        logging.info("[NCM] Getting exposed port...")
-        node_port = kube_client.get_port(new_svc_name, prom_namespace)
-        logging.info(f"[NCM] Prometheus port: {node_port}")
+            # Get the exposed port
+            logging.info("[NCM] Getting exposed port...")
+            raw_port = kube_client.get_port(new_svc_name, prom_namespace)
+            if raw_port and raw_port.strip().isdigit():
+                node_port = raw_port.strip()
+            logging.info(f"[NCM] Prometheus port: {node_port}")
 
         # Get PC UUID
         logging.info("[NCM] Getting PC UUID...")
         pc_uuid = kube_client.get_pc_uuid()
         logging.info(f"[NCM] PC UUID: {pc_uuid}")
 
-        # Clean up SSH connection
         kube_client.close()
 
+        # If kubectl failed (broken NC cluster), fall back to existing DB record
+        if not ncm_ip or not node_port:
+            logging.warning("[NCM] kubectl returned no valid NCM IP or port — checking existing testbed data")
+            from database import SessionLocal as _SL
+            from models.testbed import Testbed
+            import json as _json
+            _s = _SL()
+            try:
+                existing = _s.query(Testbed).filter(
+                    Testbed.pc_ip == pc_ip
+                ).order_by(Testbed.timestamp.desc()).first()
+                if existing:
+                    tj = existing.testbed_json
+                    if isinstance(tj, str):
+                        try:
+                            tj = _json.loads(tj)
+                        except Exception:
+                            tj = {}
+                    if not isinstance(tj, dict):
+                        tj = {}
+                    saved_endpoint = tj.get('prometheus_endpoint', '')
+                    saved_ncm = tj.get('ncm_ip') or ''
+                    saved_port = tj.get('node_port') or ''
+                    # Also check ncm_ip column on the model
+                    if not saved_ncm and existing.ncm_ip and existing.ncm_ip != pc_ip:
+                        saved_ncm = existing.ncm_ip
+                    # Try to parse endpoint if individual fields missing
+                    if saved_endpoint and (not saved_ncm or not saved_port):
+                        import re as _re
+                        ep_match = _re.search(r'https?://([^:]+):(\d+)', saved_endpoint)
+                        if ep_match:
+                            saved_ncm = saved_ncm or ep_match.group(1)
+                            saved_port = saved_port or ep_match.group(2)
+                    if saved_ncm and saved_port:
+                        ncm_ip = saved_ncm
+                        node_port = str(saved_port)
+                        ncm_node = tj.get('ncm_node', ncm_node)
+                        logging.info(f"[NCM] Using saved testbed data: {ncm_ip}:{node_port}")
+            except Exception as db_err:
+                logging.warning(f"[NCM] DB lookup failed: {db_err}")
+            finally:
+                _s.close()
+
+        if not ncm_ip:
+            return jsonify({'error': f'Could not determine NCM IP for {pc_ip}. The NC cluster may be in error state.'}), 500
+
         # Determine the final endpoint
-        if node_port and node_port.strip():
-            endpoint = f"http://{ncm_ip}:{node_port.strip()}"
-            port_info = node_port.strip()
+        if node_port:
+            endpoint = f"http://{ncm_ip}:{node_port}"
+            port_info = node_port
         else:
-            # Fallback to standard port if NodePort not available
             endpoint = f"http://{ncm_ip}:9090"
             port_info = "9090"
             logging.info("[NCM] Falling back to standard Prometheus port 9090")
 
-        logging.info(f"=== NCM SETUP COMPLETE: http://{ncm_ip}:{node_port.strip()} ===")
+        logging.info(f"=== NCM SETUP COMPLETE: {endpoint} ===")
 
         return jsonify({
             'endpoint': endpoint,
@@ -310,8 +356,15 @@ def expose_prometheus():
         })
 
     except Exception as e:
-        logging.error(f"[ERROR] NCM setup failed: {str(e)}")
-        return jsonify({'error': f'Failed to run NCM setup: {str(e)}'}), 500
+        import traceback
+        logging.error(f"[ERROR] NCM setup failed: {type(e).__name__}: {str(e)}")
+        logging.error(traceback.format_exc())
+        try:
+            kube_client.close()
+        except Exception:
+            pass
+        error_msg = str(e) or type(e).__name__
+        return jsonify({'error': f'Failed to connect to NCM: {error_msg}'}), 500
 
 
 
@@ -1596,6 +1649,75 @@ def delete_testbed(testbed_id):
         
     except Exception as e:
         logging.error(f"Error deleting testbed {testbed_id}: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/testbed/<testbed_id>/monitoring-rules', methods=['GET'])
+def get_testbed_monitoring_rules(testbed_id):
+    """Load saved monitoring rules for a testbed."""
+    try:
+        from sqlalchemy import text as sa_text
+        session = SessionLocal()
+        try:
+            # Try the ORM column first
+            tb = session.query(Testbed).filter_by(unique_testbed_id=testbed_id).first()
+            if not tb:
+                return jsonify({'success': False, 'error': 'Testbed not found'}), 404
+
+            rules = None
+            if hasattr(tb, 'monitoring_rules_config') and tb.monitoring_rules_config:
+                rules = tb.monitoring_rules_config
+            else:
+                # Fallback: read directly from DB in case column was added after model load
+                row = session.execute(
+                    sa_text("SELECT monitoring_rules_config FROM testbeds WHERE unique_testbed_id = :tid"),
+                    {'tid': testbed_id}
+                ).fetchone()
+                if row and row[0]:
+                    rules = row[0]
+
+            return jsonify({'success': True, 'monitoring_rules': rules or []})
+        finally:
+            session.close()
+    except Exception as e:
+        logging.error(f"Error loading monitoring rules for {testbed_id}: {e}")
+        return jsonify({'success': True, 'monitoring_rules': []})
+
+
+@app.route('/api/testbed/<testbed_id>/monitoring-rules', methods=['PUT'])
+def save_testbed_monitoring_rules(testbed_id):
+    """Save monitoring rules for a testbed so they persist across executions."""
+    try:
+        from sqlalchemy import text as sa_text
+        data = request.get_json(force=True)
+        rules = data.get('monitoring_rules', [])
+
+        session = SessionLocal()
+        try:
+            tb = session.query(Testbed).filter_by(unique_testbed_id=testbed_id).first()
+            if not tb:
+                return jsonify({'success': False, 'error': 'Testbed not found'}), 404
+
+            # Try ORM first, fall back to raw SQL if column doesn't exist yet
+            try:
+                tb.monitoring_rules_config = rules
+                session.commit()
+            except Exception:
+                session.rollback()
+                session.execute(
+                    sa_text("ALTER TABLE testbeds ADD COLUMN IF NOT EXISTS monitoring_rules_config JSONB"),
+                )
+                session.execute(
+                    sa_text("UPDATE testbeds SET monitoring_rules_config = :rules WHERE unique_testbed_id = :tid"),
+                    {'rules': __import__('json').dumps(rules), 'tid': testbed_id}
+                )
+                session.commit()
+
+            return jsonify({'success': True, 'saved': len(rules)})
+        finally:
+            session.close()
+    except Exception as e:
+        logging.error(f"Error saving monitoring rules for {testbed_id}: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -3589,52 +3711,56 @@ def get_ncm_deployment_status():
 
 @app.route('/api/alerts/<testbed_id>', methods=['GET'])
 def get_alerts_for_testbed(testbed_id):
-    """Get alerts for a specific testbed (with fake data for testing)"""
+    """Get alerts for a specific testbed from the alert_summaries table."""
     try:
-        import random
-        from datetime import datetime, timedelta
-        
-        # Generate fake alerts for testing
-        alert_names = [
-            'High CPU Usage',
-            'Memory Threshold Exceeded',
-            'Disk Space Low',
-            'Network Latency High',
-            'Pod Restart Detected',
-            'Service Unavailable'
-        ]
-        
-        severities = ['Critical', 'Warning', 'Info']
-        statuses = ['Active', 'Pending', 'Resolved']
-        
-        # Generate 0-5 random alerts
-        num_alerts = random.randint(0, 5)
-        fake_alerts = []
-        
-        for i in range(num_alerts):
-            alert = {
-                'id': f'alert-{testbed_id}-{i}',
+        import psycopg2
+        DB_CFG = dict(dbname="alerts", user="alertuser", password="alertpass", host="localhost", port="5432")
+
+        sev_map = {'critical': 'Critical', 'warning': 'Moderate', 'info': 'Low'}
+        sts_map = {'active': 'Active', 'firing': 'Active', 'acknowledged': 'Active', 'resolved': 'Resolved'}
+
+        conn = psycopg2.connect(**DB_CFG)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT a.id, a.alert_type, a.severity, a.status, a.message,
+                   a.metric_value, a.threshold_value, a.created_at,
+                   a.duration_minutes, a.resolved_at, a.diagnostic_context
+            FROM alert_summaries a
+            WHERE a.testbed_id = %s
+            ORDER BY a.created_at DESC
+            LIMIT 200
+        """, (testbed_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        alert_list = []
+        for row in rows:
+            raw_sev = (row[2] or '').lower()
+            raw_sts = (row[3] or '').lower()
+            alert_list.append({
+                'id': str(row[0]),
                 'testbed_id': testbed_id,
-                'alert_name': random.choice(alert_names),
-                'severity': random.choice(severities),
-                'status': random.choice(statuses),
-                'description': f'Test alert {i+1} for monitoring verification',
-                'timestamp': (datetime.now() - timedelta(hours=random.randint(0, 24))).isoformat()
-            }
-            fake_alerts.append(alert)
-        
-        logging.info(f"Generated {num_alerts} fake alerts for testbed {testbed_id}")
-        
+                'alert_name': row[1] or 'Unknown',
+                'severity': sev_map.get(raw_sev, row[2] or 'Low'),
+                'status': sts_map.get(raw_sts, row[3] or 'Active'),
+                'description': row[4] or '',
+                'metric_value': row[5],
+                'threshold_value': row[6],
+                'timestamp': row[7].isoformat() + 'Z' if row[7] else None,
+                'duration_minutes': row[8],
+                'resolved_at': row[9].isoformat() + 'Z' if row[9] else None,
+            })
+
         return jsonify({
             'success': True,
-            'alerts': fake_alerts,
-            'count': num_alerts,
-            'note': 'These are fake alerts for testing purposes'
+            'alerts': alert_list,
+            'count': len(alert_list),
         })
-        
+
     except Exception as e:
-        logging.error(f"Error generating alerts for testbed {testbed_id}: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logging.error(f"Error fetching alerts for testbed {testbed_id}: {e}")
+        return jsonify({'success': True, 'alerts': [], 'count': 0})
 
 
 @app.route('/api/check-prometheus', methods=['GET'])
@@ -5843,6 +5969,13 @@ def get_enhanced_smart_execution_report(execution_id):
             metrics_stats=status.get('metrics_stats') or report_data.get('metrics_stats') or {},
             resource_lifecycle=status.get('resource_lifecycle') or report_data.get('resource_lifecycle') or {},
             event_timeline=report_data.get('event_timeline') or status.get('event_timeline') or [],
+            # Monitoring rule violations
+            monitoring_rule_violations=(
+                status.get('monitoring_rule_violations')
+                or report_data.get('monitoring_rule_violations')
+                or (report_data.get('full_execution_data') or {}).get('monitoring_rule_violations')
+                or []
+            ),
             # JSON for charts
             metrics_history_json=json_mod.dumps(metrics_history),
             operations_history_json=json_mod.dumps(operations_history),

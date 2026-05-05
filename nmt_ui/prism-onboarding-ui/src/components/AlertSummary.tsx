@@ -43,12 +43,8 @@ const AlertSummary: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      const params = new URLSearchParams();
-      if (selectedSeverity !== 'All') params.append('severity', selectedSeverity);
-      if (selectedStatus !== 'All') params.append('status', selectedStatus);
-
       const backendUrl = getApiBase();
-      const response = await fetch(`${backendUrl}/api/alerts?${params.toString()}`);
+      const response = await fetch(`${backendUrl}/api/alerts`);
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`Alerts API failed (${response.status}): ${errorText}`);
@@ -75,6 +71,7 @@ const AlertSummary: React.FC = () => {
 
       setAlertDigests(digests);
       if (digests.length > 0) setSelectedDate(digests[0].date);
+      setSelectedTestbed('');
     } catch (err) {
       console.error('Error fetching alerts:', err);
       setError(err instanceof Error ? err.message : 'Failed to fetch alerts');
@@ -113,6 +110,7 @@ const AlertSummary: React.FC = () => {
   const paginatedAlerts = searchFilteredAlerts.slice(startIndex, endIndex);
 
   React.useEffect(() => { setCurrentPage(1); }, [selectedDate, selectedTestbed, selectedSeverity, selectedStatus, sortBy]);
+  React.useEffect(() => { setSelectedTestbed(''); }, [selectedDate]);
 
   const getTestbedOptions = () => {
     const selectedDigest = alertDigests.find(digest => digest.date === selectedDate);
@@ -251,30 +249,23 @@ const AlertSummary: React.FC = () => {
             </div>
           </div>
 
-          {/* Testbed Cards */}
-          {selectedDate && getTestbedOptions().length > 1 && (
+          {/* Testbed Overview - only when "All Testbeds" and multiple testbeds exist */}
+          {selectedDate && !selectedTestbed && getTestbedOptions().length > 1 && (
             <div className="row g-3 mb-4">
               {getTestbedOptions().map(testbed => {
                 const testbedAlerts = (alertDigests.find(d => d.date === selectedDate)?.testbeds[testbed] || []).map(a => ({ ...a, status: normalizeStatus(a.status) }));
                 const active = testbedAlerts.filter(a => a.status === 'Active').length;
                 const critical = testbedAlerts.filter(a => a.severity === 'Critical').length;
-                const isSelected = selectedTestbed === testbed;
-
                 return (
-                  <div className="col-md-3" key={testbed}>
-                    <div
-                      className={`card rounded-4 shadow-none h-100 ${isSelected ? 'border-primary border-2' : 'border'}`}
-                      style={{ cursor: 'pointer', transition: 'all 0.15s', background: isSelected ? '#eff6ff' : undefined }}
-                      onClick={() => setSelectedTestbed(isSelected ? '' : testbed)}
-                    >
+                  <div className="col-md-3 col-lg-2" key={testbed}>
+                    <div className="card rounded-4 shadow-none h-100 border" style={{ cursor: 'pointer', transition: 'all 0.15s' }} onClick={() => setSelectedTestbed(testbed)}>
                       <div className="card-body p-3 text-center">
-                        <div className="fw-semibold small mb-2">{testbed}</div>
-                        <div className="fw-bold fs-4 text-primary">{testbedAlerts.length}</div>
-                        <div className="text-muted small">alerts</div>
-                        <div className="d-flex justify-content-center gap-1 mt-2 flex-wrap">
-                          {active > 0 && <span className="badge bg-danger rounded-pill" style={{ fontSize: '0.68rem' }}>{active} active</span>}
-                          {critical > 0 && <span className="badge bg-dark rounded-pill" style={{ fontSize: '0.68rem' }}>{critical} critical</span>}
-                          {active === 0 && critical === 0 && <span className="badge bg-success rounded-pill" style={{ fontSize: '0.68rem' }}>all clear</span>}
+                        <div className="fw-semibold small mb-1 text-truncate" title={testbed}>{testbed}</div>
+                        <div className="fw-bold fs-5 text-primary">{testbedAlerts.length}</div>
+                        <div className="d-flex justify-content-center gap-1 mt-1 flex-wrap">
+                          {active > 0 && <span className="badge bg-danger rounded-pill" style={{ fontSize: '0.65rem' }}>{active} active</span>}
+                          {critical > 0 && <span className="badge bg-dark rounded-pill" style={{ fontSize: '0.65rem' }}>{critical} critical</span>}
+                          {active === 0 && critical === 0 && <span className="badge bg-success rounded-pill" style={{ fontSize: '0.65rem' }}>clear</span>}
                         </div>
                       </div>
                     </div>
@@ -283,6 +274,33 @@ const AlertSummary: React.FC = () => {
               })}
             </div>
           )}
+
+          {/* Selected testbed info bar */}
+          {selectedTestbed && (() => {
+            const tbAlerts = (alertDigests.find(d => d.date === selectedDate)?.testbeds[selectedTestbed] || []).map(a => ({ ...a, status: normalizeStatus(a.status) }));
+            const tbActive = tbAlerts.filter(a => a.status === 'Active').length;
+            const tbCritical = tbAlerts.filter(a => a.severity === 'Critical').length;
+            const tbResolved = tbAlerts.filter(a => a.status === 'Resolved').length;
+            return (
+              <div className="d-flex align-items-center gap-3 mb-4 p-3 rounded-3" style={{ background: '#eff6ff', border: '1px solid #bfdbfe' }}>
+                <div className="d-flex align-items-center justify-content-center rounded-3" style={{ width: 36, height: 36, background: '#3b82f6' }}>
+                  <i className="material-icons-outlined text-white" style={{ fontSize: 18 }}>dns</i>
+                </div>
+                <div className="flex-grow-1">
+                  <div className="fw-semibold" style={{ fontSize: '0.88rem' }}>{selectedTestbed}</div>
+                  <div className="d-flex gap-2 mt-1">
+                    <span className="badge bg-primary rounded-pill" style={{ fontSize: '0.68rem' }}>{tbAlerts.length} total</span>
+                    {tbActive > 0 && <span className="badge bg-danger rounded-pill" style={{ fontSize: '0.68rem' }}>{tbActive} active</span>}
+                    {tbCritical > 0 && <span className="badge bg-dark rounded-pill" style={{ fontSize: '0.68rem' }}>{tbCritical} critical</span>}
+                    {tbResolved > 0 && <span className="badge bg-success rounded-pill" style={{ fontSize: '0.68rem' }}>{tbResolved} resolved</span>}
+                  </div>
+                </div>
+                <button className="btn btn-sm btn-outline-primary rounded-3 d-flex align-items-center gap-1" onClick={() => setSelectedTestbed('')}>
+                  <i className="material-icons-outlined" style={{ fontSize: 16 }}>close</i>Show All
+                </button>
+              </div>
+            );
+          })()}
 
           {/* Alerts Table */}
           <div className="card rounded-4 border shadow-none mb-4">

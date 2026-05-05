@@ -25,7 +25,7 @@ import {
   AVAILABLE_ENTITIES,
   getAvailableOperations,
 } from '../components/smart-execution';
-import type { Testbed, AISettings, PresetConfig } from '../components/smart-execution';
+import type { Testbed, AISettings, PresetConfig, MonitoringRule } from '../components/smart-execution';
 
 const STEPS = [
   { label: 'Identity', icon: 'badge' },
@@ -92,6 +92,9 @@ const SmartExecutionConfigureAI: React.FC = () => {
   // Tags
   const [tags, setTags] = useState<string[]>([]);
 
+  // Monitoring Rules
+  const [monitoringRules, setMonitoringRules] = useState<MonitoringRule[]>([]);
+
   // Longevity
   const [longevityEnabled, setLongevityEnabled] = useState(false);
   const [longevityDuration, setLongevityDuration] = useState(24);
@@ -116,6 +119,14 @@ const SmartExecutionConfigureAI: React.FC = () => {
 
   useEffect(() => {
     fetchTestbeds();
+
+    // Pre-select testbed if navigated from MyTestbeds or Onboarding
+    const preSelectedId = localStorage.getItem('unique_testbed_id');
+    if (preSelectedId) {
+      setSelectedTestbed(preSelectedId);
+      localStorage.removeItem('unique_testbed_id');
+    }
+
     const rerunJson = sessionStorage.getItem('rerun_config');
     if (rerunJson) {
       try {
@@ -145,7 +156,26 @@ const SmartExecutionConfigureAI: React.FC = () => {
     }
   }, []);
 
-  useEffect(() => { if (selectedTestbed) fetchAvailablePods(); }, [selectedTestbed]);
+  useEffect(() => {
+    if (selectedTestbed) {
+      fetchAvailablePods();
+      loadSavedMonitoringRules(selectedTestbed);
+    }
+  }, [selectedTestbed]);
+
+  // Auto-save monitoring rules when they change (debounced)
+  const saveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!selectedTestbed || monitoringRules.length === 0) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      fetch(`${getApiBase()}/api/testbed/${selectedTestbed}/monitoring-rules`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ monitoring_rules: monitoringRules }),
+      }).catch(() => {});
+    }, 1500);
+    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
+  }, [monitoringRules, selectedTestbed]);
 
   /* ─── API calls ────────────────────────────────────────── */
 
@@ -157,6 +187,18 @@ const SmartExecutionConfigureAI: React.FC = () => {
       if (data.success && data.testbeds) setTestbeds(data.testbeds);
       else setError(data.error || 'Failed to load testbeds');
     } catch { setError('Could not connect to backend to load testbeds'); }
+  };
+
+  const loadSavedMonitoringRules = async (testbedId: string) => {
+    try {
+      const res = await fetch(`${getApiBase()}/api/testbed/${testbedId}/monitoring-rules`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && Array.isArray(data.monitoring_rules) && data.monitoring_rules.length > 0) {
+          setMonitoringRules(data.monitoring_rules);
+        }
+      }
+    } catch { /* ignore — rules just start empty */ }
   };
 
   const fetchAvailablePods = async () => {
@@ -253,7 +295,16 @@ const SmartExecutionConfigureAI: React.FC = () => {
             : { enabled: false },
         },
         entities_config: selectedEntities,
-        rule_config: { namespaces: selectedNamespaces, pod_names: selectedPods, custom_queries: [] },
+        rule_config: {
+          namespaces: selectedNamespaces,
+          pod_names: selectedPods,
+          custom_queries: [],
+          monitoring_rules: monitoringRules.filter(r => r.enabled).map(r => ({
+            id: r.id, name: r.name, query: r.query, operator: r.operator,
+            threshold: r.threshold, severity: r.severity, description: r.description,
+            namespace: r.namespace || null, pod_name: r.podName || null,
+          })),
+        },
         ai_settings: aiSettings,
         advanced: { workload_profile: workloadProfile, max_parallel_operations: maxParallelOps, operations_per_iteration: opsPerIteration, parallel_execution: parallelExecution, auto_cleanup: autoCleanup, tags, ml_guided_ops: mlGuidedOps, entity_cooldown_seconds: entityCooldown, alert_thresholds: { cpu_spike_percent: cpuSpikeThreshold, memory_spike_percent: memorySpikeThreshold, failure_rate_threshold: failureRateThreshold } },
       };
@@ -398,6 +449,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
           checkpointIntervalMin={checkpointIntervalMin} onCheckpointChange={setCheckpointIntervalMin}
           maintainLoadPct={maintainLoadPct} onMaintainLoadChange={setMaintainLoadPct}
           healthChecks={healthChecks} onHealthChecksChange={setHealthChecks}
+          monitoringRules={monitoringRules} onMonitoringRulesChange={setMonitoringRules}
         />
       )}
 

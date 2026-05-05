@@ -195,8 +195,8 @@ const Status: React.FC = () => {
   const alertSeverityVariant = (severity: string): 'danger' | 'warning' | 'info' | 'neutral' => {
     const s = severity.toLowerCase();
     if (s === 'critical') return 'danger';
-    if (s === 'warning') return 'warning';
-    if (s === 'info') return 'info';
+    if (s === 'warning' || s === 'moderate') return 'warning';
+    if (s === 'info' || s === 'low') return 'info';
     return 'neutral';
   };
 
@@ -214,6 +214,7 @@ const Status: React.FC = () => {
   const runningExecs = executions.filter(e => e.status?.toUpperCase() === 'RUNNING').length;
   const avgSuccessRate = executions.length > 0 ? executions.reduce((sum, e) => sum + (e.success_rate || 0), 0) / executions.length : 0;
   const activeAlerts = alerts.filter(a => ['active', 'firing'].includes(a.status.toLowerCase())).length;
+  const resolvedAlerts = alerts.filter(a => a.status.toLowerCase() === 'resolved').length;
   const criticalAlerts = alerts.filter(a => a.severity.toLowerCase() === 'critical').length;
   const successRateVariant: 'success' | 'warning' | 'danger' = avgSuccessRate >= 80 ? 'success' : avgSuccessRate >= 50 ? 'warning' : 'danger';
 
@@ -309,9 +310,9 @@ const Status: React.FC = () => {
               <MetricCard
                 icon="warning"
                 variant={activeAlerts > 0 ? 'danger' : 'success'}
-                label="Active Alerts"
-                value={activeAlerts}
-                detail={criticalAlerts > 0 ? `${criticalAlerts} critical` : 'No critical alerts'}
+                label="Alerts"
+                value={alerts.length}
+                detail={activeAlerts > 0 ? `${activeAlerts} active, ${criticalAlerts} critical` : `${resolvedAlerts} resolved`}
               />
             </div>
           </div>
@@ -379,11 +380,16 @@ const Status: React.FC = () => {
             <div className="card-body p-4">
               <div className="d-flex justify-content-between align-items-center mb-3">
                 <div className="d-flex align-items-center gap-2">
-                  <i className="material-icons-outlined" style={{ fontSize: 20, color: alerts.length > 0 ? 'var(--color-danger)' : 'var(--color-success)' }}>
-                    {alerts.length > 0 ? 'warning' : 'verified'}
+                  <i className="material-icons-outlined" style={{ fontSize: 20, color: activeAlerts > 0 ? 'var(--color-danger)' : 'var(--color-success)' }}>
+                    {activeAlerts > 0 ? 'warning' : 'verified'}
                   </i>
-                  <h6 className="mb-0 fw-semibold" style={{ fontSize: 'var(--text-md)' }}>Active Alerts</h6>
-                  {alerts.length > 0 && <StatusBadge label={String(alerts.length)} variant="danger" size="sm" />}
+                  <h6 className="mb-0 fw-semibold" style={{ fontSize: 'var(--text-md)' }}>Alerts</h6>
+                  {alerts.length > 0 && (
+                    <div className="d-flex gap-1">
+                      {activeAlerts > 0 && <StatusBadge label={`${activeAlerts} active`} variant="danger" size="sm" />}
+                      {resolvedAlerts > 0 && <StatusBadge label={`${resolvedAlerts} resolved`} variant="success" size="sm" />}
+                    </div>
+                  )}
                 </div>
                 <button className="btn btn-outline-primary btn-sm rounded-3 d-flex align-items-center gap-1" onClick={() => navigate('/alert-summary')}>
                   <i className="material-icons-outlined" style={{ fontSize: 16 }}>open_in_new</i>Full Alert Dashboard
@@ -394,7 +400,7 @@ const Status: React.FC = () => {
               {alerts.length === 0 ? (
                 <div className="d-flex align-items-center gap-2 p-3 rounded-3" style={{ background: 'var(--color-success-light)' }}>
                   <i className="material-icons-outlined" style={{ color: 'var(--color-success)', fontSize: 22 }}>check_circle</i>
-                  <span style={{ color: 'var(--color-success)', fontWeight: 500, fontSize: 'var(--text-base)' }}>No active alerts — all systems healthy for this testbed</span>
+                  <span style={{ color: 'var(--color-success)', fontWeight: 500, fontSize: 'var(--text-base)' }}>No alerts recorded for this testbed</span>
                 </div>
               ) : (
                 <div className="table-responsive">
@@ -412,7 +418,9 @@ const Status: React.FC = () => {
                           <td className="ps-3 fw-medium border-0">{alert.alert_name}</td>
                           <td className="border-0"><StatusBadge label={alert.severity} variant={alertSeverityVariant(alert.severity)} size="sm" /></td>
                           <td className="border-0"><StatusBadge label={alert.status} variant={alertStatusVariant(alert.status)} dot size="sm" /></td>
-                          <td className="border-0" style={{ maxWidth: 300, color: 'var(--color-text-secondary)' }}>{alert.description.length > 100 ? alert.description.slice(0, 100) + '…' : alert.description}</td>
+                          <td className="border-0" style={{ maxWidth: 300, color: 'var(--color-text-secondary)' }}>
+                            {alert.description ? (alert.description.length > 100 ? alert.description.slice(0, 100) + '…' : alert.description) : (alert as any).metric_value != null ? `Value: ${(alert as any).metric_value?.toFixed?.(1) ?? (alert as any).metric_value} / Threshold: ${(alert as any).threshold_value?.toFixed?.(1) ?? '—'}` : '—'}
+                          </td>
                           <td className="border-0 text-nowrap" style={{ color: 'var(--color-text-muted)' }}>{new Date(alert.timestamp).toLocaleString()}</td>
                         </tr>
                       ))}

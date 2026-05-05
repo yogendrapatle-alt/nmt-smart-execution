@@ -99,11 +99,6 @@ def get_alerts_from_db():
             if metric_val is not None and threshold_val is not None:
                 description += f" (value: {metric_val:.1f}, threshold: {threshold_val:.1f})"
 
-            short_diag = generate_short_diagnosis(
-                alert_type, metric_val, threshold_val, dur_min, row[3] or '')
-            actionable = is_actionable(
-                alert_type, severity, status, metric_val, threshold_val)
-
             diag_ctx = row[14] or {}
             if isinstance(diag_ctx, str):
                 import json as _json
@@ -111,6 +106,12 @@ def get_alerts_from_db():
                     diag_ctx = _json.loads(diag_ctx)
                 except Exception:
                     diag_ctx = {}
+
+            short_diag = generate_short_diagnosis(
+                alert_type, metric_val, threshold_val, dur_min, row[3] or '',
+                diagnostic_context=diag_ctx)
+            actionable = is_actionable(
+                alert_type, severity, status, metric_val, threshold_val)
 
             alert_dicts.append({
                 'id': row[0],
@@ -329,8 +330,17 @@ def download_alert_html():
             sev = _severity_label(row[2])
             sts = _status_label(row[3])
             dur = row[12]
-            diag = generate_short_diagnosis(row[1] or '', row[5], row[6], dur, row[3] or '')
+            diag_ctx = row[13] or {}
+            if isinstance(diag_ctx, str):
+                import json as _json
+                try:
+                    diag_ctx = _json.loads(diag_ctx)
+                except Exception:
+                    diag_ctx = {}
+            diag = generate_short_diagnosis(row[1] or '', row[5], row[6], dur, row[3] or '',
+                                            diagnostic_context=diag_ctx)
             actionable = _is_actionable(row[1] or '', sev, sts, row[5], row[6])
+            affected_pods = diag_ctx.get('affected_pods', [])
             alerts.append({
                 'id': row[0], 'alert_type': row[1], 'severity': sev,
                 'status': sts, 'message': row[4],
@@ -339,6 +349,7 @@ def download_alert_html():
                 'testbed_label': row[10] or row[11] or 'Unknown', 'pc_ip': row[11] or '',
                 'duration_minutes': dur, 'resolved_reason': row[14],
                 'short_diagnosis': diag, 'is_actionable': actionable,
+                'affected_pods': affected_pods,
             })
 
         total = len(alerts)
@@ -394,13 +405,18 @@ def download_alert_html():
             inv_rows = ""
             for a in needs_investigation:
                 ts = a['created_at'].strftime('%Y-%m-%d %H:%M') if a['created_at'] else 'N/A'
+                inv_diag = a['short_diagnosis']
+                inv_pods = a.get('affected_pods', [])
+                if inv_pods and a.get('alert_type') == 'Pod Restarts':
+                    pod_list = ', '.join(f"{p.get('pod','')} ({p.get('reason','')})" for p in inv_pods[:3])
+                    inv_diag += f'<br><span style="font-size:11px;color:#6c757d">Affected: {pod_list}</span>'
                 inv_rows += f"""<tr style="background:#fff5f5">
                     <td style="padding:10px;border-bottom:1px solid #f5c6cb">{a['testbed_label']}</td>
                     <td style="padding:10px;border-bottom:1px solid #f5c6cb">{ts}</td>
                     <td style="padding:10px;border-bottom:1px solid #f5c6cb">{a['alert_type']}</td>
                     <td style="padding:10px;border-bottom:1px solid #f5c6cb">{_badge(a['severity'], sev_colors.get(a['severity'], '#6c757d'))}</td>
                     <td style="padding:10px;border-bottom:1px solid #f5c6cb">{_format_dur(a['duration_minutes'])}</td>
-                    <td style="padding:10px;border-bottom:1px solid #f5c6cb;max-width:400px">{a['short_diagnosis']}</td>
+                    <td style="padding:10px;border-bottom:1px solid #f5c6cb;max-width:400px">{inv_diag}</td>
                 </tr>"""
             investigation_html = f"""
             <div style="margin-bottom:30px;border:2px solid #dc3545;border-radius:8px;overflow:hidden">
@@ -435,6 +451,27 @@ def download_alert_html():
                 ts = a['created_at'].strftime('%Y-%m-%d %H:%M') if a['created_at'] else 'N/A'
                 row_bg = 'background:#fff5f5;' if a['is_actionable'] else ''
                 border_left = 'border-left:3px solid #dc3545;' if a['is_actionable'] else ''
+
+                diag_html = a['short_diagnosis']
+                pods = a.get('affected_pods', [])
+                if pods and a.get('alert_type') == 'Pod Restarts':
+                    pod_rows = ''.join(
+                        f'<tr><td style="padding:3px 6px;font-size:11px">{p.get("pod","")}</td>'
+                        f'<td style="padding:3px 6px;font-size:11px">{p.get("namespace","")}</td>'
+                        f'<td style="padding:3px 6px;font-size:11px">{p.get("restart_count","")}</td>'
+                        f'<td style="padding:3px 6px;font-size:11px">{p.get("reason","")}</td></tr>'
+                        for p in pods[:5]
+                    )
+                    diag_html += (
+                        f'<table style="margin-top:6px;border-collapse:collapse;width:100%;font-size:11px;background:#f8f9fa;border-radius:4px">'
+                        f'<thead><tr style="background:#e9ecef">'
+                        f'<th style="padding:4px 6px;text-align:left;font-size:10px">Pod</th>'
+                        f'<th style="padding:4px 6px;text-align:left;font-size:10px">Namespace</th>'
+                        f'<th style="padding:4px 6px;text-align:left;font-size:10px">Restarts</th>'
+                        f'<th style="padding:4px 6px;text-align:left;font-size:10px">Reason</th>'
+                        f'</tr></thead><tbody>{pod_rows}</tbody></table>'
+                    )
+
                 rows_html += f"""<tr style="{row_bg}">
                     <td style="padding:10px;border-bottom:1px solid #eee;{border_left}">{ts}</td>
                     <td style="padding:10px;border-bottom:1px solid #eee">{a['alert_type']}</td>
@@ -443,7 +480,7 @@ def download_alert_html():
                     <td style="padding:10px;border-bottom:1px solid #eee;white-space:nowrap">{_format_dur(a['duration_minutes'])}</td>
                     <td style="padding:10px;border-bottom:1px solid #eee">{f"{a['metric_value']:.1f}" if a['metric_value'] is not None else 'N/A'}</td>
                     <td style="padding:10px;border-bottom:1px solid #eee">{f"{a['threshold_value']:.1f}" if a['threshold_value'] is not None else 'N/A'}</td>
-                    <td style="padding:10px;border-bottom:1px solid #eee;max-width:350px;font-size:12px;color:#495057">{a['short_diagnosis']}</td>
+                    <td style="padding:10px;border-bottom:1px solid #eee;max-width:400px;font-size:12px;color:#495057">{diag_html}</td>
                 </tr>"""
 
             testbed_sections += f"""

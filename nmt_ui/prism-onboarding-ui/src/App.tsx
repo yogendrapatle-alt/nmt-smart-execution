@@ -1,5 +1,5 @@
 import React, { Suspense } from 'react';
-import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 
 import Layout from './components/Layout';
 import DashboardHome from './pages/DashboardHome';
@@ -74,7 +74,8 @@ const App: React.FC = () => {
         {/* Rules & Alerts */}
         <Route path="/rulebuilder-experimental" element={<Layout><RuleBuilderExperimental onSave={() => {}} /></Layout>} />
         <Route path="/rulebuilder" element={<Layout><RuleBuilder onSave={() => {}} /></Layout>} />
-        <Route path="/rule-config-manager" element={<Layout><RuleConfigManager /></Layout>} />
+        {/* Rule Config Manager disabled — monitoring rules are now in Smart Execution */}
+        <Route path="/rule-config-manager" element={<Navigate to="/smart-execution" replace />} />
         <Route path="/alert-summary" element={<Layout><AlertSummary /></Layout>} />
         <Route path="/alert-configuration" element={<Layout><AlertConfiguration /></Layout>} />
 

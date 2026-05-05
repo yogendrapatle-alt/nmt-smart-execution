@@ -14,7 +14,7 @@ const PAGE_TITLES: Record<string, string> = {
   '/onboarding': 'Onboard Testbed',
   '/my-testbeds': 'My Testbeds',
   '/testbeds': 'My Testbeds',
-  '/rule-config-manager': 'Rule & Config Manager',
+  '/rule-config-manager': 'Rule & Config Manager', // disabled from sidebar but route kept for backward compat
   '/alert-summary': 'Alert Summary',
   '/alert-configuration': 'Alert Configuration',
   '/smart-execution': 'Smart Execution',
@@ -95,7 +95,6 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
             {navItem('/my-testbeds', 'dns', 'My Testbeds', ['/my-testbeds', '/testbeds'])}
 
             <li className="menu-label">MONITORING</li>
-            {navItem('/rule-config-manager', 'rule', 'Rules & Config', ['/rule-config-manager', '/rulebuilder-experimental', '/rulebuilder'])}
             {navItem('/alert-summary', 'notifications_active', 'Alert Summary')}
             {navItem('/alert-configuration', 'tune', 'Alert Configuration')}
             {navItem('/status', 'show_chart', 'Status & Health')}

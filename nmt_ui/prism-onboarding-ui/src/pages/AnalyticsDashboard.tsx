@@ -7,8 +7,8 @@ import { SkeletonMetricRow, SkeletonCard } from '../components/ui/LoadingSkeleto
 
 interface Overview {
   period: { start: string; end: string; days: number };
-  executions: { total: number; completed: number; failed: number; running: number; success_rate: number };
-  operations: { total: number; successful: number; success_rate: number; avg_per_execution: number };
+  executions: { total: number; completed: number; failed: number; running: number; stopped?: number; success_rate: number; completion_rate?: number };
+  operations: { total: number; successful: number; failed?: number; success_rate: number; avg_per_execution: number };
   performance: { avg_duration_minutes: number; avg_operations_per_minute: number; threshold_achievement_rate: number };
   resource_utilization: { avg_cpu_percent: number; avg_memory_percent: number };
 }
@@ -34,6 +34,22 @@ const AnalyticsDashboard: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [dateRange, setDateRange] = useState('365');
   const [selectedMetric, setSelectedMetric] = useState('executions');
+  const [testbeds, setTestbeds] = useState<{ id: string; name: string }[]>([]);
+  const [selectedTestbed, setSelectedTestbed] = useState('');
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(`${getApiBase()}/api/get-testbeds`);
+        const d = await res.json();
+        const list = (d.testbeds || []).map((t: any) => ({
+          id: t.unique_testbed_id || t.id,
+          name: t.testbed_label || t.ncm_ip || t.pc_ip || (t.unique_testbed_id || '').slice(0, 12),
+        }));
+        setTestbeds(list);
+      } catch { /* ignore */ }
+    })();
+  }, []);
 
   const loadAnalytics = useCallback(async () => {
     try {
@@ -45,6 +61,7 @@ const AnalyticsDashboard: React.FC = () => {
         start_date: start.toISOString().split('T')[0],
         end_date: end.toISOString().split('T')[0],
       });
+      if (selectedTestbed) params.set('testbed_id', selectedTestbed);
 
       const [ovRes, trRes] = await Promise.all([
         fetch(`${getApiBase()}/api/analytics/overview?${params}`),
@@ -61,11 +78,10 @@ const AnalyticsDashboard: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [dateRange, selectedMetric]);
+  }, [dateRange, selectedMetric, selectedTestbed]);
 
   useEffect(() => { loadAnalytics(); }, [loadAnalytics]);
 
-  /* ── Loading skeleton ──────────────────────────────────── */
   if (loading) {
     return (
       <div className="main-content">
@@ -90,8 +106,10 @@ const AnalyticsDashboard: React.FC = () => {
     ? overview.resource_utilization.avg_memory_percent > 80 ? 'danger' : overview.resource_utilization.avg_memory_percent > 60 ? 'warning' : 'success'
     : 'success';
   const successVariant: 'success' | 'warning' | 'danger' = overview
-    ? overview.executions.success_rate >= 80 ? 'success' : overview.executions.success_rate >= 50 ? 'warning' : 'danger'
+    ? overview.operations.success_rate >= 80 ? 'success' : overview.operations.success_rate >= 50 ? 'warning' : 'danger'
     : 'success';
+
+  const stoppedCount = overview?.executions?.stopped ?? 0;
 
   return (
     <div className="main-content">
@@ -102,6 +120,12 @@ const AnalyticsDashboard: React.FC = () => {
         subtitle="Track Smart Execution performance across all testbeds — execution counts, success rates, operation throughput, and resource usage trends."
         actions={
           <div className="d-flex gap-2 align-items-center flex-wrap">
+            {testbeds.length > 0 && (
+              <select className="form-select form-select-sm rounded-3" style={{ width: 'auto', maxWidth: 200 }} value={selectedTestbed} onChange={e => setSelectedTestbed(e.target.value)}>
+                <option value="">All Testbeds</option>
+                {testbeds.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            )}
             <select className="form-select form-select-sm rounded-3" style={{ width: 'auto' }} value={dateRange} onChange={e => setDateRange(e.target.value)}>
               <option value="7">Last 7 days</option>
               <option value="30">Last 30 days</option>
@@ -117,37 +141,90 @@ const AnalyticsDashboard: React.FC = () => {
         }
       />
 
-      {/* ── Metric Cards ──────────────────────────────────── */}
       {overview && (
         <div className="row row-cols-1 row-cols-md-3 row-cols-xl-6 g-3 mb-4">
           <div className="col">
             <MetricCard icon="rocket_launch" variant="default" label="Total Executions" value={overview.executions.total}
-              detail={`${overview.executions.completed} completed, ${overview.executions.failed} failed`} />
+              detail={`${overview.executions.completed} completed, ${overview.executions.failed} failed${stoppedCount > 0 ? `, ${stoppedCount} stopped` : ''}`} />
           </div>
           <div className="col">
-            <MetricCard icon="check_circle" variant={successVariant} label="Success Rate" value={`${overview.executions.success_rate.toFixed(1)}`} suffix="%"
-              detail={overview.executions.success_rate >= 80 ? 'Healthy — above 80%' : overview.executions.success_rate >= 50 ? 'Moderate — room for improvement' : 'Below 50% — review failures'} />
+            <MetricCard icon="check_circle" variant={successVariant} label="Op Success Rate" value={`${overview.operations.success_rate.toFixed(1)}`} suffix="%"
+              detail={`${overview.operations.successful?.toLocaleString()} of ${overview.operations.total?.toLocaleString()} ops succeeded`} />
           </div>
           <div className="col">
             <MetricCard icon="settings" iconGradient="linear-gradient(135deg, #8b5cf6, #7c3aed)" label="Total Operations" value={overview.operations.total.toLocaleString()}
-              detail={`${overview.operations.success_rate.toFixed(1)}% op success`} />
+              detail={`~${overview.operations.avg_per_execution.toFixed(0)} ops per execution`} />
           </div>
           <div className="col">
-            <MetricCard icon="timer" variant="warning" label="Avg Exec Time" value={`${overview.performance.avg_duration_minutes.toFixed(1)}`} suffix="m"
-              detail={`${overview.performance.avg_operations_per_minute.toFixed(1)} ops/min`} />
+            <MetricCard icon="timer" variant="warning" label="Avg Duration" value={`${overview.performance.avg_duration_minutes.toFixed(1)}`} suffix="m"
+              detail={`${overview.performance.avg_operations_per_minute.toFixed(1)} ops/min throughput`} />
           </div>
           <div className="col">
             <MetricCard icon="memory" variant={cpuVariant} label="Avg CPU" value={`${overview.resource_utilization.avg_cpu_percent.toFixed(1)}`} suffix="%"
-              detail={overview.resource_utilization.avg_cpu_percent > 80 ? 'High — monitor closely' : 'Within normal range'} />
+              detail={overview.resource_utilization.avg_cpu_percent > 80 ? 'High — monitor closely' : overview.resource_utilization.avg_cpu_percent > 0 ? 'Within normal range' : 'No data available'} />
           </div>
           <div className="col">
             <MetricCard icon="storage" variant={memVariant} label="Avg Memory" value={`${overview.resource_utilization.avg_memory_percent.toFixed(1)}`} suffix="%"
-              detail={overview.resource_utilization.avg_memory_percent > 80 ? 'High — monitor closely' : 'Within normal range'} />
+              detail={overview.resource_utilization.avg_memory_percent > 80 ? 'High — monitor closely' : overview.resource_utilization.avg_memory_percent > 0 ? 'Within normal range' : 'No data available'} />
           </div>
         </div>
       )}
 
-      {/* ── Trend Chart ───────────────────────────────────── */}
+      {/* Execution Status Breakdown */}
+      {overview && overview.executions.total > 0 && (
+        <div className="row g-3 mb-4">
+          <div className="col-md-5">
+            <div className="card border-0 rounded-3" style={{ boxShadow: 'var(--shadow-sm)' }}>
+              <div className="card-body p-4">
+                <h6 className="mb-1 fw-semibold d-flex align-items-center gap-2" style={{ fontSize: 'var(--text-md)' }}>
+                  <i className="material-icons-outlined" style={{ fontSize: 20, color: '#8b5cf6' }}>donut_large</i>
+                  Execution Status
+                </h6>
+                <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }} className="mb-3">Breakdown of execution outcomes</p>
+                <ReactApexChart
+                  type="donut"
+                  height={220}
+                  series={[overview.executions.completed, overview.executions.failed, stoppedCount, overview.executions.running].filter(v => v > 0)}
+                  options={{
+                    chart: { fontFamily: 'inherit' },
+                    labels: ['Completed', 'Failed/Timeout', 'Stopped', 'Running'].filter((_, i) => [overview.executions.completed, overview.executions.failed, stoppedCount, overview.executions.running][i] > 0),
+                    colors: ['#22c55e', '#ef4444', '#f59e0b', '#3b82f6'],
+                    legend: { position: 'bottom', fontSize: '12px' },
+                    dataLabels: { enabled: true, formatter: (v: number) => `${v.toFixed(0)}%` },
+                    plotOptions: { pie: { donut: { size: '55%', labels: { show: true, total: { show: true, label: 'Total', fontSize: '14px', formatter: () => String(overview.executions.total) } } } } },
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+          <div className="col-md-7">
+            <div className="card border-0 rounded-3 h-100" style={{ boxShadow: 'var(--shadow-sm)' }}>
+              <div className="card-body p-4">
+                <h6 className="mb-1 fw-semibold d-flex align-items-center gap-2" style={{ fontSize: 'var(--text-md)' }}>
+                  <i className="material-icons-outlined" style={{ fontSize: 20, color: '#3b82f6' }}>assessment</i>
+                  Performance Summary
+                </h6>
+                <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)' }} className="mb-3">Key performance indicators at a glance</p>
+                <div className="d-flex flex-column gap-3">
+                  {[
+                    { label: 'Threshold Achievement', value: `${overview.performance.threshold_achievement_rate.toFixed(1)}%`, color: overview.performance.threshold_achievement_rate > 50 ? '#22c55e' : '#f59e0b' },
+                    { label: 'Avg Operations / Execution', value: overview.operations.avg_per_execution.toFixed(1), color: '#8b5cf6' },
+                    { label: 'Avg Throughput', value: `${overview.performance.avg_operations_per_minute.toFixed(2)} ops/min`, color: '#3b82f6' },
+                    { label: 'Operations Failed', value: `${(overview.operations.failed ?? (overview.operations.total - overview.operations.successful)).toLocaleString()}`, color: '#ef4444' },
+                  ].map((item, i) => (
+                    <div key={i} className="d-flex align-items-center justify-content-between p-2 rounded-3" style={{ background: '#f8fafc' }}>
+                      <span className="small fw-medium text-muted">{item.label}</span>
+                      <span className="fw-bold" style={{ color: item.color }}>{item.value}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Trend Chart */}
       <div className="card border-0 rounded-3 mb-4" style={{ boxShadow: 'var(--shadow-sm)' }}>
         <div className="card-body p-4">
           <div className="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
@@ -188,7 +265,7 @@ const AnalyticsDashboard: React.FC = () => {
         </div>
       </div>
 
-      {/* ── Quick Links ───────────────────────────────────── */}
+      {/* Quick Links */}
       <div className="row g-3">
         {[
           { path: '/analytics/comparison', icon: 'compare', gradient: 'linear-gradient(135deg, #3b82f6, #2563eb)', title: 'Execution Comparison', desc: 'Compare multiple executions side by side to see which performed best' },

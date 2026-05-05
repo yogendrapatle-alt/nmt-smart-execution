@@ -171,6 +171,11 @@ class SmartExecutionController:
             'pod_name_pattern': None
         }
         
+        # Monitoring rules — evaluated each iteration and violations become alerts
+        self.monitoring_rules = (rule_config or {}).get('monitoring_rules', [])
+        self.monitoring_rule_violations: List[Dict] = []
+        self._rule_cooldowns: Dict[str, float] = {}
+        
         self.execution_id = f"SMART-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:12]}"
         self.status = "INITIALIZING"
         self.is_running = False
@@ -1988,6 +1993,9 @@ class SmartExecutionController:
                             logger.info(f"RECOMMENDATION: {recommendation['action']}")
                             self._log_event('INFO', f"Recommendation: {recommendation['action']}", recommendation=recommendation)
                 
+                # Evaluate user-configured monitoring rules
+                await self._evaluate_monitoring_rules(iteration)
+
                 # Phase 4: Adaptive parallelism
                 if self._adaptive_parallelism:
                     self._adjust_parallelism(cpu, memory)
@@ -6793,6 +6801,272 @@ class SmartExecutionController:
         # All URLs failed
         return None
     
+    # ── Monitoring Rule Evaluation ─────────────────────────────────────
+    QUERY_NAME_TO_PROMETHEUS = {
+        'PodCPUUsage': 'sum(rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (pod, namespace) * 100',
+        'PodMemoryUsage': 'sum(container_memory_working_set_bytes{container!="POD",container!=""}) by (pod, namespace) / 1024 / 1024 / 1024',
+        'PodRestarts': 'sum(kube_pod_container_status_restarts_total) by (pod, namespace)',
+        'ContainerRestarts': 'sum(kube_pod_container_status_restarts_total) by (container, pod, namespace)',
+        'ContainerCPUThrottling': 'sum(rate(container_cpu_cfs_throttled_periods_total[5m])) by (pod, namespace) / sum(rate(container_cpu_cfs_periods_total[5m])) by (pod, namespace) * 100',
+        'HighCPUThrottling': 'sum(rate(container_cpu_cfs_throttled_periods_total[5m])) / sum(rate(container_cpu_cfs_periods_total[5m])) * 100',
+        'CHCPUUsage': 'sum(rate(container_cpu_usage_seconds_total{container=~"cluster_health.*"}[5m])) * 100',
+        'CHMemoryUsage': 'sum(container_memory_working_set_bytes{container=~"cluster_health.*"}) / 1024 / 1024 / 1024',
+        'IDFCPUUsage': 'sum(rate(container_cpu_usage_seconds_total{container=~"idf.*|insights.*"}[5m])) * 100',
+        'IDFMemoryUsage': 'sum(container_memory_working_set_bytes{container=~"idf.*|insights.*"}) / 1024 / 1024 / 1024',
+    }
+
+    @staticmethod
+    def _inject_label_filters(prom_query: str, namespace: str = None, pod_name: str = None) -> str:
+        """Inject namespace and/or pod label selectors into a PromQL expression."""
+        if not namespace and not pod_name:
+            return prom_query
+
+        import re
+        extra_labels = []
+        if namespace:
+            extra_labels.append(f'namespace="{namespace}"')
+        if pod_name:
+            extra_labels.append(f'pod=~".*{re.escape(pod_name)}.*"')
+
+        snippet = ','.join(extra_labels)
+
+        def _add_labels(match):
+            metric_name = match.group(1)
+            existing = match.group(2).strip() if match.group(2) else ''
+            if existing:
+                return f'{metric_name}{{{existing},{snippet}}}'
+            return f'{metric_name}{{{snippet}}}'
+
+        # Match metric_name{...} or metric_name without braces
+        result = re.sub(
+            r'(\b[a-zA-Z_:][a-zA-Z0-9_:]*)\{([^}]*)\}',
+            _add_labels,
+            prom_query,
+        )
+
+        # If query has no braces at all (pure metric name), append filters
+        if '{' not in result and not any(op in result for op in ['(', '+', '-', '*', '/']):
+            result = f'{result}{{{snippet}}}'
+
+        return result
+
+    async def _evaluate_monitoring_rules(self, iteration: int):
+        """Evaluate user-configured monitoring rules against live Prometheus data."""
+        if not self.monitoring_rules or not self.prometheus_url:
+            return
+
+        now_ts = time.time()
+
+        for rule in self.monitoring_rules:
+            rule_id = rule.get('id', 'unknown')
+            rule_name = rule.get('name', 'Unnamed Rule')
+            query_key = rule.get('query', '')
+            operator = rule.get('operator', '>')
+            threshold = float(rule.get('threshold', 0))
+            severity = rule.get('severity', 'Moderate')
+            description = rule.get('description', '')
+            rule_namespace = rule.get('namespace') or None
+            rule_pod_name = rule.get('pod_name') or None
+
+            # Cooldown: don't re-alert for the same rule within 60 seconds
+            last_fired = self._rule_cooldowns.get(rule_id, 0)
+            if now_ts - last_fired < 60:
+                continue
+
+            # Resolve query name to Prometheus expression, or use as-is if custom
+            prom_query = self.QUERY_NAME_TO_PROMETHEUS.get(query_key, query_key)
+            if not prom_query:
+                continue
+
+            # Inject namespace/pod label filters into the PromQL query
+            prom_query = self._inject_label_filters(prom_query, rule_namespace, rule_pod_name)
+
+            scope_label = ''
+            if rule_namespace:
+                scope_label += f' ns={rule_namespace}'
+            if rule_pod_name:
+                scope_label += f' pod={rule_pod_name}'
+
+            try:
+                value = await self._query_prometheus(prom_query)
+                if value is None:
+                    continue
+
+                violated = False
+                if operator == '>' and value > threshold:
+                    violated = True
+                elif operator == '<' and value < threshold:
+                    violated = True
+                elif operator == '>=' and value >= threshold:
+                    violated = True
+                elif operator == '<=' and value <= threshold:
+                    violated = True
+                elif operator == '==' and value == threshold:
+                    violated = True
+                elif operator == '!=' and value != threshold:
+                    violated = True
+
+                if violated:
+                    self._rule_cooldowns[rule_id] = now_ts
+                    violation = {
+                        'rule_id': rule_id,
+                        'rule_name': rule_name,
+                        'query': query_key,
+                        'prom_query': prom_query,
+                        'operator': operator,
+                        'threshold': threshold,
+                        'actual_value': round(value, 4),
+                        'severity': severity,
+                        'description': description,
+                        'namespace': rule_namespace or 'All',
+                        'pod_name': rule_pod_name or 'All',
+                        'iteration': iteration,
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                        'execution_id': self.execution_id,
+                    }
+                    self.monitoring_rule_violations.append(violation)
+                    display_name = f"{rule_name}{scope_label}"
+                    logger.warning(f"🚨 Monitoring rule violated: {display_name} — "
+                                   f"value={value:.4f} {operator} {threshold}")
+                    self._log_event('WARNING',
+                                    f'Monitoring rule violated: {display_name} — '
+                                    f'value={value:.4f} {operator} {threshold}',
+                                    rule_violation=violation)
+                    self._emit_event('monitoring_rule_violated',
+                                     f'{display_name}: {value:.2f} {operator} {threshold}',
+                                     severity=severity.lower(), iteration=iteration,
+                                     metadata={'rule_id': rule_id, 'value': value, 'threshold': threshold,
+                                               'namespace': rule_namespace, 'pod_name': rule_pod_name})
+
+                    # Persist violation as an alert in alert_summaries
+                    self._persist_rule_violation_alert(violation)
+
+                    # Send Slack notification for the violation
+                    self._send_rule_violation_slack(violation, scope_label)
+
+            except Exception as e:
+                logger.warning(f"Failed to evaluate monitoring rule '{rule_name}': {e}")
+
+    def _send_rule_violation_slack(self, violation: Dict, scope_label: str = ''):
+        """Send Slack notification for a monitoring rule violation."""
+        try:
+            testbed_uid = self.testbed_info.get('unique_testbed_id')
+            webhook = get_slack_webhook_for_testbed(testbed_uid)
+            if not webhook:
+                return
+            sev_emoji = {'Critical': ':rotating_light:', 'Moderate': ':warning:', 'Low': ':information_source:'}
+            emoji = sev_emoji.get(violation['severity'], ':bell:')
+            text = (
+                f"{emoji} *Monitoring Rule Violated*\n"
+                f"*Rule:* {violation['rule_name']}{scope_label}\n"
+                f"*Value:* {violation['actual_value']:.4f} {violation['operator']} "
+                f"threshold {violation['threshold']}\n"
+                f"*Severity:* {violation['severity']}\n"
+                f"*Execution:* {violation.get('execution_id', 'N/A')} (iteration {violation.get('iteration', '?')})\n"
+                f"*Time:* {violation.get('timestamp', 'N/A')}"
+            )
+            if violation.get('description'):
+                text += f"\n*Description:* {violation['description']}"
+            if post_slack_incoming_webhook(webhook, text):
+                logger.info(f"📢 Slack alert sent for rule violation: {violation['rule_name']}")
+            else:
+                logger.debug(f"Slack webhook delivery failed for rule: {violation['rule_name']}")
+        except Exception as e:
+            logger.debug(f"Could not send Slack notification for rule violation: {e}")
+
+    def _persist_rule_violation_alert(self, violation: Dict):
+        """Insert a monitoring rule violation into alert_summaries so it appears on the Alerts page."""
+        try:
+            import psycopg2
+            db_url = os.environ.get('DATABASE_URL', 'postgresql://alertuser:alertpass@127.0.0.1:5432/alerts')
+
+            parts = {}
+            if db_url.startswith('postgresql://'):
+                from urllib.parse import urlparse
+                parsed = urlparse(db_url)
+                parts = {
+                    'host': parsed.hostname or '127.0.0.1',
+                    'port': parsed.port or 5432,
+                    'dbname': parsed.path.lstrip('/') or 'alerts',
+                    'user': parsed.username or 'alertuser',
+                    'password': parsed.password or 'alertpass',
+                }
+            else:
+                parts = {'host': '127.0.0.1', 'port': 5432, 'dbname': 'alerts',
+                         'user': 'alertuser', 'password': 'alertpass'}
+
+            testbed_id = self.testbed_info.get('unique_testbed_id', '')
+            sev_map = {'Critical': 'critical', 'Moderate': 'warning', 'Low': 'info'}
+            db_severity = sev_map.get(violation['severity'], 'warning')
+
+            conn = psycopg2.connect(**parts)
+            cur = conn.cursor()
+
+            # Ensure alert_summaries table exists
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS alert_summaries (
+                    id SERIAL PRIMARY KEY,
+                    testbed_id VARCHAR(128),
+                    alert_type VARCHAR(100),
+                    severity VARCHAR(50),
+                    status VARCHAR(50) DEFAULT 'active',
+                    message TEXT,
+                    metric_value FLOAT,
+                    threshold_value FLOAT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    acknowledged_at TIMESTAMP,
+                    resolved_at TIMESTAMP,
+                    duration_minutes FLOAT,
+                    diagnostic_context JSONB,
+                    resolved_reason TEXT
+                )
+            """)
+
+            import json as _json
+            rule_ns = violation.get('namespace', 'All')
+            rule_pod = violation.get('pod_name', 'All')
+            diag_ctx = _json.dumps({
+                'execution_id': violation['execution_id'],
+                'rule_id': violation['rule_id'],
+                'query': violation['query'],
+                'prom_query': violation['prom_query'],
+                'operator': violation['operator'],
+                'iteration': violation['iteration'],
+                'namespace': rule_ns,
+                'pod_name': rule_pod,
+                'source': 'smart_execution_monitoring_rule',
+            })
+
+            scope_parts = []
+            if rule_ns and rule_ns != 'All':
+                scope_parts.append(f'namespace={rule_ns}')
+            if rule_pod and rule_pod != 'All':
+                scope_parts.append(f'pod={rule_pod}')
+            scope_str = f" [{', '.join(scope_parts)}]" if scope_parts else ''
+
+            cur.execute("""
+                INSERT INTO alert_summaries
+                    (testbed_id, alert_type, severity, status, message,
+                     metric_value, threshold_value, created_at, diagnostic_context)
+                VALUES (%s, %s, %s, 'active', %s, %s, %s, NOW(), %s)
+            """, (
+                testbed_id,
+                f"monitoring_rule:{violation['rule_name']}",
+                db_severity,
+                f"{violation['rule_name']}{scope_str}: value {violation['actual_value']:.4f} "
+                f"{violation['operator']} threshold {violation['threshold']}. "
+                f"{violation.get('description', '')}".strip(),
+                violation['actual_value'],
+                violation['threshold'],
+                diag_ctx,
+            ))
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info(f"✅ Alert saved to alert_summaries for rule '{violation['rule_name']}'")
+        except Exception as e:
+            logger.warning(f"Failed to persist monitoring rule alert: {e}")
+
     def stop(self):
         """Stop the execution with graceful drain for in-flight ops."""
         logger.info(f"🛑 Stopping smart execution {self.execution_id}")
@@ -7847,6 +8121,8 @@ spec:
             full_execution_data['data_quality'] = self._compute_data_quality()
             full_execution_data['metrics_stats'] = self._compute_metrics_stats()
             full_execution_data['cleanup_results'] = self._cleanup_results
+            full_execution_data['monitoring_rule_violations'] = self.monitoring_rule_violations
+            full_execution_data['monitoring_rules_configured'] = self.monitoring_rules
             
             # Prepare execution data
             execution_data = {
@@ -8235,6 +8511,11 @@ spec:
             'resource_lifecycle': self._get_resource_lifecycle_summary(),
             'data_quality': self._compute_data_quality(),
             'metrics_stats': self._compute_metrics_stats(),
+            
+            # Monitoring rule violations
+            'monitoring_rule_violations': self.monitoring_rule_violations,
+            'monitoring_rules_configured': len(self.monitoring_rules),
+            'monitoring_rules_active': len([r for r in self.monitoring_rules if r.get('enabled', True)]),
         }
     
     def _calculate_predictions(self) -> Optional[Dict]:

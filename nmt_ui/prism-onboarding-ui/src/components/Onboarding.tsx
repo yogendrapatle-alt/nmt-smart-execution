@@ -321,7 +321,7 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
                     <button
                       type="button"
                       className="btn btn-success"
-                      onClick={() => { onSubmit(form); navigate('/rulebuilder-experimental'); }}
+                      onClick={() => { onSubmit(form); navigate('/smart-execution/configure'); }}
                       style={{
                         borderRadius: 8,
                         padding: '10px 24px',
@@ -330,8 +330,8 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
                         boxShadow: '0 2px 8px rgba(40, 167, 69, 0.3)'
                       }}
                     >
-                      <i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle', marginRight: 6 }}>arrow_forward</i>
-                      Configure Rules
+                      <i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle', marginRight: 6 }}>rocket_launch</i>
+                      Configure & Run
                     </button>
                     <button
                       type="button"

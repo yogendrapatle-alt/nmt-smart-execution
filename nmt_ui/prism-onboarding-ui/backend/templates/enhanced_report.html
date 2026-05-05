@@ -448,6 +448,80 @@
     </div>
     {% endif %}
 
+    <!-- MONITORING RULE VIOLATIONS -->
+    {% if monitoring_rule_violations is defined and monitoring_rule_violations|length > 0 %}
+    <div class="card" id="section-monitoring-rules">
+        <div class="card-header">
+            <div class="icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">📋</div>
+            <h2>Monitoring Rule Violations ({{ monitoring_rule_violations|length }})</h2>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--muted); margin-bottom:16px;">
+                User-configured monitoring rules that were violated during execution. Each violation was captured as an alert.
+            </p>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Rule Name</th>
+                        <th>Namespace</th>
+                        <th>Pod</th>
+                        <th>Query</th>
+                        <th>Condition</th>
+                        <th>Actual Value</th>
+                        <th>Severity</th>
+                        <th>Iteration</th>
+                        <th>Timestamp</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for v in monitoring_rule_violations %}
+                    <tr>
+                        <td><strong>{{ v.rule_name }}</strong></td>
+                        <td style="font-size:0.85em;">{{ v.namespace if v.namespace and v.namespace != 'All' else '<span style="color:var(--muted)">All</span>' }}</td>
+                        <td style="font-size:0.85em;">{{ v.pod_name if v.pod_name and v.pod_name != 'All' else '<span style="color:var(--muted)">All</span>' }}</td>
+                        <td><code style="font-size:0.75em; background:#f1f5f9; padding:2px 6px; border-radius:4px;">{{ v.query }}</code></td>
+                        <td>{{ v.operator }} {{ v.threshold }}</td>
+                        <td><strong style="color: {% if v.severity == 'Critical' %}var(--fail){% elif v.severity == 'Moderate' %}#f59e0b{% else %}var(--pass){% endif %};">{{ '%.4f'|format(v.actual_value) }}</strong></td>
+                        <td>
+                            <span style="display:inline-block; padding:2px 10px; border-radius:999px; font-size:0.75em; font-weight:600;
+                                {% if v.severity == 'Critical' %}background:#fef2f2; color:#dc2626;
+                                {% elif v.severity == 'Moderate' %}background:#fffbeb; color:#d97706;
+                                {% else %}background:#f0fdf4; color:#16a34a;{% endif %}">
+                                {{ v.severity }}
+                            </span>
+                        </td>
+                        <td style="text-align:center;">{{ v.iteration }}</td>
+                        <td style="white-space:nowrap; font-size:0.8em;">{{ v.timestamp[:19] if v.timestamp else '—' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+
+            {% set violations_by_rule = {} %}
+            {% for v in monitoring_rule_violations %}
+                {% if v.rule_name not in violations_by_rule %}
+                    {% set _ = violations_by_rule.update({v.rule_name: {'count': 0, 'severity': v.severity, 'query': v.query}}) %}
+                {% endif %}
+                {% set _ = violations_by_rule[v.rule_name].update({'count': violations_by_rule[v.rule_name].count + 1}) %}
+            {% endfor %}
+
+            <div style="margin-top:16px;">
+                <strong>Summary by Rule:</strong>
+                <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;">
+                    {% for rule_name, info in violations_by_rule.items() %}
+                    <div style="padding:8px 14px; border-radius:8px; font-size:0.85em;
+                        {% if info.severity == 'Critical' %}background:#fef2f2; border:1px solid #fecaca;
+                        {% elif info.severity == 'Moderate' %}background:#fffbeb; border:1px solid #fed7aa;
+                        {% else %}background:#f0fdf4; border:1px solid #bbf7d0;{% endif %}">
+                        <strong>{{ rule_name }}</strong>: {{ info.count }} violation{{ 's' if info.count != 1 }}
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
     <!-- FAILURE ROOT CAUSE ANALYSIS -->
     {% if failure_analysis.total_failures > 0 %}
     <div class="card" id="section-failures">

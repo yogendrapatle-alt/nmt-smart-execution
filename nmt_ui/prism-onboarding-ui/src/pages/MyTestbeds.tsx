@@ -22,7 +22,7 @@ const MyTestbeds: React.FC = () => {
   const handleConfigure = (testbed: any) => {
     localStorage.setItem('unique_testbed_id', testbed.unique_testbed_id);
     localStorage.setItem('selected_testbed_label', testbed.testbed_label);
-    navigate('/rule-config-manager');
+    navigate('/smart-execution/configure');
   };
 
   const handleDelete = async (testbed: any) => {

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 MODEL_DIR = os.environ.get('ML_MODEL_DIR', '/tmp/nmt_ml_models')
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-SLIDING_WINDOW_SIZE = int(os.environ.get('ML_SLIDING_WINDOW', 1000))
+SLIDING_WINDOW_SIZE = int(os.environ.get('ML_SLIDING_WINDOW', 2500))
 MIN_SAMPLES_FOR_TRAINING = 20
 MIN_R2_THRESHOLD = 0.15
 RETRAIN_AFTER_N_OPS = int(os.environ.get('ML_RETRAIN_AFTER_OPS', 50))

@@ -155,7 +155,8 @@ def _get_running_executions(testbed_id: str, at_time: datetime) -> List[Dict]:
 def generate_short_diagnosis(alert_type: str, metric_value: Optional[float],
                              threshold_value: Optional[float],
                              duration_minutes: Optional[float],
-                             status: str) -> str:
+                             status: str,
+                             diagnostic_context: Optional[Dict] = None) -> str:
     """One-line tester-friendly explanation for the alert list view."""
     if metric_value is None or threshold_value is None:
         return f"{alert_type} detected"
@@ -164,6 +165,7 @@ def generate_short_diagnosis(alert_type: str, metric_value: Optional[float],
     val = f"{metric_value:.1f}"
     thr = f"{threshold_value:.1f}"
     active = status.lower() in ('active', 'firing', 'acknowledged')
+    ctx = diagnostic_context or {}
 
     if alert_type == 'High CPU Usage':
         if active:
@@ -182,9 +184,18 @@ def generate_short_diagnosis(alert_type: str, metric_value: Optional[float],
 
     if alert_type == 'Pod Restarts':
         count = int(abs(metric_value)) if metric_value else 0
+        pods = ctx.get('affected_pods', [])
+        pod_info = ''
+        if pods:
+            pod_names = [p.get('pod', '') for p in pods[:3] if p.get('pod')]
+            reasons = set(p.get('reason', '') for p in pods if p.get('reason'))
+            if pod_names:
+                pod_info = f" — pods: {', '.join(pod_names)}"
+            if reasons - {''}:
+                pod_info += f" ({', '.join(reasons - {''})})"
         if active:
-            return f"{count} pod restarts detected (threshold {thr}) -- investigate termination reasons"
-        return f"{count} pod restarts detected, issue lasted {dur}"
+            return f"{count} pod restarts detected (threshold {thr}){pod_info}"
+        return f"{count} pod restarts detected, lasted {dur}{pod_info}"
 
     if alert_type == 'Network Latency':
         if active:

@@ -29,6 +29,9 @@ class Testbed(Base):
     # Alert configuration for notifications (Slack, Email, Webhook)
     alert_config = Column(JSON, nullable=True)  # Alert notification settings
 
+    # Saved monitoring rules for Smart Execution (persisted per testbed)
+    monitoring_rules_config = Column(JSON, nullable=True)
+
     def to_dict(self):
         """Convert Testbed instance to dictionary"""
         return {
@@ -47,5 +50,6 @@ class Testbed(Base):
             'pc_deployment': self.pc_deployment,
             'ncm_deployment': self.ncm_deployment,
             'remote_pc_deployment': self.remote_pc_deployment,
-            'alert_config': self.alert_config
+            'alert_config': self.alert_config,
+            'monitoring_rules_config': self.monitoring_rules_config,
         }

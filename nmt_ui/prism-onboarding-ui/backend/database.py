@@ -74,6 +74,7 @@ def init_db():
     """Create all tables in the database."""
     Base.metadata.create_all(bind=engine)
     _migrate_pod_events_columns()
+    _migrate_testbed_monitoring_rules()
 
 
 def _migrate_pod_events_columns():
@@ -104,6 +105,21 @@ def _migrate_pod_events_columns():
     except Exception as e:
         logging.debug(f"[migrate] pod_events column migration skipped: {e}")
 
+
+def _migrate_testbed_monitoring_rules():
+    """Add monitoring_rules_config JSONB column to testbeds if it doesn't exist."""
+    try:
+        with engine.connect() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE testbeds ADD COLUMN monitoring_rules_config JSONB"
+                ))
+                conn.commit()
+                logging.info("[migrate] Added column testbeds.monitoring_rules_config")
+            except Exception:
+                conn.rollback()
+    except Exception as e:
+        logging.debug(f"[migrate] testbed monitoring_rules_config migration skipped: {e}")
 
 
 

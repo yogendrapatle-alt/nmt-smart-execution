@@ -85,6 +85,32 @@ export function getAvailableOperations(entity: string): string[] {
   return OPERATIONS_MAP[entity] || ['CREATE', 'DELETE', 'LIST'];
 }
 
+export interface MonitoringRule {
+  id: string;
+  name: string;
+  query: string;
+  operator: '>' | '<' | '>=' | '<=' | '==' | '!=';
+  threshold: number;
+  severity: 'Critical' | 'Moderate' | 'Low';
+  enabled: boolean;
+  description?: string;
+  namespace?: string;
+  podName?: string;
+}
+
+export const QUICK_RULE_TEMPLATES: Omit<MonitoringRule, 'id' | 'enabled'>[] = [
+  { name: 'Pod CPU Usage', query: 'PodCPUUsage', operator: '>', threshold: 80, severity: 'Critical', description: 'Alert when any pod CPU usage exceeds threshold' },
+  { name: 'Pod Memory Usage', query: 'PodMemoryUsage', operator: '>', threshold: 80, severity: 'Critical', description: 'Alert when any pod memory usage exceeds threshold' },
+  { name: 'Container Restarts', query: 'ContainerRestarts', operator: '>', threshold: 5, severity: 'Moderate', description: 'Alert when container restart count exceeds threshold' },
+  { name: 'Pod Restarts', query: 'PodRestarts', operator: '>', threshold: 3, severity: 'Moderate', description: 'Alert when pod restart count exceeds threshold' },
+  { name: 'CPU Throttling', query: 'ContainerCPUThrottling', operator: '>', threshold: 25, severity: 'Moderate', description: 'Alert when CPU throttling percentage exceeds threshold' },
+  { name: 'CH CPU Usage', query: 'CHCPUUsage', operator: '>', threshold: 85, severity: 'Critical', description: 'Alert when Cluster Health CPU usage exceeds threshold' },
+  { name: 'CH Memory Usage', query: 'CHMemoryUsage', operator: '>', threshold: 85, severity: 'Critical', description: 'Alert when Cluster Health Memory usage exceeds threshold' },
+  { name: 'IDF CPU Usage', query: 'IDFCPUUsage', operator: '>', threshold: 80, severity: 'Moderate', description: 'Alert when IDF CPU usage exceeds threshold' },
+  { name: 'IDF Memory Usage', query: 'IDFMemoryUsage', operator: '>', threshold: 80, severity: 'Moderate', description: 'Alert when IDF Memory usage exceeds threshold' },
+  { name: 'High CPU Throttling', query: 'HighCPUThrottling', operator: '==', threshold: 1, severity: 'Critical', description: 'Alert when high CPU throttling is detected' },
+];
+
 export const PRESET_TEMPLATES: PresetConfig[] = [
   {
     id: 'smoke',

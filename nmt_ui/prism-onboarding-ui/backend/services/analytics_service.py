@@ -12,35 +12,64 @@ from collections import defaultdict
 logger = logging.getLogger(__name__)
 
 
+def _resolve_testbed_name(testbed_id: str) -> str:
+    """Resolve a testbed UUID to its display label / IP."""
+    try:
+        from database import SessionLocal
+        from sqlalchemy import text
+        s = SessionLocal()
+        try:
+            row = s.execute(
+                text("SELECT testbed_label, pc_ip, ncm_ip FROM testbeds WHERE unique_testbed_id = :tid LIMIT 1"),
+                {'tid': testbed_id},
+            ).fetchone()
+            if row:
+                label = row[0] or ''
+                pc_ip = row[1] or ''
+                ncm_ip = row[2] or ''
+                if label and pc_ip and label != pc_ip:
+                    return f"{label} ({pc_ip})"
+                return label or pc_ip or ncm_ip or testbed_id[:16]
+        finally:
+            s.close()
+    except Exception:
+        pass
+    return testbed_id[:16] + '...'
+
+
+def _extract_cpu(metrics: dict) -> Optional[float]:
+    """Extract CPU % from a metrics dict regardless of key convention."""
+    if not metrics:
+        return None
+    for key in ('cpu_percent', 'final_cpu', 'cpu'):
+        v = metrics.get(key)
+        if v is not None and isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    return None
+
+
+def _extract_memory(metrics: dict) -> Optional[float]:
+    """Extract memory % from a metrics dict regardless of key convention."""
+    if not metrics:
+        return None
+    for key in ('memory_percent', 'final_memory', 'memory'):
+        v = metrics.get(key)
+        if v is not None and isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    return None
+
+
 class AnalyticsService:
     """
     Advanced analytics service for Smart Executions
-    
-    Provides:
-    - Historical trend analysis
-    - Testbed comparisons
-    - Time period comparisons
-    - Statistical aggregations
-    - Executive summaries
     """
     
     def __init__(self):
-        """Initialize analytics service"""
         logger.info("✅ Analytics service initialized")
     
     def get_overview(self, start_date: datetime, end_date: datetime, 
                     testbed_id: Optional[str] = None) -> Dict:
-        """
-        Get analytics overview for a date range
-        
-        Args:
-            start_date: Start date
-            end_date: End date
-            testbed_id: Optional testbed filter
-        
-        Returns:
-            Dict with overview metrics
-        """
+        """Get analytics overview for a date range."""
         try:
             from database import SessionLocal
             from models.smart_execution import SmartExecution
@@ -58,39 +87,37 @@ class AnalyticsService:
                 executions = query.all()
                 
                 if not executions:
-                    return self._empty_overview()
+                    return self._empty_overview(start_date, end_date)
                 
-                # Calculate metrics (case-insensitive status comparison)
                 total_executions = len(executions)
                 completed = sum(1 for e in executions if (e.status or '').upper() == 'COMPLETED')
                 failed = sum(1 for e in executions if (e.status or '').upper() in ('FAILED', 'TIMEOUT', 'ERROR'))
                 running = sum(1 for e in executions if (e.status or '').upper() == 'RUNNING')
                 stopped = sum(1 for e in executions if (e.status or '').upper() == 'STOPPED')
                 
-                # Use operation-level success rate (more accurate than just counting COMPLETED executions)
                 total_operations = sum(e.total_operations or 0 for e in executions)
                 successful_operations = sum(e.successful_operations or 0 for e in executions)
-                success_rate = (successful_operations / total_operations * 100) if total_operations > 0 else 0
+                op_success_rate = (successful_operations / total_operations * 100) if total_operations > 0 else 0
+                exec_completion_rate = (completed / total_executions * 100) if total_executions > 0 else 0
                 
-                # Average duration
-                durations = [e.duration_minutes for e in executions if e.duration_minutes]
+                durations = [e.duration_minutes for e in executions if e.duration_minutes and e.duration_minutes > 0]
                 avg_duration = sum(durations) / len(durations) if durations else 0
                 
-                # Average operations per minute
-                ops_per_min = [e.operations_per_minute for e in executions if e.operations_per_minute]
+                ops_per_min = [e.operations_per_minute for e in executions if e.operations_per_minute and e.operations_per_minute > 0]
                 avg_ops_per_min = sum(ops_per_min) / len(ops_per_min) if ops_per_min else 0
                 
-                # Threshold achievement
                 threshold_reached = sum(1 for e in executions if e.threshold_reached)
                 threshold_rate = (threshold_reached / total_executions * 100) if total_executions > 0 else 0
                 
-                # Resource utilization
                 cpu_values = []
                 memory_values = []
                 for e in executions:
-                    if e.final_metrics:
-                        cpu_values.append(e.final_metrics.get('final_cpu', 0))
-                        memory_values.append(e.final_metrics.get('final_memory', 0))
+                    cpu_val = _extract_cpu(e.final_metrics)
+                    mem_val = _extract_memory(e.final_metrics)
+                    if cpu_val is not None:
+                        cpu_values.append(cpu_val)
+                    if mem_val is not None:
+                        memory_values.append(mem_val)
                 
                 avg_cpu = sum(cpu_values) / len(cpu_values) if cpu_values else 0
                 avg_memory = sum(memory_values) / len(memory_values) if memory_values else 0
@@ -106,12 +133,15 @@ class AnalyticsService:
                         'completed': completed,
                         'failed': failed,
                         'running': running,
-                        'success_rate': round(success_rate, 2)
+                        'stopped': stopped,
+                        'success_rate': round(op_success_rate, 2),
+                        'completion_rate': round(exec_completion_rate, 2),
                     },
                     'operations': {
                         'total': total_operations,
                         'successful': successful_operations,
-                        'success_rate': round((successful_operations / total_operations * 100) if total_operations > 0 else 0, 2),
+                        'failed': total_operations - successful_operations,
+                        'success_rate': round(op_success_rate, 2),
                         'avg_per_execution': round(total_operations / total_executions, 2) if total_executions > 0 else 0
                     },
                     'performance': {
@@ -130,7 +160,7 @@ class AnalyticsService:
                 
         except Exception as e:
             logger.error(f"Error getting overview: {e}")
-            return self._empty_overview()
+            return self._empty_overview(start_date, end_date)
     
     def get_trends(self, start_date: datetime, end_date: datetime,
                    metric: str = 'executions', granularity: str = 'daily',
@@ -289,72 +319,121 @@ class AnalyticsService:
             return {}
     
     def get_executive_summary(self, start_date: datetime, end_date: datetime) -> Dict:
-        """
-        Generate executive summary with key insights
-        
-        Args:
-            start_date: Start date
-            end_date: End date
-        
-        Returns:
-            Dict with executive summary
-        """
+        """Generate a rich executive summary with key insights."""
         try:
             from database import SessionLocal
             from models.smart_execution import SmartExecution
-            
+            from sqlalchemy import text
+
             session = SessionLocal()
             try:
                 executions = session.query(SmartExecution).filter(
                     SmartExecution.start_time >= start_date,
                     SmartExecution.start_time <= end_date
                 ).all()
-                
-                # Calculate key metrics (case-insensitive status)
+
                 total_executions = len(executions)
                 completed = sum(1 for e in executions if (e.status or '').upper() == 'COMPLETED')
-                
+                failed = sum(1 for e in executions if (e.status or '').upper() in ('FAILED', 'TIMEOUT', 'ERROR'))
+                stopped = sum(1 for e in executions if (e.status or '').upper() == 'STOPPED')
+
                 total_operations = sum(e.total_operations or 0 for e in executions)
                 successful_operations = sum(e.successful_operations or 0 for e in executions)
-                success_rate = (successful_operations / total_operations * 100) if total_operations > 0 else 0
-                
-                # Get testbed with most executions
-                testbed_counts = defaultdict(int)
+                failed_operations = total_operations - successful_operations
+                op_success_rate = (successful_operations / total_operations * 100) if total_operations > 0 else 0
+                exec_completion_rate = (completed / total_executions * 100) if total_executions > 0 else 0
+
+                durations = [e.duration_minutes for e in executions if e.duration_minutes and e.duration_minutes > 0]
+                avg_duration = sum(durations) / len(durations) if durations else 0
+                total_duration = sum(durations) if durations else 0
+                longest = max(durations) if durations else 0
+                shortest = min(durations) if durations else 0
+
+                ops_per_min = [e.operations_per_minute for e in executions if e.operations_per_minute and e.operations_per_minute > 0]
+                avg_ops_per_min = sum(ops_per_min) / len(ops_per_min) if ops_per_min else 0
+
+                threshold_reached = sum(1 for e in executions if e.threshold_reached)
+
+                cpu_values = []
+                memory_values = []
+                for e in executions:
+                    cv = _extract_cpu(e.final_metrics)
+                    mv = _extract_memory(e.final_metrics)
+                    if cv is not None:
+                        cpu_values.append(cv)
+                    if mv is not None:
+                        memory_values.append(mv)
+                avg_cpu = sum(cpu_values) / len(cpu_values) if cpu_values else 0
+                avg_memory = sum(memory_values) / len(memory_values) if memory_values else 0
+                peak_cpu = max(cpu_values) if cpu_values else 0
+                peak_memory = max(memory_values) if memory_values else 0
+
+                # Testbed breakdown
+                testbed_counts: Dict[str, int] = defaultdict(int)
                 for e in executions:
                     testbed_counts[e.testbed_id] += 1
-                
-                most_active_testbed = max(testbed_counts.items(), key=lambda x: x[1]) if testbed_counts else (None, 0)
-                
+                most_active = max(testbed_counts.items(), key=lambda x: x[1]) if testbed_counts else (None, 0)
+
+                # Entity / operation breakdown from operation_metrics
+                entity_breakdown = []
+                try:
+                    rows = session.execute(text("""
+                        SELECT entity_type, operation_type, COUNT(*) as cnt,
+                               SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as ok
+                        FROM operation_metrics
+                        WHERE started_at >= :s AND started_at <= :e
+                        GROUP BY entity_type, operation_type
+                        ORDER BY cnt DESC
+                        LIMIT 10
+                    """), {'s': start_date, 'e': end_date}).fetchall()
+                    for r in rows:
+                        entity_breakdown.append({
+                            'entity': r[0] or 'Unknown',
+                            'operation': r[1] or 'Unknown',
+                            'count': r[2],
+                            'success_rate': round(r[3] / r[2] * 100, 1) if r[2] > 0 else 0,
+                        })
+                except Exception:
+                    pass
+
+                # Status breakdown for donut
+                status_breakdown = []
+                status_map = defaultdict(int)
+                for e in executions:
+                    status_map[(e.status or 'UNKNOWN').upper()] += 1
+                for st, cnt in sorted(status_map.items(), key=lambda x: -x[1]):
+                    status_breakdown.append({'status': st, 'count': cnt})
+
                 # Generate insights
                 insights = []
-                
-                if success_rate >= 90:
-                    insights.append({
-                        'type': 'positive',
-                        'message': f'Excellent success rate of {success_rate:.1f}%',
-                        'icon': '✅'
-                    })
-                elif success_rate < 70:
-                    insights.append({
-                        'type': 'warning',
-                        'message': f'Success rate of {success_rate:.1f}% needs improvement',
-                        'icon': '⚠️'
-                    })
-                
-                if total_operations > 0:
-                    insights.append({
-                        'type': 'info',
-                        'message': f'{successful_operations:,} of {total_operations:,} operations succeeded ({success_rate:.1f}%)',
-                        'icon': 'check_circle'
-                    })
-                
-                if most_active_testbed[1] > total_executions * 0.5:
-                    insights.append({
-                        'type': 'info',
-                        'message': f'Testbed {most_active_testbed[0][:8]}... accounts for {most_active_testbed[1]/total_executions*100:.0f}% of executions',
-                        'icon': '📊'
-                    })
-                
+                if op_success_rate >= 90:
+                    insights.append({'type': 'positive', 'message': f'Excellent operation success rate of {op_success_rate:.1f}% across {total_operations:,} operations'})
+                elif op_success_rate >= 70:
+                    insights.append({'type': 'info', 'message': f'Operation success rate is {op_success_rate:.1f}% — {failed_operations:,} failures out of {total_operations:,} operations'})
+                elif op_success_rate > 0:
+                    insights.append({'type': 'warning', 'message': f'Operation success rate of {op_success_rate:.1f}% is below 70% — {failed_operations:,} failures need attention'})
+
+                if completed > 0:
+                    insights.append({'type': 'positive', 'message': f'{completed} of {total_executions} executions ran to completion ({exec_completion_rate:.0f}%)'})
+                if stopped > 0:
+                    insights.append({'type': 'info', 'message': f'{stopped} executions were manually stopped — consider extending timeouts or adjusting thresholds'})
+                if failed > 0:
+                    insights.append({'type': 'warning', 'message': f'{failed} executions failed or timed out — check connectivity and cluster health'})
+
+                if avg_duration > 0:
+                    insights.append({'type': 'info', 'message': f'Average execution duration: {avg_duration:.1f} minutes (shortest: {shortest:.1f}m, longest: {longest:.1f}m)'})
+                if threshold_reached > 0:
+                    insights.append({'type': 'positive', 'message': f'{threshold_reached} of {total_executions} executions reached the resource threshold target ({threshold_reached/total_executions*100:.0f}%)'})
+                if peak_cpu > 0:
+                    insights.append({'type': 'info' if peak_cpu < 90 else 'warning', 'message': f'Peak CPU utilization: {peak_cpu:.1f}% — Average: {avg_cpu:.1f}%'})
+                if peak_memory > 0:
+                    insights.append({'type': 'info' if peak_memory < 90 else 'warning', 'message': f'Peak memory utilization: {peak_memory:.1f}% — Average: {avg_memory:.1f}%'})
+
+                if most_active[0]:
+                    tb_name = _resolve_testbed_name(most_active[0])
+                    pct = most_active[1] / total_executions * 100 if total_executions else 0
+                    insights.append({'type': 'info', 'message': f'Most active testbed: {tb_name} with {most_active[1]} executions ({pct:.0f}%)'})
+
                 return {
                     'period': {
                         'start': start_date.isoformat(),
@@ -363,31 +442,63 @@ class AnalyticsService:
                     },
                     'key_metrics': {
                         'total_executions': total_executions,
-                        'success_rate': round(success_rate, 2),
+                        'completed_executions': completed,
+                        'failed_executions': failed,
+                        'stopped_executions': stopped,
+                        'success_rate': round(op_success_rate, 2),
+                        'completion_rate': round(exec_completion_rate, 2),
                         'total_operations': total_operations,
                         'successful_operations': successful_operations,
-                        'completed_executions': completed,
+                        'failed_operations': failed_operations,
                     },
+                    'performance': {
+                        'avg_duration_minutes': round(avg_duration, 2),
+                        'total_test_hours': round(total_duration / 60, 1),
+                        'avg_ops_per_minute': round(avg_ops_per_min, 2),
+                        'threshold_reached': threshold_reached,
+                        'longest_run_minutes': round(longest, 1),
+                        'shortest_run_minutes': round(shortest, 1),
+                    },
+                    'resource_utilization': {
+                        'avg_cpu_percent': round(avg_cpu, 2),
+                        'avg_memory_percent': round(avg_memory, 2),
+                        'peak_cpu_percent': round(peak_cpu, 2),
+                        'peak_memory_percent': round(peak_memory, 2),
+                    },
+                    'status_breakdown': status_breakdown,
+                    'entity_breakdown': entity_breakdown,
                     'insights': insights,
                     'most_active_testbed': {
-                        'testbed_id': most_active_testbed[0],
-                        'execution_count': most_active_testbed[1]
-                    } if most_active_testbed[0] else None
+                        'testbed_id': most_active[0],
+                        'testbed_name': _resolve_testbed_name(most_active[0]) if most_active[0] else None,
+                        'execution_count': most_active[1],
+                    } if most_active[0] else None,
+                    'testbed_summary': [
+                        {
+                            'testbed_id': tid,
+                            'testbed_name': _resolve_testbed_name(tid),
+                            'executions': cnt,
+                        }
+                        for tid, cnt in sorted(testbed_counts.items(), key=lambda x: -x[1])[:5]
+                    ],
                 }
-                
+
             finally:
                 session.close()
-                
+
         except Exception as e:
             logger.error(f"Error generating executive summary: {e}")
             return {}
     
-    def _empty_overview(self) -> Dict:
+    def _empty_overview(self, start_date=None, end_date=None) -> Dict:
         """Return empty overview structure"""
+        period = {}
+        if start_date and end_date:
+            period = {'start': start_date.isoformat(), 'end': end_date.isoformat(), 'days': (end_date - start_date).days}
         return {
-            'period': {},
-            'executions': {'total': 0, 'completed': 0, 'failed': 0, 'running': 0, 'success_rate': 0},
-            'operations': {'total': 0, 'successful': 0, 'success_rate': 0, 'avg_per_execution': 0},
+            'period': period,
+            'executions': {'total': 0, 'completed': 0, 'failed': 0, 'running': 0, 'stopped': 0, 'success_rate': 0, 'completion_rate': 0},
+            'operations': {'total': 0, 'successful': 0, 'failed': 0, 'success_rate': 0, 'avg_per_execution': 0},
             'performance': {'avg_duration_minutes': 0, 'avg_operations_per_minute': 0, 'threshold_achievement_rate': 0},
             'resource_utilization': {'avg_cpu_percent': 0, 'avg_memory_percent': 0}
         }
@@ -431,10 +542,10 @@ class AnalyticsService:
         elif metric == 'operations':
             return sum(e.total_operations or 0 for e in executions)
         elif metric == 'cpu':
-            values = [e.final_metrics.get('final_cpu', 0) for e in executions if e.final_metrics]
+            values = [v for v in (_extract_cpu(e.final_metrics) for e in executions) if v is not None]
             return sum(values) / len(values) if values else 0
         elif metric == 'memory':
-            values = [e.final_metrics.get('final_memory', 0) for e in executions if e.final_metrics]
+            values = [v for v in (_extract_memory(e.final_metrics) for e in executions) if v is not None]
             return sum(values) / len(values) if values else 0
         elif metric == 'success_rate':
             total_ops = sum(e.total_operations or 0 for e in executions)

@@ -103,19 +103,24 @@ const AnalyticsComparison: React.FC = () => {
 
   const label = (e: CompResult | Execution) => {
     const name = ('execution_name' in e ? e.execution_name : '') || '';
-    if (name) return name.length > 22 ? name.slice(0, 22) + '...' : name;
+    if (name) return name.length > 28 ? name.slice(0, 28) + '...' : name;
+    const tb = ('testbed_label' in e ? e.testbed_label : '') || '';
+    if (tb) return `${tb} (${e.execution_id.slice(-8)})`;
     return e.execution_id.slice(0, 20) + '...';
   };
 
   const shortLabel = (e: CompResult) => {
     const name = e.execution_name || '';
-    if (name) return name.length > 14 ? name.slice(0, 14) + '..' : name;
+    if (name) return name.length > 16 ? name.slice(0, 16) + '..' : name;
+    const tb = e.testbed_label || '';
+    if (tb) return tb.length > 12 ? `${tb.slice(0, 12)}..` : `${tb}-${e.execution_id.slice(-4)}`;
     return e.execution_id.slice(6, 20);
   };
 
   const statusBadge = (s: string) => {
+    const upper = (s || '').toUpperCase();
     const map: Record<string, string> = { COMPLETED: 'bg-success', STOPPED: 'bg-warning text-dark', FAILED: 'bg-danger', TIMEOUT: 'bg-secondary', THRESHOLD_REACHED: 'bg-primary' };
-    return <span className={`badge ${map[s] || 'bg-secondary'} rounded-pill`}>{s}</span>;
+    return <span className={`badge ${map[upper] || 'bg-secondary'} rounded-pill`}>{upper}</span>;
   };
 
   const bestId = (metric: keyof CompResult, mode: 'max' | 'min' = 'max') => {
