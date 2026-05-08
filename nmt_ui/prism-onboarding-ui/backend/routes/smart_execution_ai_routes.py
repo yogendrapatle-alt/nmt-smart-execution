@@ -174,11 +174,9 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
     - Stagnation detection: forces entity rotation when CPU/Memory aren't improving
     """
     import asyncio
+    import math
     from collections import defaultdict
     from services.smart_execution_service import SmartExecutionController
-
-    max_iterations = int(os.environ.get('AI_ENGINE_MAX_ITERATIONS', '2000'))
-    max_seconds = float(os.environ.get('AI_ENGINE_MAX_SECONDS', '7200'))
 
     BLACKLIST_THRESHOLD = 5          # Blacklist entity after N consecutive failures
     STAGNATION_WINDOW = 10           # Check last N iterations for stagnation
@@ -195,6 +193,58 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
     )
     max_ops_per_iter = max(user_ops_per_iter, 5)
     OPS_PER_ITER_CAP = 30  # absolute ceiling for adaptive increase
+
+    # ---- Time / iteration limits ----
+    # Honour the user's `timeout_minutes` from target_config (with `0` meaning
+    # "no limit — run until threshold reached or user clicks Stop").
+    # Longevity duration takes precedence when enabled.
+    # Env-var caps remain as last-resort safety nets when the user's value is
+    # missing entirely (None), so existing deployments don't change behaviour.
+    longevity = ai_engine.target_config.get('longevity', {}) or {}
+    longevity_enabled = bool(longevity.get('enabled'))
+    longevity_hours = float(longevity.get('duration_hours') or 0)
+
+    # Read user timeout from target_config (UI sends it here) or advanced block
+    raw_timeout = ai_engine.target_config.get('timeout_minutes')
+    if raw_timeout is None:
+        raw_timeout = adv.get('timeout_minutes')
+
+    if longevity_enabled and longevity_hours > 0:
+        # Longevity wins — user explicitly asked for an N-hour endurance run.
+        max_seconds = longevity_hours * 3600.0
+        max_iterations = max(2000, int(max_seconds / 2))
+        logger.info(
+            f"⏱️  AI loop time budget: longevity {longevity_hours:.2f}h "
+            f"= {max_seconds:.0f}s / {max_iterations} iters"
+        )
+    elif raw_timeout is None:
+        # No user value at all — fall back to env-var safety nets (legacy).
+        max_iterations = int(os.environ.get('AI_ENGINE_MAX_ITERATIONS', '2000'))
+        max_seconds = float(os.environ.get('AI_ENGINE_MAX_SECONDS', '7200'))
+        logger.info(
+            f"⏱️  AI loop time budget: defaults {max_seconds:.0f}s / {max_iterations} iters "
+            f"(no user timeout_minutes provided)"
+        )
+    else:
+        try:
+            user_timeout_min = float(raw_timeout)
+        except (TypeError, ValueError):
+            user_timeout_min = 0.0
+        if user_timeout_min <= 0:
+            # User explicitly chose "no limit" — keep running until threshold
+            # reached, sustain complete, or emergency stop.
+            max_seconds = math.inf
+            max_iterations = 10 ** 9
+            logger.info("⏱️  AI loop time budget: UNLIMITED (user set timeout_minutes=0)")
+        else:
+            max_seconds = user_timeout_min * 60.0
+            # Allow ample iteration headroom: ~1 iter per 2 seconds plus a
+            # generous buffer so we never hit the iter cap before the time cap.
+            max_iterations = max(2000, int(max_seconds / 2) + 500)
+            logger.info(
+                f"⏱️  AI loop time budget: user timeout {user_timeout_min:.1f}min "
+                f"= {max_seconds:.0f}s / {max_iterations} iters"
+            )
 
     # Heavy operations that actually generate cluster load (CPU/Memory impact)
     LOAD_GENERATING_OPS = [
@@ -222,12 +272,29 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
                 entity_ops.append((entity, op))
         logger.warning(f"⚠️ Populated entity_ops from defaults: {len(entity_ops)} pairs")
 
-    # Separate load-generating ops from the full list for stagnation recovery
-    load_gen_ops = [eo for eo in entity_ops if eo in LOAD_GENERATING_OPS]
+    # Strict whitelist of (entity, operation) pairs the user actually selected.
+    # Every ML recommendation, diversity injection, stagnation escalation, and
+    # fallback path MUST intersect with this set — otherwise we end up running
+    # operations the user never asked for (e.g. CREATE/CLONE when only LIST
+    # was selected). The set is canonicalised with operation upper-cased to
+    # match how _execute_single_operation normalises ops downstream.
+    allowed_ops_set = {(e, str(o).upper()) for e, o in entity_ops}
+    logger.info(
+        f"🔒 User-selected (entity, operation) pairs: {len(allowed_ops_set)} "
+        f"(sample: {list(allowed_ops_set)[:5]})"
+    )
+
+    # Separate load-generating ops from the full list for stagnation recovery,
+    # but ONLY from the user's selection — never inject ops the user didn't pick.
+    load_gen_ops = [eo for eo in entity_ops if (eo[0], str(eo[1]).upper()) in
+                    {(e, o) for e, o in LOAD_GENERATING_OPS}]
     if not load_gen_ops:
-        load_gen_ops = [(e, o) for e, o in entity_ops if o in ('CREATE', 'EXECUTE')]
+        load_gen_ops = [(e, o) for e, o in entity_ops if str(o).upper() in ('CREATE', 'EXECUTE')]
     if not load_gen_ops:
         load_gen_ops = entity_ops[:5]
+    if not load_gen_ops:
+        # Last resort — should never happen if entity_ops was built correctly
+        logger.warning("⚠️ No load-generating ops in user selection; will use first selected op for stagnation escalation")
 
     # --- Adaptive tracking state ---
     entity_stats: Dict[str, Dict] = defaultdict(lambda: {'attempts': 0, 'successes': 0, 'consecutive_fails': 0})
@@ -434,7 +501,21 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
             ml_ops = action.get('recommended_operations') or []
 
             if ml_ops:
-                ml_ops = [r for r in ml_ops if r.get('entity_type', '') not in blacklisted_entities]
+                # CRITICAL: filter ML recommendations against user's selection.
+                # The ML model is trained on global history and recommends from
+                # KNOWN_ENTITIES × KNOWN_OPERATIONS — we must drop any pair the
+                # user did not explicitly opt into, otherwise we silently
+                # execute CREATE/CLONE/etc. when only LIST was selected.
+                ml_ops_before = len(ml_ops)
+                ml_ops = [
+                    r for r in ml_ops
+                    if r.get('entity_type', '') not in blacklisted_entities
+                    and (r.get('entity_type', ''), str(r.get('operation', '')).upper()) in allowed_ops_set
+                ]
+                if ml_ops_before and not ml_ops:
+                    logger.debug(
+                        f"All {ml_ops_before} ML recommendations dropped — none matched user's selection"
+                    )
 
                 ml_entity_types = set(r.get('entity_type', '') for r in ml_ops)
                 if len(ml_entity_types) <= 1 and ml_ops:
@@ -446,9 +527,9 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
 
                     elif i >= DIVERSITY_WINDOW:
                         diverse_inject = []
+                        # Only inject ops the user actually selected.
                         available = [(e, o) for e, o in entity_ops
-                                     if e != stuck_type and e not in blacklisted_entities
-                                     and o in ('CREATE', 'EXECUTE', 'LIST')]
+                                     if e != stuck_type and e not in blacklisted_entities]
                         if available:
                             inject_count = min(desired_ops // 3, len(available))
                             for j in range(inject_count):
@@ -470,6 +551,31 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
                     if et in blacklisted_entities:
                         continue
                     ops_to_run.append({'entity_type': et, 'operation': op})
+
+        # Final whitelist guard — drop anything that, despite all the upstream
+        # filters, is not in the user's selected (entity, operation) pairs.
+        # This is defence in depth so future code paths can't silently widen
+        # the executed op set.
+        before_ct = len(ops_to_run)
+        ops_to_run = [
+            r for r in ops_to_run
+            if (r.get('entity_type', ''), str(r.get('operation', '')).upper()) in allowed_ops_set
+        ]
+        dropped = before_ct - len(ops_to_run)
+        if dropped:
+            logger.warning(
+                f"🛡️  Dropped {dropped} ops not in user's selection (kept {len(ops_to_run)})"
+            )
+
+        # If the whitelist guard drained the list, fall back to a round-robin
+        # over the user's selected pairs so the iteration still does useful work.
+        if not ops_to_run and entity_ops:
+            for _ in range(desired_ops):
+                et_fb, op_fb = entity_ops[op_index % len(entity_ops)]
+                op_index += 1
+                if et_fb in blacklisted_entities:
+                    continue
+                ops_to_run.append({'entity_type': et_fb, 'operation': op_fb})
 
         # --- Execute operations (adaptive count, not hard-capped) ---
         iter_entity_types = set()
@@ -1185,6 +1291,201 @@ def get_available_pods():
             
     except Exception as e:
         logger.exception("Error getting available pods")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@smart_execution_ai_bp.route('/api/smart-execution/available-nodes', methods=['POST'])
+def get_available_nodes():
+    """Return the list of node ``instance`` labels visible to this testbed's
+    Prometheus, so the rule editor can offer a Node-scope dropdown.
+
+    Request: ``{"testbed_id": "..."}``
+    Response: ``{"success": true, "nodes": ["10.x.x.x:9100", ...], "count": N}``
+
+    Falls back to an empty list if Prometheus is unreachable so the UI can
+    still render a free-form input.
+    """
+    try:
+        import requests
+        from database import SessionLocal
+        from models.testbed import Testbed
+
+        data = request.get_json() or {}
+        testbed_id = data.get('testbed_id')
+        if not testbed_id:
+            return jsonify({'success': False, 'error': 'testbed_id required'}), 400
+
+        session = SessionLocal()
+        try:
+            testbed = session.query(Testbed).filter(
+                Testbed.unique_testbed_id == testbed_id
+            ).first()
+            if not testbed:
+                return jsonify({'success': False, 'error': 'Testbed not found'}), 404
+
+            raw = testbed.testbed_json or {}
+            if isinstance(raw, str):
+                import json as _json
+                try:
+                    testbed_json = _json.loads(raw)
+                except (ValueError, TypeError):
+                    testbed_json = {}
+            else:
+                testbed_json = raw
+            prometheus_url = (
+                testbed_json.get('prometheus_url')
+                or testbed_json.get('prometheus_endpoint')
+            )
+            if not prometheus_url:
+                return jsonify({'success': True, 'nodes': [], 'count': 0,
+                                'note': 'Prometheus URL not configured for this testbed'})
+
+            try:
+                resp = requests.get(
+                    f"{prometheus_url}/api/v1/query",
+                    params={'query': 'count by(instance)(node_cpu_seconds_total{mode="idle"})'},
+                    verify=False, timeout=8,
+                )
+                if resp.status_code != 200:
+                    return jsonify({'success': True, 'nodes': [], 'count': 0,
+                                    'note': f'Prometheus returned HTTP {resp.status_code}'})
+                pdata = resp.json()
+                if pdata.get('status') != 'success':
+                    return jsonify({'success': True, 'nodes': [], 'count': 0,
+                                    'note': 'Prometheus query failed'})
+                nodes = []
+                for r in pdata.get('data', {}).get('result', []):
+                    inst = (r.get('metric') or {}).get('instance')
+                    if inst:
+                        nodes.append(inst)
+                # De-dupe + stable order
+                nodes = sorted(set(nodes))
+                return jsonify({'success': True, 'nodes': nodes, 'count': len(nodes)})
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                logger.warning(f"available-nodes: Prometheus not reachable: {e}")
+                return jsonify({'success': True, 'nodes': [], 'count': 0,
+                                'note': f'Prometheus not reachable: {e}'})
+        finally:
+            session.close()
+    except Exception as e:
+        logger.exception("Error getting available nodes")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@smart_execution_ai_bp.route('/api/smart-execution/test-rule-query', methods=['POST'])
+def test_rule_query():
+    """Run a single PromQL probe against a testbed's Prometheus and return the
+    series count + max value. Used by the rule editor's "Test query" button so
+    users can validate a query before saving the rule.
+
+    Request body::
+
+        {
+            "testbed_id": "...",
+            "query": "PodCPUUsage" | "container_cpu_usage_seconds_total{...}",
+            "query_mode": "quick" | "raw",     # optional, default raw
+            "scope": "pod" | "node" | "cluster", # optional
+            "namespace": "ns" | None,
+            "pod_names": ["a", "b"] | None,
+            "node_instance": "10.x.x.x" | None
+        }
+
+    Response::
+
+        { "success": true, "series_count": N, "max_value": V, "resolved_query": "...",
+          "samples": [{ "labels": {...}, "value": V }, ... up to 5] }
+    """
+    try:
+        import requests
+        from database import SessionLocal
+        from models.testbed import Testbed
+        from services.smart_execution_service import SmartExecutionController
+
+        data = request.get_json() or {}
+        testbed_id = data.get('testbed_id')
+        if not testbed_id:
+            return jsonify({'success': False, 'error': 'testbed_id required'}), 400
+        raw_query = (data.get('query') or '').strip()
+        if not raw_query:
+            return jsonify({'success': False, 'error': 'query required'}), 400
+
+        session = SessionLocal()
+        try:
+            testbed = session.query(Testbed).filter(
+                Testbed.unique_testbed_id == testbed_id
+            ).first()
+            if not testbed:
+                return jsonify({'success': False, 'error': 'Testbed not found'}), 404
+            tb_json = testbed.testbed_json or {}
+            if isinstance(tb_json, str):
+                import json as _json
+                try: tb_json = _json.loads(tb_json)
+                except (ValueError, TypeError): tb_json = {}
+            prom_url = tb_json.get('prometheus_url') or tb_json.get('prometheus_endpoint')
+            if not prom_url:
+                return jsonify({'success': False, 'error': 'Prometheus URL not configured for this testbed'}), 200
+
+            # Resolve via the same path the evaluator uses, so the user sees
+            # exactly what would run at evaluation time.
+            ctrl = SmartExecutionController.__new__(SmartExecutionController)
+            cond = {
+                'scope': data.get('scope'),
+                'query': raw_query,
+                'operator': '>', 'threshold': 0,
+                'namespace': data.get('namespace'),
+                'pod_names': data.get('pod_names') or data.get('podNames'),
+                'pod_name': data.get('pod_name') or data.get('podName'),
+                'node_instance': data.get('node_instance') or data.get('nodeInstance'),
+            }
+            resolved = ctrl._resolve_condition(cond)
+            prom_query = resolved['prom_query']
+
+            try:
+                resp = requests.get(
+                    f"{prom_url}/api/v1/query",
+                    params={'query': prom_query}, verify=False, timeout=8,
+                )
+                if resp.status_code != 200:
+                    return jsonify({'success': False,
+                                    'error': f'Prometheus HTTP {resp.status_code}',
+                                    'resolved_query': prom_query}), 200
+                pdata = resp.json()
+                if pdata.get('status') != 'success':
+                    return jsonify({'success': False,
+                                    'error': pdata.get('error') or 'Prometheus query failed',
+                                    'resolved_query': prom_query}), 200
+                results = pdata.get('data', {}).get('result', []) or []
+                samples, max_v = [], None
+                for r in results[:5]:
+                    try:
+                        v = float(r.get('value', [0, 0])[1])
+                    except (TypeError, ValueError, IndexError):
+                        v = None
+                    if v is not None:
+                        max_v = v if max_v is None else max(max_v, v)
+                    samples.append({'labels': r.get('metric', {}), 'value': v})
+                # Continue scanning for max past the first 5
+                for r in results[5:]:
+                    try:
+                        v = float(r.get('value', [0, 0])[1])
+                        max_v = v if max_v is None else max(max_v, v)
+                    except (TypeError, ValueError, IndexError):
+                        pass
+                return jsonify({
+                    'success': True,
+                    'series_count': len(results),
+                    'max_value': round(max_v, 4) if max_v is not None else None,
+                    'resolved_query': prom_query,
+                    'samples': samples,
+                })
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                return jsonify({'success': False,
+                                'error': f'Prometheus not reachable: {e}',
+                                'resolved_query': prom_query}), 200
+        finally:
+            session.close()
+    except Exception as e:
+        logger.exception("Error testing rule query")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

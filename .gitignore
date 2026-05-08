@@ -38,6 +38,13 @@ nohup.out
 .idea/
 *.swp
 *.swo
+
+# Local reference / backup snapshots (large, not for upstream)
+nmt_old_backup/
+
+# Test/playwright artifacts
+playwright-report/
+test-results/
 *~
 
 # Database

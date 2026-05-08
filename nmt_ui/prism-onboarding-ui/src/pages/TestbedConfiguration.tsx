@@ -144,20 +144,6 @@ const TestbedConfiguration: React.FC = () => {
 
   return (
     <div className="main-content">
-      {/* Breadcrumb */}
-      <div className="d-flex align-items-center mb-4">
-        <nav aria-label="breadcrumb">
-          <ol className="breadcrumb mb-0">
-            <li className="breadcrumb-item">
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/dashboard'); }}>
-                <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle' }}>home</i>
-              </a>
-            </li>
-            <li className="breadcrumb-item active">Deploy New Testbed</li>
-          </ol>
-        </nav>
-      </div>
-
       <div className="container-fluid">
         <div className="row justify-content-center">
           <div className="col-12 col-xl-10">

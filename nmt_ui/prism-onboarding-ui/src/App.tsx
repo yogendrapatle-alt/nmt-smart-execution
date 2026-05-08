@@ -8,15 +8,13 @@ import { ToastProvider } from './context/ToastContext';
 const Onboarding = React.lazy(() => import('./components/Onboarding'));
 const OnboardingExperimental = React.lazy(() => import('./components/OnboardingExperimental'));
 const MyTestbeds = React.lazy(() => import('./pages/MyTestbeds'));
-const DeployNew = React.lazy(() => import('./pages/DeployNew'));
+
 const RuleBuilderExperimental = React.lazy(() => import('./components/RuleBuilderExperimental'));
 const EnvironmentSelect = React.lazy(() => import('./pages/TestbedConfiguration'));
 const RuleBuilder = React.lazy(() => import('./components/RuleBuilder'));
 const AlertSummary = React.lazy(() => import('./components/AlertSummary'));
-const DynamicWorkload = React.lazy(() => import('./pages/DynamicWorkload'));
 const Status = React.lazy(() => import('./pages/Status'));
-const RuleConfigManager = React.lazy(() => import('./pages/RuleConfigManager'));
-const ExecutionWorkloadManager = React.lazy(() => import('./pages/ExecutionWorkloadManager'));
+
 const TestbedTimeline = React.lazy(() => import('./pages/TestbedTimeline'));
 const TestbedActivity = React.lazy(() => import('./pages/TestbedActivity'));
 const ExecutionReport = React.lazy(() => import('./pages/ExecutionReport'));
@@ -26,6 +24,10 @@ const SmartExecutionConfigureAI = React.lazy(() => import('./pages/SmartExecutio
 const SmartExecutionMonitorAI = React.lazy(() => import('./pages/SmartExecutionMonitorAI'));
 const MLInsights = React.lazy(() => import('./pages/MLInsights'));
 const ScheduledExecutions = React.lazy(() => import('./pages/ScheduledExecutions'));
+const MonitorOnlyConfigure = React.lazy(() => import('./pages/MonitorOnlyConfigure'));
+const MonitorOnlyRun = React.lazy(() => import('./pages/MonitorOnlyRun'));
+const MonitorOnlySessions = React.lazy(() => import('./pages/MonitorOnlySessions'));
+const MonitorOnlyReport = React.lazy(() => import('./pages/MonitorOnlyReport'));
 const AlertConfiguration = React.lazy(() => import('./pages/AlertConfiguration'));
 const MultiTestbedConfigure = React.lazy(() => import('./pages/MultiTestbedConfigure'));
 const MultiTestbedMonitor = React.lazy(() => import('./pages/MultiTestbedMonitor'));
@@ -59,7 +61,6 @@ const App: React.FC = () => {
         <Route path="/dashboard" element={<Layout><DashboardHome /></Layout>} />
 
         {/* Testbed setup */}
-        <Route path="/deploy-new" element={<Layout><DeployNew /></Layout>} />
         <Route path="/onboarding" element={<Layout><Onboarding onSubmit={() => { setOnboarded(true); setIsAuthenticated(true); }} /></Layout>} />
         <Route path="/onboarding-experimental" element={
           <Layout><OnboardingExperimental onSubmit={() => { setOnboarded(true); setIsAuthenticated(true); }} /></Layout>
@@ -79,10 +80,6 @@ const App: React.FC = () => {
         <Route path="/alert-summary" element={<Layout><AlertSummary /></Layout>} />
         <Route path="/alert-configuration" element={<Layout><AlertConfiguration /></Layout>} />
 
-        {/* Workloads */}
-        <Route path="/dynamic-workload" element={<Layout><DynamicWorkload /></Layout>} />
-        <Route path="/execution-workload-manager" element={<Layout><ExecutionWorkloadManager /></Layout>} />
-
         {/* Smart Execution */}
         <Route path="/smart-execution" element={<Layout><SmartExecutionConfigureAI /></Layout>} />
         <Route path="/smart-execution/configure" element={<Layout><SmartExecutionConfigureAI /></Layout>} />
@@ -91,6 +88,13 @@ const App: React.FC = () => {
         <Route path="/smart-execution/report/:executionId" element={<Layout><SmartExecutionReport /></Layout>} />
         <Route path="/ml-insights" element={<Layout><MLInsights /></Layout>} />
         <Route path="/scheduled-executions" element={<Layout><ScheduledExecutions /></Layout>} />
+
+        {/* Monitor-Only Testbed (no workload) */}
+        <Route path="/monitor-only" element={<Layout><MonitorOnlyConfigure /></Layout>} />
+        <Route path="/monitor-only/configure" element={<Layout><MonitorOnlyConfigure /></Layout>} />
+        <Route path="/monitor-only/sessions" element={<Layout><MonitorOnlySessions /></Layout>} />
+        <Route path="/monitor-only/run/:monitorId" element={<Layout><MonitorOnlyRun /></Layout>} />
+        <Route path="/monitor-only/report/:monitorId" element={<Layout><MonitorOnlyReport /></Layout>} />
 
         {/* Multi-Testbed */}
         <Route path="/multi-testbed/configure" element={<Layout><MultiTestbedConfigure /></Layout>} />

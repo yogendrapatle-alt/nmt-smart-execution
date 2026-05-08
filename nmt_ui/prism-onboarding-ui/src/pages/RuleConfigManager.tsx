@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
 import RuleBuilderExperimental from '../components/RuleBuilderExperimental';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeRulesByTestbed } from '../fake-data';
@@ -24,8 +23,6 @@ interface Rule {
 }
 
 const RuleConfigManager: React.FC = () => {
-  const navigate = useNavigate();
-  
   // State
   const [testbeds, setTestbeds] = useState<Testbed[]>([]);
   const [selectedTestbed, setSelectedTestbed] = useState<string>('');
@@ -353,20 +350,6 @@ const RuleConfigManager: React.FC = () => {
 
   return (
     <div className="main-content">
-      {/* Breadcrumb */}
-      <div className="d-flex align-items-center justify-content-between mb-4">
-        <nav aria-label="breadcrumb">
-          <ol className="breadcrumb mb-0">
-            <li className="breadcrumb-item">
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/dashboard'); }}>
-                <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle' }}>home</i>
-              </a>
-            </li>
-            <li className="breadcrumb-item active">Rule & Config Manager</li>
-          </ol>
-        </nav>
-      </div>
-
       {/* Page Title */}
       <div className="mb-4">
         <h1 className="h3 mb-2 text-gray-800">

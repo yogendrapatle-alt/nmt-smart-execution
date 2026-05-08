@@ -6802,7 +6802,10 @@ class SmartExecutionController:
         return None
     
     # ── Monitoring Rule Evaluation ─────────────────────────────────────
+    # NOTE: keys with (pod, namespace) labels are pod-scoped; queries with
+    # `by (instance)` are node-scoped; bare aggregates are cluster-scoped.
     QUERY_NAME_TO_PROMETHEUS = {
+        # Pod / container
         'PodCPUUsage': 'sum(rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (pod, namespace) * 100',
         'PodMemoryUsage': 'sum(container_memory_working_set_bytes{container!="POD",container!=""}) by (pod, namespace) / 1024 / 1024 / 1024',
         'PodRestarts': 'sum(kube_pod_container_status_restarts_total) by (pod, namespace)',
@@ -6813,20 +6816,91 @@ class SmartExecutionController:
         'CHMemoryUsage': 'sum(container_memory_working_set_bytes{container=~"cluster_health.*"}) / 1024 / 1024 / 1024',
         'IDFCPUUsage': 'sum(rate(container_cpu_usage_seconds_total{container=~"idf.*|insights.*"}[5m])) * 100',
         'IDFMemoryUsage': 'sum(container_memory_working_set_bytes{container=~"idf.*|insights.*"}) / 1024 / 1024 / 1024',
+        # Node-scoped (Phase-2)
+        'NodeCPUUsage': '100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100)',
+        'NodeMemoryUsage': '(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100',
+        'NodeDiskUsage': '(node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_avail_bytes{mountpoint="/"}) / node_filesystem_size_bytes{mountpoint="/"} * 100',
+        'NodeLoadAvg5m': 'node_load5',
+        # Cluster-scoped (Phase-2) — single scalar aggregates
+        'ClusterAvgCPU': 'avg(100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100))',
+        'ClusterAvgMemory': 'avg((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100)',
+        'ClusterMaxCPU': 'max(100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100))',
+        'ClusterMaxMemory': 'max((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100)',
+    }
+
+    # Categorise templates by scope so the Phase-1/2 evaluator can pick the right
+    # label injection (pod vs instance) without the UI having to send `scope`.
+    POD_SCOPED_QUERIES = {
+        'PodCPUUsage', 'PodMemoryUsage', 'PodRestarts', 'ContainerRestarts',
+        'ContainerCPUThrottling', 'HighCPUThrottling',
+        'CHCPUUsage', 'CHMemoryUsage', 'IDFCPUUsage', 'IDFMemoryUsage',
+    }
+    NODE_SCOPED_QUERIES = {
+        'NodeCPUUsage', 'NodeMemoryUsage', 'NodeDiskUsage', 'NodeLoadAvg5m',
+    }
+    CLUSTER_SCOPED_QUERIES = {
+        'ClusterAvgCPU', 'ClusterAvgMemory', 'ClusterMaxCPU', 'ClusterMaxMemory',
     }
 
     @staticmethod
-    def _inject_label_filters(prom_query: str, namespace: str = None, pod_name: str = None) -> str:
-        """Inject namespace and/or pod label selectors into a PromQL expression."""
-        if not namespace and not pod_name:
+    def _inject_label_filters(
+        prom_query: str,
+        namespace=None,
+        pod_name=None,
+        node_instance=None,
+    ) -> str:
+        """Inject namespace / pod / node-instance label selectors into a PromQL expression.
+
+        Each parameter accepts either a single string OR a list of strings:
+
+        - ``namespace`` (single)         → ``namespace="x"``
+        - ``namespace`` (list, len > 1)  → ``namespace=~"^(x|y|z)$"``
+        - ``pod_name``  (single)         → ``pod=~".*x.*"``
+        - ``pod_name``  (list, len > 1)  → ``pod=~".*(x|y).*"``
+        - ``node_instance`` (single)     → ``instance=~".*x.*"``
+        - ``node_instance`` (list, > 1)  → ``instance=~".*(x|y).*"``
+
+        Singletons may also be passed as a one-element list — the result is the
+        same as passing the string directly.
+        """
+        # Normalize each arg to a clean list[str]
+        def _norm(v):
+            if v is None:
+                return []
+            if isinstance(v, (list, tuple, set)):
+                return [str(x).strip() for x in v if x is not None and str(x).strip()]
+            return [str(v).strip()] if str(v).strip() else []
+
+        ns_list = _norm(namespace)
+        pod_list = _norm(pod_name)
+        node_list = _norm(node_instance)
+
+        if not ns_list and not pod_list and not node_list:
             return prom_query
 
         import re
         extra_labels = []
-        if namespace:
-            extra_labels.append(f'namespace="{namespace}"')
-        if pod_name:
-            extra_labels.append(f'pod=~".*{re.escape(pod_name)}.*"')
+
+        # Namespace: exact match (single) or alternation regex (multi)
+        if len(ns_list) == 1:
+            extra_labels.append(f'namespace="{ns_list[0]}"')
+        elif len(ns_list) > 1:
+            joined = '|'.join(re.escape(n) for n in ns_list)
+            extra_labels.append(f'namespace=~"^({joined})$"')
+
+        # Pod: substring regex (single) or alternation substring (multi)
+        if len(pod_list) == 1:
+            extra_labels.append(f'pod=~".*{re.escape(pod_list[0])}.*"')
+        elif len(pod_list) > 1:
+            joined = '|'.join(re.escape(p) for p in pod_list)
+            extra_labels.append(f'pod=~".*({joined}).*"')
+
+        # Node: substring regex (single) or alternation substring (multi)
+        if len(node_list) == 1:
+            extra_labels.append(f'instance=~".*{re.escape(node_list[0])}.*"')
+        elif len(node_list) > 1:
+            joined = '|'.join(re.escape(n) for n in node_list)
+            extra_labels.append(f'instance=~".*({joined}).*"')
 
         snippet = ','.join(extra_labels)
 
@@ -6850,8 +6924,96 @@ class SmartExecutionController:
 
         return result
 
+    @staticmethod
+    def _compare(value: float, operator: str, threshold: float) -> bool:
+        """Apply a comparison operator. Unknown operators default to ``>``."""
+        if operator == '>': return value > threshold
+        if operator == '<': return value < threshold
+        if operator == '>=': return value >= threshold
+        if operator == '<=': return value <= threshold
+        if operator == '==': return value == threshold
+        if operator == '!=': return value != threshold
+        return value > threshold
+
+    def _resolve_condition(self, cond: Dict) -> Dict:
+        """Resolve a single condition spec into a runnable PromQL + comparison.
+
+        Returns ``{ 'prom_query', 'operator', 'threshold', 'scope_label', 'raw_query' }``.
+        """
+        scope = (cond.get('scope') or '').lower()
+        raw = cond.get('query') or ''
+        operator = cond.get('operator', '>')
+        threshold = float(cond.get('threshold', 0))
+
+        # Auto-detect scope from named template if user/UI didn't set one
+        if not scope:
+            if raw in self.NODE_SCOPED_QUERIES:
+                scope = 'node'
+            elif raw in self.CLUSTER_SCOPED_QUERIES:
+                scope = 'cluster'
+            else:
+                scope = 'pod'
+
+        prom_query = self.QUERY_NAME_TO_PROMETHEUS.get(raw, raw)
+
+        # Collect target filters — each can be single (legacy) or list (modern multi-select)
+        ns_v = cond.get('namespaces') or cond.get('namespace_list') or cond.get('namespace')
+        pod_v = (cond.get('pod_names') or cond.get('podNames')
+                 or cond.get('pod_name') or cond.get('podName'))
+        node_v = (cond.get('node_instances') or cond.get('nodeInstances')
+                  or cond.get('node_instance') or cond.get('nodeInstance'))
+
+        if scope == 'pod':
+            prom_query = self._inject_label_filters(
+                prom_query, namespace=ns_v, pod_name=pod_v,
+            )
+        elif scope == 'node':
+            prom_query = self._inject_label_filters(prom_query, node_instance=node_v)
+        # cluster: no label injection — aggregates are already cluster-wide
+
+        # Build a short label like " ns=xxx pod=yyy" / " node=zzz" for logs
+        def _fmt(v):
+            if v is None:
+                return None
+            if isinstance(v, (list, tuple)):
+                if not v:
+                    return None
+                return ','.join(str(x) for x in v)
+            return str(v)
+
+        scope_label = ''
+        ns_lbl = _fmt(ns_v)
+        if ns_lbl:
+            scope_label += f' ns={ns_lbl}'
+        pod_lbl = _fmt(pod_v)
+        if pod_lbl:
+            scope_label += f' pod={pod_lbl}'
+        node_lbl = _fmt(node_v)
+        if node_lbl:
+            scope_label += f' node={node_lbl}'
+        if scope == 'cluster':
+            scope_label += ' [cluster]'
+
+        return {
+            'prom_query': prom_query,
+            'operator': operator,
+            'threshold': threshold,
+            'scope_label': scope_label,
+            'raw_query': raw,
+            'scope': scope,
+        }
+
     async def _evaluate_monitoring_rules(self, iteration: int):
-        """Evaluate user-configured monitoring rules against live Prometheus data."""
+        """Evaluate user-configured monitoring rules against live Prometheus data.
+
+        Supports two rule shapes (both back-compat):
+
+        1. **Simple** — single condition fields directly on the rule:
+           ``{ name, query, operator, threshold, namespace?, pod_name?, scope?, node_instance? }``
+        2. **Composite (Phase-3)** — ``conditions: [c1, c2, …]`` joined by
+           ``logical_operator``/``logicalOperator`` (``AND`` or ``OR``). Each ``cN``
+           has the same fields as a Simple rule (minus ``name``/``severity``).
+        """
         if not self.monitoring_rules or not self.prometheus_url:
             return
 
@@ -6860,89 +7022,131 @@ class SmartExecutionController:
         for rule in self.monitoring_rules:
             rule_id = rule.get('id', 'unknown')
             rule_name = rule.get('name', 'Unnamed Rule')
-            query_key = rule.get('query', '')
-            operator = rule.get('operator', '>')
-            threshold = float(rule.get('threshold', 0))
             severity = rule.get('severity', 'Moderate')
             description = rule.get('description', '')
-            rule_namespace = rule.get('namespace') or None
-            rule_pod_name = rule.get('pod_name') or None
 
             # Cooldown: don't re-alert for the same rule within 60 seconds
             last_fired = self._rule_cooldowns.get(rule_id, 0)
             if now_ts - last_fired < 60:
                 continue
 
-            # Resolve query name to Prometheus expression, or use as-is if custom
-            prom_query = self.QUERY_NAME_TO_PROMETHEUS.get(query_key, query_key)
-            if not prom_query:
-                continue
+            # ── Decide rule shape ──────────────────────────────────────
+            conditions = rule.get('conditions') or []
+            is_composite = isinstance(conditions, list) and len(conditions) > 0
+            logical_op = (rule.get('logical_operator') or rule.get('logicalOperator') or 'AND').upper()
 
-            # Inject namespace/pod label filters into the PromQL query
-            prom_query = self._inject_label_filters(prom_query, rule_namespace, rule_pod_name)
+            if not is_composite:
+                # Promote the legacy simple-rule fields into a single condition
+                # so we have one evaluator code-path below. We forward both
+                # single (back-compat) and multi-value array fields so
+                # _resolve_condition can pick whichever the UI sent.
+                conditions = [{
+                    'scope': rule.get('scope'),
+                    'query': rule.get('query', ''),
+                    'operator': rule.get('operator', '>'),
+                    'threshold': rule.get('threshold', 0),
+                    'namespace': rule.get('namespace'),
+                    'namespaces': rule.get('namespaces'),
+                    'pod_name': rule.get('pod_name') or rule.get('podName'),
+                    'pod_names': rule.get('pod_names') or rule.get('podNames'),
+                    'node_instance': rule.get('node_instance') or rule.get('nodeInstance'),
+                    'node_instances': rule.get('node_instances') or rule.get('nodeInstances'),
+                }]
 
-            scope_label = ''
-            if rule_namespace:
-                scope_label += f' ns={rule_namespace}'
-            if rule_pod_name:
-                scope_label += f' pod={rule_pod_name}'
-
+            # ── Evaluate each condition ────────────────────────────────
+            condition_results = []  # list of dicts with violated/value/details
             try:
-                value = await self._query_prometheus(prom_query)
-                if value is None:
+                for cond in conditions:
+                    resolved = self._resolve_condition(cond)
+                    prom_query = resolved['prom_query']
+                    if not prom_query:
+                        condition_results.append({
+                            **resolved, 'value': None, 'violated': False, 'error': 'empty_query',
+                        })
+                        continue
+                    value = await self._query_prometheus(prom_query)
+                    if value is None:
+                        condition_results.append({
+                            **resolved, 'value': None, 'violated': False, 'error': 'no_data',
+                        })
+                        continue
+                    violated = self._compare(value, resolved['operator'], resolved['threshold'])
+                    condition_results.append({
+                        **resolved, 'value': float(value), 'violated': bool(violated), 'error': None,
+                    })
+
+                # Combine via logical operator. Conditions with `error` count as
+                # not-violated (False) so a single Prometheus blip doesn't over-fire.
+                violated_flags = [c['violated'] for c in condition_results]
+                if not violated_flags:
+                    rule_violated = False
+                elif logical_op == 'OR':
+                    rule_violated = any(violated_flags)
+                else:
+                    # Treat AND with all-data-missing conditions as not violated
+                    rule_violated = all(violated_flags) and any(c['error'] is None for c in condition_results)
+
+                if not rule_violated:
                     continue
 
-                violated = False
-                if operator == '>' and value > threshold:
-                    violated = True
-                elif operator == '<' and value < threshold:
-                    violated = True
-                elif operator == '>=' and value >= threshold:
-                    violated = True
-                elif operator == '<=' and value <= threshold:
-                    violated = True
-                elif operator == '==' and value == threshold:
-                    violated = True
-                elif operator == '!=' and value != threshold:
-                    violated = True
+                # ── Build the violation payload ────────────────────────
+                self._rule_cooldowns[rule_id] = now_ts
+                # For back-compat, top-level "actual_value"/"prom_query" come
+                # from the FIRST condition (or first violated condition).
+                primary = next((c for c in condition_results if c['violated']), condition_results[0])
+                joined_label = ' / '.join(
+                    f"{c['raw_query']}{c['scope_label']}={c['value']}"
+                    for c in condition_results if c['value'] is not None
+                ) if is_composite else ''
 
-                if violated:
-                    self._rule_cooldowns[rule_id] = now_ts
-                    violation = {
-                        'rule_id': rule_id,
-                        'rule_name': rule_name,
-                        'query': query_key,
-                        'prom_query': prom_query,
-                        'operator': operator,
-                        'threshold': threshold,
-                        'actual_value': round(value, 4),
-                        'severity': severity,
-                        'description': description,
-                        'namespace': rule_namespace or 'All',
-                        'pod_name': rule_pod_name or 'All',
-                        'iteration': iteration,
-                        'timestamp': datetime.now(timezone.utc).isoformat(),
-                        'execution_id': self.execution_id,
-                    }
-                    self.monitoring_rule_violations.append(violation)
-                    display_name = f"{rule_name}{scope_label}"
-                    logger.warning(f"🚨 Monitoring rule violated: {display_name} — "
-                                   f"value={value:.4f} {operator} {threshold}")
-                    self._log_event('WARNING',
-                                    f'Monitoring rule violated: {display_name} — '
-                                    f'value={value:.4f} {operator} {threshold}',
-                                    rule_violation=violation)
-                    self._emit_event('monitoring_rule_violated',
-                                     f'{display_name}: {value:.2f} {operator} {threshold}',
-                                     severity=severity.lower(), iteration=iteration,
-                                     metadata={'rule_id': rule_id, 'value': value, 'threshold': threshold,
-                                               'namespace': rule_namespace, 'pod_name': rule_pod_name})
+                violation = {
+                    'rule_id': rule_id,
+                    'rule_name': rule_name,
+                    'query': primary['raw_query'],
+                    'prom_query': primary['prom_query'],
+                    'operator': primary['operator'],
+                    'threshold': primary['threshold'],
+                    'actual_value': round(primary['value'], 4) if primary['value'] is not None else None,
+                    'severity': severity,
+                    'description': description,
+                    'namespace': (rule.get('namespace') or 'All') if not is_composite else 'composite',
+                    'pod_name': (rule.get('pod_name') or rule.get('podName') or 'All') if not is_composite else 'composite',
+                    'iteration': iteration,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'execution_id': self.execution_id,
+                    # Composite metadata
+                    'is_composite': is_composite,
+                    'logical_operator': logical_op if is_composite else None,
+                    'conditions_evaluated': [
+                        {
+                            'query': c['raw_query'], 'scope': c['scope'],
+                            'operator': c['operator'], 'threshold': c['threshold'],
+                            'value': c['value'], 'violated': c['violated'],
+                            'error': c['error'], 'scope_label': c['scope_label'].strip(),
+                        }
+                        for c in condition_results
+                    ],
+                }
+                self.monitoring_rule_violations.append(violation)
 
-                    # Persist violation as an alert in alert_summaries
-                    self._persist_rule_violation_alert(violation)
+                display_name = (
+                    f"{rule_name} ({logical_op}: {joined_label})" if is_composite
+                    else f"{rule_name}{primary['scope_label']}"
+                )
+                logger.warning(f"🚨 Monitoring rule violated: {display_name}")
+                self._log_event('WARNING',
+                                f'Monitoring rule violated: {display_name}',
+                                rule_violation=violation)
+                self._emit_event('monitoring_rule_violated',
+                                 display_name,
+                                 severity=severity.lower(), iteration=iteration,
+                                 metadata={'rule_id': rule_id, 'composite': is_composite})
 
-                    # Send Slack notification for the violation
-                    self._send_rule_violation_slack(violation, scope_label)
+                # Persist violation as an alert in alert_summaries
+                self._persist_rule_violation_alert(violation)
+
+                # Send Slack notification for the violation
+                self._send_rule_violation_slack(violation, primary['scope_label'])
 
             except Exception as e:
                 logger.warning(f"Failed to evaluate monitoring rule '{rule_name}': {e}")

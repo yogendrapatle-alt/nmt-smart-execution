@@ -23,10 +23,10 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _prom_query(prom_url: str, query: str, timeout: float = 12.0) -> List[Dict]:
+def _prom_query(prom_url: str, query: str, timeout: float = 3.0) -> List[Dict]:
     try:
         url = urljoin(prom_url.rstrip('/') + '/', 'api/v1/query')
-        resp = requests.get(url, params={'query': query}, verify=False, timeout=timeout)
+        resp = requests.get(url, params={'query': query}, verify=False, timeout=(2, timeout))
         if resp.status_code == 200:
             data = resp.json()
             if data.get('status') == 'success':

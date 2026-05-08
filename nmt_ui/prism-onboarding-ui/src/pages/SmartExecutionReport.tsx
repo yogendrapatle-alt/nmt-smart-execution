@@ -202,15 +202,6 @@ function fmtTs(raw: string | number | undefined | null): string {
   } catch { return String(raw).substring(0, 19); }
 }
 
-function fmtTime(raw: string | number | undefined | null): string {
-  if (!raw) return '—';
-  try {
-    const d = new Date(typeof raw === 'number' ? raw * 1000 : raw);
-    if (isNaN(d.getTime())) return String(raw).substring(0, 19);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  } catch { return String(raw).substring(0, 19); }
-}
-
 function csvEscapeCell(val: string): string {
   if (/[",\n\r]/.test(val)) return `"${val.replace(/"/g, '""')}"`;
   return val;
@@ -333,6 +324,13 @@ interface ReportData {
     memory?: { baseline: number; final: number; min: number; max: number; avg: number; p50: number; p95: number; samples: number };
   };
   cleanup_results?: Record<string, any>;
+  testbed_topology?: {
+    topology_type?: string;
+    total_hosts?: number;
+    total_clusters?: number;
+    [key: string]: any;
+  };
+  full_execution_data?: Record<string, any>;
 }
 
 const SmartExecutionReport: React.FC = () => {
@@ -350,7 +348,7 @@ const SmartExecutionReport: React.FC = () => {
   const [expandedIterations, setExpandedIterations] = useState<Set<number>>(new Set());
   const [expandedEffectiveOps, setExpandedEffectiveOps] = useState<Set<string>>(new Set());
   const [podEvents, setPodEvents] = useState<any[]>([]);
-  const [expandedLogSnippets, setExpandedLogSnippets] = useState<Set<number>>(new Set());
+  const [expandedLogSnippets, setExpandedLogSnippets] = useState<Set<string | number>>(new Set());
 
   useEffect(() => {
     fetchReport();
@@ -562,25 +560,6 @@ const SmartExecutionReport: React.FC = () => {
 
   return (
     <div className="main-content">
-        {/* Breadcrumb */}
-        <div className="d-flex align-items-center mb-3">
-          <nav aria-label="breadcrumb">
-            <ol className="breadcrumb mb-0">
-              <li className="breadcrumb-item">
-                <a href="#" onClick={(e) => { e.preventDefault(); navigate('/dashboard'); }}>
-                  <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle' }}>home</i>
-                </a>
-              </li>
-              <li className="breadcrumb-item">
-                <a href="#" onClick={(e) => { e.preventDefault(); navigate('/smart-execution/history'); }}>
-                  Execution History
-                </a>
-              </li>
-              <li className="breadcrumb-item active">Report</li>
-            </ol>
-          </nav>
-        </div>
-
         {/* Page Header */}
         <div className="mb-3">
           <div className="d-flex justify-content-between align-items-center mb-3">
@@ -1111,12 +1090,12 @@ const SmartExecutionReport: React.FC = () => {
                         {clusterNames.map((cname, ci) => {
                           const cNodes = allNodeIds.filter(id => nodeCluster[id] === cname);
                           if (cNodes.length === 0) return null;
-                          const cSeries = cNodes.flatMap((id, ni) => [
+                          const cSeries = cNodes.flatMap((id) => [
                             { name: `${nodeLabel[id]} CPU`, data: nodeData[id].cpu },
                             { name: `${nodeLabel[id]} Mem`, data: nodeData[id].mem },
                           ]);
-                          const cColors = cNodes.flatMap((_, ni) => {
-                            const c = nodePalette[ni % nodePalette.length];
+                          const cColors = cNodes.flatMap((_, idx) => {
+                            const c = nodePalette[idx % nodePalette.length];
                             return [c, c];
                           });
                           return (

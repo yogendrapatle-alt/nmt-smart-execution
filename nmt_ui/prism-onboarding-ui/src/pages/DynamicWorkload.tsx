@@ -1,7 +1,6 @@
 
 import React, { useEffect, useState } from 'react';
 import WorkloadUploader from '../components/WorkloadUploader';
-import { useNavigate } from 'react-router-dom';
 import { useOnboarding } from '../context/OnboardingContext';
 import ntnxLogo from '../assets/new_nutanix_logo.png';
 import { getApiBase } from '../utils/backendUrl';
@@ -35,7 +34,6 @@ type WorkloadRow = {
 
 
 const DynamicWorkload: React.FC = () => {
-	const navigate = useNavigate();
 	const { onboardingForm } = useOnboarding();
 	
 	// Workload Label state
@@ -250,25 +248,6 @@ const DynamicWorkload: React.FC = () => {
 
 				return (
 				<div className="main-content">
-      {/* Breadcrumb */}
-      <div className="d-flex align-items-center mb-4">
-        <nav aria-label="breadcrumb">
-          <ol className="breadcrumb mb-0">
-            <li className="breadcrumb-item">
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/dashboard'); }}>
-                <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle' }}>home</i>
-              </a>
-            </li>
-            <li className="breadcrumb-item">
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/rulebuilder-experimental'); }}>
-                Rule Builder
-              </a>
-            </li>
-            <li className="breadcrumb-item active">Dynamic Workload</li>
-          </ol>
-        </nav>
-      </div>
-
       <div style={{
         maxWidth: 1200,
         margin: '0 auto',

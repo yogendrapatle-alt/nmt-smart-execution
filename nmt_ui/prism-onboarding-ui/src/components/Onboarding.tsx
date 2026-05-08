@@ -125,7 +125,7 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
                 <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle' }}>home</i>
               </a>
             </li>
-            <li className="breadcrumb-item active">Onboard Existing Testbed</li>
+            <li className="breadcrumb-item active">Onboard Testbed</li>
           </ol>
         </nav>
       </div>
@@ -151,7 +151,7 @@ const Onboarding: React.FC<Props> = ({ onSubmit }) => {
               }}>
                 <img src={ntnxLogo} alt="Nutanix Logo" style={{ width: 50, height: 50, objectFit: 'contain' }} />
               </div>
-              <h2 style={{ color: '#00008B', fontWeight: 700, fontSize: 32, marginBottom: 8, letterSpacing: '-0.5px' }}>Onboard Existing Testbed</h2>
+              <h2 style={{ color: '#00008B', fontWeight: 700, fontSize: 32, marginBottom: 8, letterSpacing: '-0.5px' }}>Onboard Testbed</h2>
               <p className="text-muted mb-0" style={{ fontSize: 16 }}>Connect to your NCM cluster and start monitoring</p>
             </div>
 

@@ -317,8 +317,7 @@ const DashboardHome: React.FC = () => {
           <div className="row row-cols-2 row-cols-md-5 g-3">
             {[
               { path: '/smart-execution', icon: 'psychology', label: 'Smart Execution', cls: 'btn-primary' },
-              { path: '/deploy-new', icon: 'rocket_launch', label: 'Deploy New', cls: 'btn-outline-secondary' },
-              { path: '/onboarding', icon: 'add_circle_outline', label: 'Onboard', cls: 'btn-outline-secondary' },
+              { path: '/onboarding', icon: 'add_circle_outline', label: 'Onboard Testbed', cls: 'btn-outline-secondary' },
               { path: '/my-testbeds', icon: 'dns', label: 'My Testbeds', cls: 'btn-outline-secondary' },
               { path: '/alert-summary', icon: 'notifications_active', label: 'View Alerts', cls: 'btn-outline-secondary' },
             ].map(qa => (
@@ -346,8 +345,7 @@ const DashboardHome: React.FC = () => {
               <h6 className="fw-bold mb-1">Welcome to NCM Monitoring Tool!</h6>
               <p className="mb-3" style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-base)' }}>Get started by deploying a new testbed or onboarding your existing one.</p>
               <div className="d-flex gap-2 flex-wrap">
-                <button className="btn btn-sm btn-success rounded-3" onClick={() => navigate('/deploy-new')}>Deploy New Testbed</button>
-                <button className="btn btn-sm btn-primary rounded-3" onClick={() => navigate('/onboarding')}>Onboard Existing</button>
+                <button className="btn btn-sm btn-primary rounded-3" onClick={() => navigate('/onboarding')}>Onboard Testbed</button>
               </div>
             </div>
           </div>

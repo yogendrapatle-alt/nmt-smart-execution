@@ -122,21 +122,6 @@ const TestbedTimeline: React.FC = () => {
 
   return (
     <div className="container-fluid" style={{ padding: '20px' }}>
-      {/* Breadcrumb */}
-      <nav aria-label="breadcrumb" style={{ marginBottom: '20px' }}>
-        <ol className="breadcrumb">
-          <li className="breadcrumb-item">
-            <a href="/" onClick={(e) => { e.preventDefault(); navigate('/'); }}>Home</a>
-          </li>
-          <li className="breadcrumb-item">
-            <a href="/my-testbeds" onClick={(e) => { e.preventDefault(); navigate('/my-testbeds'); }}>My Testbeds</a>
-          </li>
-          <li className="breadcrumb-item active" aria-current="page">
-            Testbed Timeline
-          </li>
-        </ol>
-      </nav>
-
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-4">
         <div>

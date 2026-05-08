@@ -247,14 +247,7 @@ const SmartExecutionMonitorAI: React.FC = () => {
         </div>
       )}
 
-      {/* Breadcrumb + Header */}
-      <nav aria-label="breadcrumb" className="mb-2">
-        <ol className="breadcrumb mb-0 small">
-          <li className="breadcrumb-item"><a href="#" onClick={e => { e.preventDefault(); navigate('/'); }} className="text-decoration-none">Dashboard</a></li>
-          <li className="breadcrumb-item"><a href="#" onClick={e => { e.preventDefault(); navigate('/smart-execution/history'); }} className="text-decoration-none">Execution History</a></li>
-          <li className="breadcrumb-item active" aria-current="page">Monitor</li>
-        </ol>
-      </nav>
+      {/* Header */}
 
       <div className="d-flex flex-wrap align-items-center justify-content-between gap-3 mb-3">
         <div>

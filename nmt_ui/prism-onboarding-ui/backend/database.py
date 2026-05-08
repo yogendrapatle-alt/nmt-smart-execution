@@ -30,6 +30,12 @@ from models.execution_detail_tables import (
     ExecutionMetricsTimeline,
 )
 
+# Import the MonitorSession model (Monitor-Only Testbed flow)
+from models.monitor_session import MonitorSession  # noqa: F401
+
+# Import the AlertLogBundle model (Phase-4 log collection on rule violation)
+from models.alert_log_bundle import AlertLogBundle  # noqa: F401
+
 # Use 127.0.0.1 (not localhost) so libpq uses TCP + md5/pg_hba "host" rules; "localhost" can use ::1 or socket.
 DATABASE_URL = os.environ.get(
     'DATABASE_URL',

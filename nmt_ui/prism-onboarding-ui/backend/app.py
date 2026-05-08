@@ -168,6 +168,10 @@ app.register_blueprint(test_routes)
 from routes.smart_execution_ai_routes import smart_execution_ai_bp
 app.register_blueprint(smart_execution_ai_bp)
 
+# Monitor-Only Testbed flow (Phase-4) — standalone Prometheus rule watcher
+from routes.monitor_only_routes import monitor_only_bp
+app.register_blueprint(monitor_only_bp)
+
 # Phase 3: Register Scheduled Execution routes
 from routes.scheduled_execution_routes import scheduled_execution_bp
 app.register_blueprint(scheduled_execution_bp)
@@ -3765,27 +3769,37 @@ def get_alerts_for_testbed(testbed_id):
 
 @app.route('/api/check-prometheus', methods=['GET'])
 def check_prometheus_status():
-    """Check if Prometheus is reachable"""
+    """Check if Prometheus is reachable.
+
+    Tries both HTTP and HTTPS schemes via the shared resolver, since many
+    testbeds are saved with the wrong scheme (e.g. http:// when only https
+    works due to TLS-terminated NodePort exposures).
+    """
     try:
         import requests
         url = request.args.get('url', '')
-        
+
         if not url:
             return jsonify({'status': 'offline', 'error': 'No URL provided'})
-        
-        # Try to reach Prometheus health endpoint
-        try:
-            # Remove trailing slash and add /-/healthy
-            prometheus_url = url.rstrip('/') + '/-/healthy'
-            response = requests.get(prometheus_url, timeout=5, verify=False)
-            
-            if response.status_code == 200:
-                return jsonify({'status': 'online', 'url': url})
-            else:
-                return jsonify({'status': 'offline', 'error': f'HTTP {response.status_code}'})
-        except requests.exceptions.RequestException as e:
-            return jsonify({'status': 'offline', 'error': str(e)})
-            
+
+        from services.prometheus_url import _candidate_urls
+
+        # Try each candidate scheme until one responds with a healthy Prometheus
+        last_error = None
+        for cand in _candidate_urls(url):
+            for path in ('/-/healthy', '/api/v1/query?query=up'):
+                try:
+                    target = cand.rstrip('/') + path
+                    resp = requests.get(target, timeout=4, verify=False)
+                    if resp.status_code == 200:
+                        return jsonify({'status': 'online', 'url': cand.rstrip('/')})
+                    last_error = f'HTTP {resp.status_code}'
+                except requests.exceptions.RequestException as e:
+                    last_error = str(e)
+                    continue
+
+        return jsonify({'status': 'offline', 'error': last_error or 'Not reachable on http or https'})
+
     except Exception as e:
         logging.error(f"Error checking Prometheus status: {e}")
         return jsonify({'status': 'offline', 'error': str(e)})

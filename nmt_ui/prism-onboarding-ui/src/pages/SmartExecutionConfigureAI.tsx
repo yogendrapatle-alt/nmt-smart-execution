@@ -69,6 +69,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
   // Monitoring
   const [availableNamespaces, setAvailableNamespaces] = useState<string[]>([]);
   const [availablePods, setAvailablePods] = useState<string[]>([]);
+  const [podsByNamespace, setPodsByNamespace] = useState<Record<string, string[]>>({});
   const [selectedNamespaces, setSelectedNamespaces] = useState<string[]>([]);
   const [selectedPods, setSelectedPods] = useState<string[]>([]);
   const [loadingPods, setLoadingPods] = useState(false);
@@ -224,6 +225,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
         if (data.success) {
           setAvailableNamespaces(data.namespaces || []);
           setAvailablePods(data.pods || []);
+          setPodsByNamespace(data.pods_by_namespace || {});
           const common = ['ntnx-system', 'default', 'kube-system'];
           setSelectedNamespaces(data.namespaces?.filter((ns: string) => common.includes(ns)) || common);
         } else throw new Error('API returned error');
@@ -450,6 +452,7 @@ const SmartExecutionConfigureAI: React.FC = () => {
           maintainLoadPct={maintainLoadPct} onMaintainLoadChange={setMaintainLoadPct}
           healthChecks={healthChecks} onHealthChecksChange={setHealthChecks}
           monitoringRules={monitoringRules} onMonitoringRulesChange={setMonitoringRules}
+          podsByNamespace={podsByNamespace} testbedId={selectedTestbed || undefined}
         />
       )}
 

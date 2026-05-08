@@ -85,30 +85,138 @@ export function getAvailableOperations(entity: string): string[] {
   return OPERATIONS_MAP[entity] || ['CREATE', 'DELETE', 'LIST'];
 }
 
+export type RuleScope = 'pod' | 'node' | 'cluster';
+export type ComparisonOperator = '>' | '<' | '>=' | '<=' | '==' | '!=';
+export type LogicalOperator = 'AND' | 'OR';
+export type MetricUnit = 'Percentage' | 'Memory (GB)' | 'Time (ms)' | 'Count' | 'Raw';
+
+/**
+ * A single condition inside a (possibly composite) monitoring rule.
+ *
+ * ``podNames`` is the modern multi-select form; ``podName`` (singular) is the
+ * legacy single-pod field kept for back-compat. The backend treats both the
+ * same — multiple pod names get joined into a single ``pod=~"(p1|p2|…)"``
+ * regex when the rule is evaluated.
+ */
+export interface RuleCondition {
+  scope?: RuleScope;
+  query: string;
+  queryMode?: 'quick' | 'raw';
+  operator: ComparisonOperator;
+  threshold: number;
+  unit?: MetricUnit;
+  namespace?: string;
+  namespaces?: string[];
+  podName?: string;
+  podNames?: string[];
+  nodeInstance?: string;
+  nodeInstances?: string[];
+}
+
 export interface MonitoringRule {
   id: string;
   name: string;
+  // Single-condition fields (legacy — kept for back-compat).
   query: string;
-  operator: '>' | '<' | '>=' | '<=' | '==' | '!=';
+  operator: ComparisonOperator;
   threshold: number;
   severity: 'Critical' | 'Moderate' | 'Low';
   enabled: boolean;
   description?: string;
   namespace?: string;
   podName?: string;
+  // ── New (all optional, back-compat) ────────────────────────────
+  scope?: RuleScope;
+  queryMode?: 'quick' | 'raw';
+  unit?: MetricUnit;
+  namespaces?: string[];
+  podNames?: string[];
+  nodeInstance?: string;
+  nodeInstances?: string[];
+  // Composite rule: when present + non-empty, the rule is evaluated as
+  // `c0 <logicalOperator> c1 <logicalOperator> c2 …`.
+  conditions?: RuleCondition[];
+  logicalOperator?: LogicalOperator;
+  // Phase-4 carry-over (log collection on violation):
+  collectLogs?: boolean;
+  logDurationHours?: number;
+  // Versioning so future loaders can migrate older shapes.
+  schemaVersion?: number;
+}
+
+/**
+ * Heuristic mapping from a query name to its natural unit, used by the editor
+ * to auto-fill the Unit field and validate threshold ranges. Mirrors the legacy
+ * Phase-1 unit-restriction matrix but keyed on the query names actually used
+ * in this codebase.
+ */
+export function getDefaultUnit(query: string): MetricUnit {
+  const q = (query || '').toLowerCase();
+  if (q.includes('cputhrott')) return 'Percentage';
+  if (q.includes('cpu')) return 'Percentage';
+  if (q.includes('memoryusage') || q.includes('memory_')) return 'Percentage';
+  if (q.includes('memory')) return 'Memory (GB)';
+  if (q.includes('disk') && q.includes('usage')) return 'Percentage';
+  if (q.includes('disk') || q.includes('storage')) return 'Memory (GB)';
+  if (q.includes('latency') || q.includes('time') || q.includes('duration')) return 'Time (ms)';
+  if (q.includes('restart') || q.includes('count') || q.includes('error') || q.includes('drop')) return 'Count';
+  if (q.includes('load')) return 'Count';
+  if (q.includes('ratio') || q.includes('percent') || q.includes('throttling')) return 'Percentage';
+  return 'Raw';
+}
+
+/**
+ * For a given query, the units the user is *allowed* to choose. Memory queries
+ * may legitimately be in either GB or % depending on whether the underlying
+ * PromQL is normalised to the request limit, so we return both.
+ */
+export function getAllowedUnits(query: string): MetricUnit[] {
+  const q = (query || '').toLowerCase();
+  if (!q) return ['Percentage', 'Memory (GB)', 'Time (ms)', 'Count', 'Raw'];
+  if (q.includes('cputhrott') || q.includes('throttling')) return ['Percentage'];
+  if (q.includes('cpu') && !q.includes('memory')) return ['Percentage'];
+  if (q.includes('memory') || q.includes('storage')) return ['Memory (GB)', 'Percentage'];
+  if (q.includes('disk') && q.includes('usage')) return ['Percentage'];
+  if (q.includes('disk')) return ['Memory (GB)', 'Time (ms)', 'Count'];
+  if (q.includes('latency') || q.includes('time') || q.includes('duration')) return ['Time (ms)'];
+  if (q.includes('restart') || q.includes('count') || q.includes('error') || q.includes('drop') || q.includes('inode')) return ['Count'];
+  if (q.includes('load')) return ['Count'];
+  return ['Raw', 'Percentage', 'Memory (GB)', 'Time (ms)', 'Count'];
+}
+
+/** Validate a threshold value against the chosen unit. Returns null if valid,
+ *  otherwise a short message suitable for an inline warning. */
+export function validateThreshold(value: number, unit?: MetricUnit): string | null {
+  if (Number.isNaN(value)) return 'Threshold must be a number';
+  if (unit === 'Percentage' && (value < 0 || value > 100)) return 'Percentage must be 0–100';
+  if (unit === 'Memory (GB)' && value < 0) return 'Memory must be ≥ 0';
+  if (unit === 'Time (ms)' && value < 0) return 'Time must be ≥ 0';
+  if (unit === 'Count' && value < 0) return 'Count must be ≥ 0';
+  return null;
 }
 
 export const QUICK_RULE_TEMPLATES: Omit<MonitoringRule, 'id' | 'enabled'>[] = [
-  { name: 'Pod CPU Usage', query: 'PodCPUUsage', operator: '>', threshold: 80, severity: 'Critical', description: 'Alert when any pod CPU usage exceeds threshold' },
-  { name: 'Pod Memory Usage', query: 'PodMemoryUsage', operator: '>', threshold: 80, severity: 'Critical', description: 'Alert when any pod memory usage exceeds threshold' },
-  { name: 'Container Restarts', query: 'ContainerRestarts', operator: '>', threshold: 5, severity: 'Moderate', description: 'Alert when container restart count exceeds threshold' },
-  { name: 'Pod Restarts', query: 'PodRestarts', operator: '>', threshold: 3, severity: 'Moderate', description: 'Alert when pod restart count exceeds threshold' },
-  { name: 'CPU Throttling', query: 'ContainerCPUThrottling', operator: '>', threshold: 25, severity: 'Moderate', description: 'Alert when CPU throttling percentage exceeds threshold' },
-  { name: 'CH CPU Usage', query: 'CHCPUUsage', operator: '>', threshold: 85, severity: 'Critical', description: 'Alert when Cluster Health CPU usage exceeds threshold' },
-  { name: 'CH Memory Usage', query: 'CHMemoryUsage', operator: '>', threshold: 85, severity: 'Critical', description: 'Alert when Cluster Health Memory usage exceeds threshold' },
-  { name: 'IDF CPU Usage', query: 'IDFCPUUsage', operator: '>', threshold: 80, severity: 'Moderate', description: 'Alert when IDF CPU usage exceeds threshold' },
-  { name: 'IDF Memory Usage', query: 'IDFMemoryUsage', operator: '>', threshold: 80, severity: 'Moderate', description: 'Alert when IDF Memory usage exceeds threshold' },
-  { name: 'High CPU Throttling', query: 'HighCPUThrottling', operator: '==', threshold: 1, severity: 'Critical', description: 'Alert when high CPU throttling is detected' },
+  // Pod-scoped
+  { name: 'Pod CPU Usage', query: 'PodCPUUsage', operator: '>', threshold: 80, severity: 'Critical', scope: 'pod', description: 'Alert when any pod CPU usage exceeds threshold' },
+  { name: 'Pod Memory Usage', query: 'PodMemoryUsage', operator: '>', threshold: 80, severity: 'Critical', scope: 'pod', description: 'Alert when any pod memory usage exceeds threshold' },
+  { name: 'Container Restarts', query: 'ContainerRestarts', operator: '>', threshold: 5, severity: 'Moderate', scope: 'pod', description: 'Alert when container restart count exceeds threshold' },
+  { name: 'Pod Restarts', query: 'PodRestarts', operator: '>', threshold: 3, severity: 'Moderate', scope: 'pod', description: 'Alert when pod restart count exceeds threshold' },
+  { name: 'CPU Throttling', query: 'ContainerCPUThrottling', operator: '>', threshold: 25, severity: 'Moderate', scope: 'pod', description: 'Alert when CPU throttling percentage exceeds threshold' },
+  { name: 'CH CPU Usage', query: 'CHCPUUsage', operator: '>', threshold: 85, severity: 'Critical', scope: 'pod', description: 'Alert when Cluster Health CPU usage exceeds threshold' },
+  { name: 'CH Memory Usage', query: 'CHMemoryUsage', operator: '>', threshold: 85, severity: 'Critical', scope: 'pod', description: 'Alert when Cluster Health Memory usage exceeds threshold' },
+  { name: 'IDF CPU Usage', query: 'IDFCPUUsage', operator: '>', threshold: 80, severity: 'Moderate', scope: 'pod', description: 'Alert when IDF CPU usage exceeds threshold' },
+  { name: 'IDF Memory Usage', query: 'IDFMemoryUsage', operator: '>', threshold: 80, severity: 'Moderate', scope: 'pod', description: 'Alert when IDF Memory usage exceeds threshold' },
+  { name: 'High CPU Throttling', query: 'HighCPUThrottling', operator: '==', threshold: 1, severity: 'Critical', scope: 'pod', description: 'Alert when high CPU throttling is detected' },
+  // Node-scoped (Phase-2)
+  { name: 'Node CPU Usage', query: 'NodeCPUUsage', operator: '>', threshold: 85, severity: 'Critical', scope: 'node', description: 'Alert when a node CPU usage exceeds threshold' },
+  { name: 'Node Memory Usage', query: 'NodeMemoryUsage', operator: '>', threshold: 85, severity: 'Critical', scope: 'node', description: 'Alert when a node memory usage exceeds threshold' },
+  { name: 'Node Disk Usage', query: 'NodeDiskUsage', operator: '>', threshold: 85, severity: 'Moderate', scope: 'node', description: 'Alert when node root filesystem usage exceeds threshold' },
+  { name: 'Node Load (5m)', query: 'NodeLoadAvg5m', operator: '>', threshold: 4, severity: 'Moderate', scope: 'node', description: 'Alert when node 5-min load average exceeds threshold' },
+  // Cluster-scoped (Phase-2)
+  { name: 'Cluster Avg CPU', query: 'ClusterAvgCPU', operator: '>', threshold: 80, severity: 'Critical', scope: 'cluster', description: 'Alert when cluster-wide average CPU exceeds threshold' },
+  { name: 'Cluster Avg Memory', query: 'ClusterAvgMemory', operator: '>', threshold: 80, severity: 'Critical', scope: 'cluster', description: 'Alert when cluster-wide average memory exceeds threshold' },
+  { name: 'Cluster Max CPU', query: 'ClusterMaxCPU', operator: '>', threshold: 90, severity: 'Critical', scope: 'cluster', description: 'Alert when any node CPU in the cluster exceeds threshold' },
+  { name: 'Cluster Max Memory', query: 'ClusterMaxMemory', operator: '>', threshold: 90, severity: 'Critical', scope: 'cluster', description: 'Alert when any node memory in the cluster exceeds threshold' },
 ];
 
 export const PRESET_TEMPLATES: PresetConfig[] = [

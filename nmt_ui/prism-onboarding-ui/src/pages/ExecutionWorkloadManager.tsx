@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { IS_FAKE_MODE } from '../config/fakeMode';
 import { getFakeTestbeds, getFakeExecutions, getFakeExecutionById } from '../fake-data';
 import { getApiBase } from '../utils/backendUrl';
@@ -71,7 +70,6 @@ interface ExecutionHistoryItem {
 }
 
 const ExecutionWorkloadManager: React.FC = () => {
-  const navigate = useNavigate();
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   
   // State
@@ -539,20 +537,6 @@ const ExecutionWorkloadManager: React.FC = () => {
 
   return (
     <div className="main-content">
-      {/* Breadcrumb */}
-      <div className="d-flex align-items-center mb-4">
-        <nav aria-label="breadcrumb">
-          <ol className="breadcrumb mb-0">
-            <li className="breadcrumb-item">
-              <a href="#" onClick={(e) => { e.preventDefault(); navigate('/dashboard'); }}>
-                <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle' }}>home</i>
-              </a>
-            </li>
-            <li className="breadcrumb-item active">Execution Workload Manager</li>
-          </ol>
-        </nav>
-      </div>
-
       {/* Page Header */}
       <div className="mb-4">
         <div className="d-flex justify-content-between align-items-start flex-wrap gap-3">

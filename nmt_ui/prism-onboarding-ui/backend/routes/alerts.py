@@ -234,9 +234,16 @@ def get_alert_detail(alert_id):
         if prom_url:
             try:
                 from services.prometheus_url import resolve_working_prometheus_url
-                prom_url = resolve_working_prometheus_url(prom_url)
+                import concurrent.futures
+                pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                future = pool.submit(resolve_working_prometheus_url, prom_url)
+                try:
+                    prom_url = future.result(timeout=3)
+                except (concurrent.futures.TimeoutError, Exception):
+                    prom_url = None
+                pool.shutdown(wait=False)
             except Exception:
-                pass
+                prom_url = None
 
         alert_dict = {
             'id': row[0], 'alert_type': row[1], 'severity': row[2],
@@ -252,8 +259,17 @@ def get_alert_detail(alert_id):
         }
 
         from services.alert_diagnostic_service import AlertDiagnosticService
+        import concurrent.futures
         svc = AlertDiagnosticService(prom_url=prom_url)
-        diagnostics = svc.diagnose(alert_dict)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(svc.diagnose, alert_dict)
+        try:
+            diagnostics = future.result(timeout=6)
+        except (concurrent.futures.TimeoutError, Exception):
+            logger.warning(f"Diagnostics timed out for alert {alert_id}, returning without live data")
+            svc_fallback = AlertDiagnosticService(prom_url=None)
+            diagnostics = svc_fallback.diagnose(alert_dict)
+        pool.shutdown(wait=False)
 
         return jsonify({
             'alert': {

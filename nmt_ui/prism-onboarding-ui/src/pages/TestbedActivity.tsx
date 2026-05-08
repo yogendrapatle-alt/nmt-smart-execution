@@ -139,15 +139,6 @@ const TestbedActivity: React.FC = () => {
   return (
     <Layout>
       <div className="container-fluid p-4">
-        {/* Breadcrumb */}
-        <nav aria-label="breadcrumb">
-          <ol className="breadcrumb">
-            <li className="breadcrumb-item"><a href="/">Home</a></li>
-            <li className="breadcrumb-item"><a href="/my-testbeds">My Testbeds</a></li>
-            <li className="breadcrumb-item active" aria-current="page">Activity</li>
-          </ol>
-        </nav>
-        
         {/* Header Card */}
         <div className="card shadow-sm mb-4">
           <div className="card-body">
@@ -236,7 +227,7 @@ const TestbedActivity: React.FC = () => {
                 <p className="text-muted">This testbed has no execution history yet.</p>
                 <button 
                   className="btn btn-primary mt-3"
-                  onClick={() => navigate('/execution-workload-manager')}
+                  onClick={() => navigate('/smart-execution')}
                 >
                   <span className="material-icons me-2" style={{verticalAlign: 'middle'}}>play_arrow</span>
                   Start New Execution

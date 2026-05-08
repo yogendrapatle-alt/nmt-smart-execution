@@ -133,9 +133,9 @@ const MyTestbeds: React.FC = () => {
             <li className="breadcrumb-item active">My Testbeds</li>
           </ol>
         </nav>
-        <button className="btn btn-primary" onClick={() => navigate('/deploy-new')}>
+        <button className="btn btn-primary" onClick={() => navigate('/onboarding')}>
           <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle', marginRight: 4 }}>add</i>
-          Deploy New Testbed
+          Onboard Testbed
         </button>
       </div>
 
@@ -190,11 +190,7 @@ const MyTestbeds: React.FC = () => {
               <div className="d-flex gap-3 justify-content-center">
                 <button className="btn btn-primary btn-lg" onClick={() => navigate('/onboarding')} style={{ borderRadius: 8, padding: '12px 24px', fontWeight: 600 }}>
                   <i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle', marginRight: 6 }}>add_circle</i>
-                  Onboard Existing
-                </button>
-                <button className="btn btn-outline-primary btn-lg" onClick={() => navigate('/deploy-new')} style={{ borderRadius: 8, padding: '12px 24px', fontWeight: 600 }}>
-                  <i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle', marginRight: 6 }}>rocket_launch</i>
-                  Deploy New
+                  Onboard Testbed
                 </button>
               </div>
             </div>

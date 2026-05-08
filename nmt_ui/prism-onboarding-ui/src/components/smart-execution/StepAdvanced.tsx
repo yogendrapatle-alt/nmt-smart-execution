@@ -1,6 +1,6 @@
 import React from 'react';
 import type { AISettings, MonitoringRule } from './types';
-import { QUICK_RULE_TEMPLATES } from './types';
+import MonitoringRulesEditor from '../MonitoringRulesEditor';
 
 interface StepAdvancedProps {
   aiSettings: AISettings;
@@ -34,6 +34,8 @@ interface StepAdvancedProps {
   maintainLoadPct: number; onMaintainLoadChange: (v: number) => void;
   healthChecks: Record<string, boolean>; onHealthChecksChange: (h: Record<string, boolean>) => void;
   monitoringRules: MonitoringRule[]; onMonitoringRulesChange: (rules: MonitoringRule[]) => void;
+  podsByNamespace?: Record<string, string[]>;
+  testbedId?: string;
 }
 
 const PROFILE_DESCRIPTIONS: Record<string, string> = {
@@ -53,74 +55,12 @@ const HEALTH_CHECK_LABELS: Record<string, string> = {
   memory_leaks: 'Memory Leak Detection',
 };
 
-const SEVERITY_COLORS: Record<string, string> = {
-  Critical: '#ef4444',
-  Moderate: '#f59e0b',
-  Low: '#22c55e',
-};
-
 const StepAdvanced: React.FC<StepAdvancedProps> = (props) => {
   const [showExecution, setShowExecution] = React.useState(false);
   const [showAlerts, setShowAlerts] = React.useState(false);
   const [showLongevity, setShowLongevity] = React.useState(false);
   const [tagInput, setTagInput] = React.useState('');
-  const [showAddCustomRule, setShowAddCustomRule] = React.useState(false);
-  const [customRuleName, setCustomRuleName] = React.useState('');
-  const [customRuleQuery, setCustomRuleQuery] = React.useState('');
-  const [customRuleOperator, setCustomRuleOperator] = React.useState<MonitoringRule['operator']>('>');
-  const [customRuleThreshold, setCustomRuleThreshold] = React.useState(80);
-  const [customRuleSeverity, setCustomRuleSeverity] = React.useState<MonitoringRule['severity']>('Moderate');
-  const [customRuleDescription, setCustomRuleDescription] = React.useState('');
-  const [customRuleNamespace, setCustomRuleNamespace] = React.useState('');
-  const [customRulePod, setCustomRulePod] = React.useState('');
-
-  const addQuickRule = (template: typeof QUICK_RULE_TEMPLATES[0]) => {
-    const exists = props.monitoringRules.some(r => r.query === template.query);
-    if (exists) return;
-    const newRule: MonitoringRule = {
-      ...template,
-      id: `rule-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      enabled: true,
-    };
-    props.onMonitoringRulesChange([...props.monitoringRules, newRule]);
-  };
-
-  const addCustomRule = () => {
-    if (!customRuleName.trim() || !customRuleQuery.trim()) return;
-    const newRule: MonitoringRule = {
-      id: `custom-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      name: customRuleName.trim(),
-      query: customRuleQuery.trim(),
-      operator: customRuleOperator,
-      threshold: customRuleThreshold,
-      severity: customRuleSeverity,
-      enabled: true,
-      description: customRuleDescription.trim() || undefined,
-      namespace: customRuleNamespace || undefined,
-      podName: customRulePod || undefined,
-    };
-    props.onMonitoringRulesChange([...props.monitoringRules, newRule]);
-    setCustomRuleName(''); setCustomRuleQuery(''); setCustomRuleOperator('>');
-    setCustomRuleThreshold(80); setCustomRuleSeverity('Moderate'); setCustomRuleDescription('');
-    setCustomRuleNamespace(''); setCustomRulePod('');
-    setShowAddCustomRule(false);
-  };
-
-  const removeRule = (ruleId: string) => {
-    props.onMonitoringRulesChange(props.monitoringRules.filter(r => r.id !== ruleId));
-  };
-
-  const toggleRule = (ruleId: string) => {
-    props.onMonitoringRulesChange(props.monitoringRules.map(r =>
-      r.id === ruleId ? { ...r, enabled: !r.enabled } : r
-    ));
-  };
-
-  const updateRuleField = (ruleId: string, field: keyof MonitoringRule, value: any) => {
-    props.onMonitoringRulesChange(props.monitoringRules.map(r =>
-      r.id === ruleId ? { ...r, [field]: value } : r
-    ));
-  };
+  const [podSearch, setPodSearch] = React.useState('');
 
   return (
     <>
@@ -130,74 +70,143 @@ const StepAdvanced: React.FC<StepAdvancedProps> = (props) => {
         {props.loadingPods ? (
           <div style={{ padding: 16, textAlign: 'center', color: 'var(--color-text-muted)', fontStyle: 'italic' }}>Loading available namespaces and pods…</div>
         ) : (
-          <div className="advanced-settings" style={{ borderTop: 'none', paddingTop: 0 }}>
-            <div className="advanced-group">
-              <label>
-                <span style={{ fontWeight: 600, fontSize: 14 }}>Namespaces</span>
-                {props.availableNamespaces.length === 0 ? (
-                  <div className="info-message">No namespaces available. Select a testbed first.</div>
-                ) : (
-                  <div className="multi-select-box">
-                    {props.availableNamespaces.map(ns => (
-                      <label key={ns} className="checkbox-label">
-                        <input type="checkbox" checked={props.selectedNamespaces.includes(ns)}
-                          onChange={e => props.onNamespacesChange(e.target.checked ? [...props.selectedNamespaces, ns] : props.selectedNamespaces.filter(n => n !== ns))} />
-                        <span>{ns}</span>
-                      </label>
-                    ))}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            {/* Namespaces */}
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                <span style={{ fontWeight: 600, fontSize: 14, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <i className="material-icons-outlined" style={{ fontSize: 18, color: 'var(--color-primary)' }}>dns</i>
+                  Namespaces
+                </span>
+                {props.availableNamespaces.length > 0 && (
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button type="button" onClick={() => props.onNamespacesChange([...props.availableNamespaces])}
+                      style={{ padding: '3px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-full)', background: 'white', cursor: 'pointer', fontSize: 11, fontWeight: 500, color: 'var(--color-primary)' }}>
+                      Select All
+                    </button>
+                    <button type="button" onClick={() => props.onNamespacesChange([])}
+                      style={{ padding: '3px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-full)', background: 'white', cursor: 'pointer', fontSize: 11, fontWeight: 500, color: 'var(--color-text-muted)' }}>
+                      Clear
+                    </button>
                   </div>
                 )}
-                <div className="selected-items">Selected: {props.selectedNamespaces.length > 0 ? props.selectedNamespaces.join(', ') : 'None'}</div>
-              </label>
-
-              <label style={{ marginTop: 16, display: 'block' }}>
-                <span style={{ fontWeight: 600, fontSize: 14 }}>Pod Names (optional — leave empty to monitor all)</span>
-                {props.availablePods.length === 0 ? (
-                  <div className="info-message">No pods available.</div>
-                ) : (
-                  <div className="multi-select-box scrollable">
-                    <div className="select-all-button">
-                      <button type="button" onClick={() => props.onPodsChange([])} className="btn-small">Clear All</button>
-                    </div>
-                    {props.availablePods.map(pod => (
-                      <label key={pod} className="checkbox-label">
-                        <input type="checkbox" checked={props.selectedPods.includes(pod)}
-                          onChange={e => props.onPodsChange(e.target.checked ? [...props.selectedPods, pod] : props.selectedPods.filter(p => p !== pod))} />
-                        <span>{pod}</span>
-                      </label>
-                    ))}
-                  </div>
-                )}
-                <div className="selected-items">Selected: {props.selectedPods.length > 0 ? `${props.selectedPods.length} pods` : 'All pods (no filter)'}</div>
-              </label>
+              </div>
+              {props.availableNamespaces.length === 0 ? (
+                <div style={{ padding: '12px 16px', background: 'var(--color-surface-muted)', borderRadius: 'var(--radius-sm)', color: 'var(--color-text-muted)', fontSize: 'var(--text-xs)', fontStyle: 'italic' }}>
+                  No namespaces available. Select a testbed first.
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                  {props.availableNamespaces.map(ns => {
+                    const isSelected = props.selectedNamespaces.includes(ns);
+                    return (
+                      <button key={ns} type="button"
+                        onClick={() => props.onNamespacesChange(isSelected ? props.selectedNamespaces.filter(n => n !== ns) : [...props.selectedNamespaces, ns])}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
+                          border: `1.5px solid ${isSelected ? 'var(--color-primary)' : 'var(--color-border)'}`,
+                          borderRadius: 'var(--radius-sm)', cursor: 'pointer', transition: 'all 150ms',
+                          background: isSelected ? 'rgba(79, 70, 229, 0.06)' : 'white',
+                          fontSize: 'var(--text-xs)', fontWeight: isSelected ? 600 : 400,
+                          color: isSelected ? 'var(--color-primary)' : 'var(--color-text)',
+                        }}
+                      >
+                        <span style={{
+                          width: 18, height: 18, borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                          background: isSelected ? 'var(--color-primary)' : 'transparent',
+                          border: isSelected ? 'none' : '2px solid var(--color-border)',
+                        }}>
+                          {isSelected && <i className="material-icons-outlined" style={{ fontSize: 14, color: 'white' }}>check</i>}
+                        </span>
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ns}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {props.selectedNamespaces.length > 0 && (
+                <div style={{ marginTop: 8, fontSize: 11, color: 'var(--color-text-muted)' }}>
+                  <strong>{props.selectedNamespaces.length}</strong> of {props.availableNamespaces.length} selected
+                </div>
+              )}
             </div>
 
-            {/* PID Tuning (CPU & Memory) — disabled
-            {props.aiSettings.enable_ai && (
-              <div className="advanced-group">
-                <h3>PID Tuning (CPU)</h3>
-                <div className="pid-inputs">
-                  {(['cpu_kp', 'cpu_ki', 'cpu_kd'] as const).map(key => (
-                    <label key={key}>
-                      {key === 'cpu_kp' ? 'Kp (Proportional)' : key === 'cpu_ki' ? 'Ki (Integral)' : 'Kd (Derivative)'}
-                      <input type="number" step={key === 'cpu_ki' ? 0.01 : 0.1} value={props.aiSettings.pid_tuning[key]}
-                        onChange={e => props.onAISettingsChange({ ...props.aiSettings, pid_tuning: { ...props.aiSettings.pid_tuning, [key]: Number(e.target.value) } })} />
-                    </label>
-                  ))}
-                </div>
-                <h3>PID Tuning (Memory)</h3>
-                <div className="pid-inputs">
-                  {(['memory_kp', 'memory_ki', 'memory_kd'] as const).map(key => (
-                    <label key={key}>
-                      {key === 'memory_kp' ? 'Kp' : key === 'memory_ki' ? 'Ki' : 'Kd'}
-                      <input type="number" step={key === 'memory_ki' ? 0.01 : 0.1} value={props.aiSettings.pid_tuning[key]}
-                        onChange={e => props.onAISettingsChange({ ...props.aiSettings, pid_tuning: { ...props.aiSettings.pid_tuning, [key]: Number(e.target.value) } })} />
-                    </label>
-                  ))}
-                </div>
+            {/* Pod Names */}
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                <span style={{ fontWeight: 600, fontSize: 14, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <i className="material-icons-outlined" style={{ fontSize: 18, color: 'var(--color-primary)' }}>view_in_ar</i>
+                  Pod Names
+                  <span style={{ fontWeight: 400, fontSize: 11, color: 'var(--color-text-muted)' }}>(optional — leave empty to monitor all)</span>
+                </span>
+                {props.availablePods.length > 0 && props.selectedPods.length > 0 && (
+                  <button type="button" onClick={() => { props.onPodsChange([]); setPodSearch(''); }}
+                    style={{ padding: '3px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-full)', background: 'white', cursor: 'pointer', fontSize: 11, fontWeight: 500, color: 'var(--color-text-muted)' }}>
+                    Clear All ({props.selectedPods.length})
+                  </button>
+                )}
               </div>
-            )}
-            */}
+              {props.availablePods.length === 0 ? (
+                <div style={{ padding: '12px 16px', background: 'var(--color-surface-muted)', borderRadius: 'var(--radius-sm)', color: 'var(--color-text-muted)', fontSize: 'var(--text-xs)', fontStyle: 'italic' }}>
+                  No pods available.
+                </div>
+              ) : (
+                <>
+                  <div style={{ position: 'relative', marginBottom: 10 }}>
+                    <i className="material-icons-outlined" style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', fontSize: 18, color: 'var(--color-text-muted)', pointerEvents: 'none' }}>search</i>
+                    <input type="text" value={podSearch} onChange={e => setPodSearch(e.target.value)}
+                      placeholder={`Search ${props.availablePods.length} pods…`}
+                      style={{ width: '100%', padding: '8px 10px 8px 34px', border: '1.5px solid var(--color-border)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-xs)', outline: 'none' }} />
+                    {podSearch && (
+                      <button type="button" onClick={() => setPodSearch('')}
+                        style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-muted)', fontSize: 16, lineHeight: 1, padding: 2 }}>
+                        ×
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6, maxHeight: 240, overflowY: 'auto', padding: 2 }}>
+                    {props.availablePods
+                      .filter(pod => !podSearch || pod.toLowerCase().includes(podSearch.toLowerCase()))
+                      .map(pod => {
+                        const isSelected = props.selectedPods.includes(pod);
+                        return (
+                          <button key={pod} type="button"
+                            onClick={() => props.onPodsChange(isSelected ? props.selectedPods.filter(p => p !== pod) : [...props.selectedPods, pod])}
+                            title={pod}
+                            style={{
+                              display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px',
+                              border: `1.5px solid ${isSelected ? '#22c55e' : 'var(--color-border)'}`,
+                              borderRadius: 'var(--radius-sm)', cursor: 'pointer', transition: 'all 150ms',
+                              background: isSelected ? 'rgba(34, 197, 94, 0.06)' : 'white',
+                              fontSize: 11, fontWeight: isSelected ? 600 : 400,
+                              color: isSelected ? '#15803d' : 'var(--color-text)',
+                            }}
+                          >
+                            <span style={{
+                              width: 16, height: 16, borderRadius: 3, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                              background: isSelected ? '#22c55e' : 'transparent',
+                              border: isSelected ? 'none' : '2px solid var(--color-border)',
+                            }}>
+                              {isSelected && <i className="material-icons-outlined" style={{ fontSize: 12, color: 'white' }}>check</i>}
+                            </span>
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace', fontSize: 11 }}>{pod}</span>
+                          </button>
+                        );
+                      })}
+                  </div>
+                  {podSearch && props.availablePods.filter(p => p.toLowerCase().includes(podSearch.toLowerCase())).length === 0 && (
+                    <div style={{ padding: '12px 0', textAlign: 'center', color: 'var(--color-text-muted)', fontSize: 'var(--text-xs)' }}>
+                      No pods matching "{podSearch}"
+                    </div>
+                  )}
+                </>
+              )}
+              <div style={{ marginTop: 8, fontSize: 11, color: 'var(--color-text-muted)' }}>
+                {props.selectedPods.length > 0
+                  ? <><strong>{props.selectedPods.length}</strong> pod{props.selectedPods.length > 1 ? 's' : ''} selected</>
+                  : 'All pods (no filter)'}
+              </div>
+            </div>
           </div>
         )}
       </section>
@@ -328,205 +337,15 @@ const StepAdvanced: React.FC<StepAdvancedProps> = (props) => {
                 Add rules to monitor Prometheus metrics during execution. Violations are captured as alerts on the Alerts page.
               </p>
 
-              {/* Quick Rule Templates */}
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 'var(--text-xs)', fontWeight: 600, marginBottom: 8, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Quick Add Rules</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                  {QUICK_RULE_TEMPLATES.map(tpl => {
-                    const alreadyAdded = props.monitoringRules.some(r => r.query === tpl.query);
-                    return (
-                      <button
-                        key={tpl.query}
-                        type="button"
-                        onClick={() => addQuickRule(tpl)}
-                        disabled={alreadyAdded}
-                        title={tpl.description}
-                        style={{
-                          padding: '5px 12px', borderRadius: 'var(--radius-full)', fontSize: 'var(--text-xs)',
-                          fontWeight: 500, cursor: alreadyAdded ? 'default' : 'pointer', border: 'none',
-                          background: alreadyAdded ? 'var(--color-surface-muted)' : `${SEVERITY_COLORS[tpl.severity]}15`,
-                          color: alreadyAdded ? 'var(--color-text-muted)' : SEVERITY_COLORS[tpl.severity],
-                          opacity: alreadyAdded ? 0.6 : 1, transition: 'all var(--transition-fast)',
-                        }}
-                      >
-                        {alreadyAdded ? '✓ ' : '+ '}{tpl.name}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Active Rules Table */}
-              {props.monitoringRules.length > 0 && (
-                <div style={{ border: '1px solid var(--color-border)', borderRadius: 'var(--radius-md)', overflow: 'hidden', marginBottom: 16, overflowX: 'auto' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-xs)', minWidth: 800 }}>
-                    <thead>
-                      <tr style={{ background: 'var(--color-surface-muted)' }}>
-                        <th style={{ padding: '8px 8px', textAlign: 'left', fontWeight: 600, width: 40 }}>On</th>
-                        <th style={{ padding: '8px 8px', textAlign: 'left', fontWeight: 600 }}>Rule Name</th>
-                        <th style={{ padding: '8px 8px', textAlign: 'left', fontWeight: 600 }}>Namespace</th>
-                        <th style={{ padding: '8px 8px', textAlign: 'left', fontWeight: 600 }}>Pod Name</th>
-                        <th style={{ padding: '8px 8px', textAlign: 'left', fontWeight: 600 }}>Query</th>
-                        <th style={{ padding: '8px 8px', textAlign: 'center', fontWeight: 600, width: 60 }}>Op</th>
-                        <th style={{ padding: '8px 8px', textAlign: 'center', fontWeight: 600, width: 70 }}>Threshold</th>
-                        <th style={{ padding: '8px 8px', textAlign: 'center', fontWeight: 600, width: 85 }}>Severity</th>
-                        <th style={{ padding: '8px 8px', textAlign: 'center', fontWeight: 600, width: 40 }}></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {props.monitoringRules.map(rule => (
-                        <tr key={rule.id} style={{ borderTop: '1px solid var(--color-border)', opacity: rule.enabled ? 1 : 0.5 }}>
-                          <td style={{ padding: '5px 8px' }}>
-                            <input type="checkbox" checked={rule.enabled} onChange={() => toggleRule(rule.id)} />
-                          </td>
-                          <td style={{ padding: '5px 8px', fontWeight: 500 }}>{rule.name}</td>
-                          <td style={{ padding: '5px 8px' }}>
-                            <select value={rule.namespace || ''} onChange={e => updateRuleField(rule.id, 'namespace', e.target.value || undefined)}
-                              style={{ padding: '2px 4px', border: '1px solid var(--color-border)', borderRadius: 4, fontSize: '0.72rem', background: 'white', maxWidth: 120 }}>
-                              <option value="">All</option>
-                              {props.availableNamespaces.map(ns => <option key={ns} value={ns}>{ns}</option>)}
-                            </select>
-                          </td>
-                          <td style={{ padding: '5px 8px' }}>
-                            <select value={rule.podName || ''} onChange={e => updateRuleField(rule.id, 'podName', e.target.value || undefined)}
-                              style={{ padding: '2px 4px', border: '1px solid var(--color-border)', borderRadius: 4, fontSize: '0.72rem', background: 'white', maxWidth: 140 }}>
-                              <option value="">All Pods</option>
-                              {props.availablePods.map(pod => <option key={pod} value={pod}>{pod}</option>)}
-                            </select>
-                          </td>
-                          <td style={{ padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', color: 'var(--color-primary)' }}>{rule.query}</td>
-                          <td style={{ padding: '5px 8px', textAlign: 'center' }}>
-                            <select value={rule.operator} onChange={e => updateRuleField(rule.id, 'operator', e.target.value)}
-                              style={{ padding: '2px 4px', border: '1px solid var(--color-border)', borderRadius: 4, fontSize: '0.72rem', background: 'white' }}>
-                              <option value=">">&gt;</option>
-                              <option value="<">&lt;</option>
-                              <option value=">=">&gt;=</option>
-                              <option value="<=">&lt;=</option>
-                              <option value="==">==</option>
-                              <option value="!=">!=</option>
-                            </select>
-                          </td>
-                          <td style={{ padding: '5px 8px', textAlign: 'center' }}>
-                            <input type="number" value={rule.threshold} onChange={e => updateRuleField(rule.id, 'threshold', Number(e.target.value))}
-                              style={{ width: 60, padding: '2px 4px', border: '1px solid var(--color-border)', borderRadius: 4, fontSize: '0.72rem', textAlign: 'center' }} />
-                          </td>
-                          <td style={{ padding: '5px 8px', textAlign: 'center' }}>
-                            <select value={rule.severity} onChange={e => updateRuleField(rule.id, 'severity', e.target.value)}
-                              style={{ padding: '2px 6px', border: 'none', borderRadius: 'var(--radius-full)', fontSize: '0.68rem', fontWeight: 600,
-                                background: `${SEVERITY_COLORS[rule.severity]}20`, color: SEVERITY_COLORS[rule.severity] }}>
-                              <option value="Critical">Critical</option>
-                              <option value="Moderate">Moderate</option>
-                              <option value="Low">Low</option>
-                            </select>
-                          </td>
-                          <td style={{ padding: '5px 8px', textAlign: 'center' }}>
-                            <button type="button" onClick={() => removeRule(rule.id)} title="Remove rule"
-                              style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-danger)', fontSize: 16, lineHeight: 1, padding: '2px' }}>
-                              <i className="material-icons-outlined" style={{ fontSize: 18 }}>delete_outline</i>
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {/* Add Custom Rule */}
-              {!showAddCustomRule ? (
-                <button type="button" onClick={() => setShowAddCustomRule(true)}
-                  style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px',
-                    border: '2px dashed var(--color-border)', borderRadius: 'var(--radius-sm)',
-                    background: 'none', cursor: 'pointer', color: 'var(--color-primary)', fontSize: 'var(--text-xs)', fontWeight: 600 }}>
-                  <i className="material-icons-outlined" style={{ fontSize: 18 }}>add</i>
-                  Add Custom Prometheus Rule
-                </button>
-              ) : (
-                <div style={{ border: '1px solid var(--color-primary)', borderRadius: 'var(--radius-md)', padding: 16, background: 'var(--color-primary-light)' }}>
-                  <div style={{ fontSize: 'var(--text-sm)', fontWeight: 600, marginBottom: 12 }}>Custom Prometheus Rule</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
-                    <div>
-                      <label style={{ fontSize: 'var(--text-xs)', fontWeight: 600, display: 'block', marginBottom: 4 }}>Rule Name *</label>
-                      <input type="text" value={customRuleName} onChange={e => setCustomRuleName(e.target.value)}
-                        placeholder="e.g., High Disk Usage"
-                        style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-xs)' }} />
-                    </div>
-                    <div>
-                      <label style={{ fontSize: 'var(--text-xs)', fontWeight: 600, display: 'block', marginBottom: 4 }}>Prometheus Query *</label>
-                      <input type="text" value={customRuleQuery} onChange={e => setCustomRuleQuery(e.target.value)}
-                        placeholder="e.g., node_filesystem_avail_bytes"
-                        style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-xs)', fontFamily: 'monospace' }} />
-                    </div>
-                    <div>
-                      <label style={{ fontSize: 'var(--text-xs)', fontWeight: 600, display: 'block', marginBottom: 4 }}>Namespace (optional)</label>
-                      <select value={customRuleNamespace} onChange={e => setCustomRuleNamespace(e.target.value)}
-                        style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-xs)' }}>
-                        <option value="">All Namespaces</option>
-                        {props.availableNamespaces.map(ns => <option key={ns} value={ns}>{ns}</option>)}
-                      </select>
-                    </div>
-                    <div>
-                      <label style={{ fontSize: 'var(--text-xs)', fontWeight: 600, display: 'block', marginBottom: 4 }}>Pod Name (optional)</label>
-                      <select value={customRulePod} onChange={e => setCustomRulePod(e.target.value)}
-                        style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-xs)' }}>
-                        <option value="">All Pods</option>
-                        {props.availablePods.map(pod => <option key={pod} value={pod}>{pod}</option>)}
-                      </select>
-                    </div>
-                    <div style={{ display: 'flex', gap: 8 }}>
-                      <div style={{ flex: 1 }}>
-                        <label style={{ fontSize: 'var(--text-xs)', fontWeight: 600, display: 'block', marginBottom: 4 }}>Operator</label>
-                        <select value={customRuleOperator} onChange={e => setCustomRuleOperator(e.target.value as MonitoringRule['operator'])}
-                          style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-xs)' }}>
-                          <option value=">">&gt;</option><option value="<">&lt;</option>
-                          <option value=">=">&gt;=</option><option value="<=">&lt;=</option>
-                          <option value="==">==</option><option value="!=">!=</option>
-                        </select>
-                      </div>
-                      <div style={{ flex: 1 }}>
-                        <label style={{ fontSize: 'var(--text-xs)', fontWeight: 600, display: 'block', marginBottom: 4 }}>Threshold</label>
-                        <input type="number" value={customRuleThreshold} onChange={e => setCustomRuleThreshold(Number(e.target.value))}
-                          style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-xs)' }} />
-                      </div>
-                    </div>
-                    <div>
-                      <label style={{ fontSize: 'var(--text-xs)', fontWeight: 600, display: 'block', marginBottom: 4 }}>Severity</label>
-                      <select value={customRuleSeverity} onChange={e => setCustomRuleSeverity(e.target.value as MonitoringRule['severity'])}
-                        style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-xs)' }}>
-                        <option value="Critical">Critical</option>
-                        <option value="Moderate">Moderate</option>
-                        <option value="Low">Low</option>
-                      </select>
-                    </div>
-                    <div style={{ gridColumn: '1 / -1' }}>
-                      <label style={{ fontSize: 'var(--text-xs)', fontWeight: 600, display: 'block', marginBottom: 4 }}>Description (optional)</label>
-                      <input type="text" value={customRuleDescription} onChange={e => setCustomRuleDescription(e.target.value)}
-                        placeholder="Describe when this alert should fire"
-                        style={{ width: '100%', padding: '8px 10px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', fontSize: 'var(--text-xs)' }} />
-                    </div>
-                  </div>
-                  <div style={{ display: 'flex', gap: 8, marginTop: 12, justifyContent: 'flex-end' }}>
-                    <button type="button" onClick={() => setShowAddCustomRule(false)}
-                      style={{ padding: '6px 16px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', background: 'white', cursor: 'pointer', fontSize: 'var(--text-xs)' }}>
-                      Cancel
-                    </button>
-                    <button type="button" onClick={addCustomRule} disabled={!customRuleName.trim() || !customRuleQuery.trim()}
-                      style={{ padding: '6px 16px', border: 'none', borderRadius: 'var(--radius-sm)', background: 'var(--color-primary)', color: 'white',
-                        cursor: customRuleName.trim() && customRuleQuery.trim() ? 'pointer' : 'not-allowed', fontSize: 'var(--text-xs)', fontWeight: 600,
-                        opacity: customRuleName.trim() && customRuleQuery.trim() ? 1 : 0.5 }}>
-                      Add Rule
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* Info box */}
-              {props.monitoringRules.length > 0 && (
-                <div style={{ marginTop: 12, padding: '10px 14px', background: '#eff6ff', borderRadius: 'var(--radius-sm)', border: '1px solid #bfdbfe', fontSize: 'var(--text-xs)', color: '#1e40af' }}>
-                  <i className="material-icons-outlined" style={{ fontSize: 16, verticalAlign: 'middle', marginRight: 4 }}>info</i>
-                  These rules will be evaluated every iteration during execution. Violations will be recorded as alerts on the <strong>Alerts</strong> page and included in the execution report.
-                </div>
-              )}
+              <MonitoringRulesEditor
+                rules={props.monitoringRules}
+                onChange={props.onMonitoringRulesChange}
+                availableNamespaces={props.availableNamespaces}
+                availablePods={props.availablePods}
+                podsByNamespace={props.podsByNamespace}
+                testbedId={props.testbedId}
+                embedded
+              />
             </div>
           </div>
         )}

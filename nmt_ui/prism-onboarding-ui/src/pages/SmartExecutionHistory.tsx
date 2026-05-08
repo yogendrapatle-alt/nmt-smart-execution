@@ -381,25 +381,6 @@ const SmartExecutionHistory: React.FC = () => {
 
   return (
     <div className="main-content">
-        {/* Breadcrumb */}
-        <div className="d-flex align-items-center mb-3">
-          <nav aria-label="breadcrumb">
-            <ol className="breadcrumb mb-0">
-              <li className="breadcrumb-item">
-                <a href="#" onClick={(e) => { e.preventDefault(); navigate('/dashboard'); }}>
-                  <i className="material-icons-outlined" style={{ fontSize: 18, verticalAlign: 'middle' }}>home</i>
-                </a>
-              </li>
-              <li className="breadcrumb-item">
-                <a href="#" onClick={(e) => { e.preventDefault(); navigate('/smart-execution'); }}>
-                  Smart Execution
-                </a>
-              </li>
-              <li className="breadcrumb-item active">Execution History</li>
-            </ol>
-          </nav>
-        </div>
-
         {/* Page Header */}
         <div className="mb-3">
           <div className="d-flex justify-content-between align-items-center mb-3">

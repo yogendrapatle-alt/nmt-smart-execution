@@ -7,27 +7,27 @@ interface LayoutProps {
   children: React.ReactNode;
 }
 
-const PAGE_TITLES: Record<string, string> = {
-  '/': 'Dashboard',
-  '/dashboard': 'Dashboard',
-  '/deploy-new': 'Deploy New Testbed',
-  '/onboarding': 'Onboard Testbed',
-  '/my-testbeds': 'My Testbeds',
-  '/testbeds': 'My Testbeds',
-  '/rule-config-manager': 'Rule & Config Manager', // disabled from sidebar but route kept for backward compat
-  '/alert-summary': 'Alert Summary',
-  '/alert-configuration': 'Alert Configuration',
-  '/smart-execution': 'Smart Execution',
-  '/smart-execution/configure': 'Smart Execution',
-  '/smart-execution/history': 'Execution History',
-  '/scheduled-executions': 'Scheduled Executions',
-  '/ml-insights': 'ML Insights',
-  '/analytics/dashboard': 'Analytics Dashboard',
-  '/analytics/comparison': 'Execution Comparison',
-  '/analytics/executive-summary': 'Executive Summary',
-  '/execution-workload-manager': 'Execution Workload',
-  '/dynamic-workload': 'Dynamic Workload',
-  '/status': 'Status & Monitoring',
+const PAGE_BREADCRUMBS: Record<string, { section?: string; page: string }> = {
+  '/': { page: 'Dashboard' },
+  '/dashboard': { page: 'Dashboard' },
+  '/onboarding': { section: 'Testbeds', page: 'Onboard' },
+  '/my-testbeds': { section: 'Testbeds', page: 'My Testbeds' },
+  '/testbeds': { section: 'Testbeds', page: 'My Testbeds' },
+  '/rule-config-manager': { section: 'Monitoring', page: 'Rule & Config Manager' },
+  '/alert-summary': { section: 'Monitoring', page: 'Alert Summary' },
+  '/alert-configuration': { section: 'Monitoring', page: 'Alert Configuration' },
+  '/monitor-only': { section: 'Monitoring', page: 'Monitor-Only Testbed' },
+  '/monitor-only/configure': { section: 'Monitoring', page: 'Monitor-Only Testbed' },
+  '/monitor-only/sessions': { section: 'Monitoring', page: 'Monitor Sessions' },
+  '/smart-execution': { section: 'Smart Execution', page: 'Configure & Run' },
+  '/smart-execution/configure': { section: 'Smart Execution', page: 'Configure & Run' },
+  '/smart-execution/history': { section: 'Smart Execution', page: 'Execution History' },
+  '/scheduled-executions': { section: 'Smart Execution', page: 'Scheduled' },
+  '/ml-insights': { section: 'Smart Execution', page: 'ML Insights' },
+  '/analytics/dashboard': { section: 'Analytics', page: 'Dashboard' },
+  '/analytics/comparison': { section: 'Analytics', page: 'Comparison' },
+  '/analytics/executive-summary': { section: 'Analytics', page: 'Executive Summary' },
+  '/status': { section: 'Monitoring', page: 'Status & Health' },
 };
 
 const Layout: React.FC<LayoutProps> = ({ children }) => {
@@ -35,7 +35,6 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [alertCount, setAlertCount] = useState<number>(0);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   useEffect(() => {
     const fetchAlertCount = async () => {
@@ -54,11 +53,13 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
   }, []);
 
   const isActive = (path: string) => location.pathname === path;
-  const pageTitle = PAGE_TITLES[location.pathname]
-    || (location.pathname.startsWith('/smart-execution/monitor') ? 'Live Monitor'
-    : location.pathname.startsWith('/smart-execution/report') ? 'Execution Report'
-    : location.pathname.startsWith('/multi-testbed') ? 'Multi-Testbed'
-    : '');
+  const crumb = PAGE_BREADCRUMBS[location.pathname]
+    || (location.pathname.startsWith('/smart-execution/monitor') ? { section: 'Smart Execution', page: 'Live Monitor' }
+    : location.pathname.startsWith('/smart-execution/report') ? { section: 'Smart Execution', page: 'Execution Report' }
+    : location.pathname.startsWith('/monitor-only/run') ? { section: 'Monitoring', page: 'Live Monitor' }
+    : location.pathname.startsWith('/monitor-only/report') ? { section: 'Monitoring', page: 'Monitor Report' }
+    : location.pathname.startsWith('/multi-testbed') ? { section: 'Testbeds', page: 'Multi-Testbed' }
+    : null);
 
   const navItem = (path: string, icon: string, label: string, activePaths?: string[]) => (
     <li key={path}>
@@ -90,13 +91,14 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
             {navItem('/dashboard', 'dashboard', 'Dashboard', ['/', '/dashboard'])}
 
             <li className="menu-label">TESTBEDS</li>
-            {navItem('/deploy-new', 'rocket_launch', 'Deploy New')}
-            {navItem('/onboarding', 'add_circle_outline', 'Onboard Existing')}
+            {navItem('/onboarding', 'add_circle_outline', 'Onboard')}
             {navItem('/my-testbeds', 'dns', 'My Testbeds', ['/my-testbeds', '/testbeds'])}
 
             <li className="menu-label">MONITORING</li>
             {navItem('/alert-summary', 'notifications_active', 'Alert Summary')}
             {navItem('/alert-configuration', 'tune', 'Alert Configuration')}
+            {navItem('/monitor-only', 'visibility', 'Monitor-Only Testbed', ['/monitor-only', '/monitor-only/configure'])}
+            {navItem('/monitor-only/sessions', 'list_alt', 'Monitor Sessions')}
             {navItem('/status', 'show_chart', 'Status & Health')}
 
             <li className="menu-label">SMART EXECUTION</li>
@@ -109,20 +111,6 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
             {navItem('/analytics/dashboard', 'insights', 'Analytics Dashboard')}
             {navItem('/analytics/comparison', 'compare', 'Comparison')}
             {navItem('/analytics/executive-summary', 'summarize', 'Executive Summary')}
-
-            {/* Collapsible Advanced section */}
-            <li className="menu-label" style={{ cursor: 'pointer', userSelect: 'none' }} onClick={() => setAdvancedOpen(!advancedOpen)}>
-              <span className="d-flex align-items-center justify-content-between w-100">
-                ADVANCED
-                <i className="material-icons-outlined" style={{ fontSize: 16, transition: 'transform 200ms', transform: advancedOpen ? 'rotate(180deg)' : 'rotate(0)' }}>expand_more</i>
-              </span>
-            </li>
-            {advancedOpen && (
-              <>
-                {navItem('/execution-workload-manager', 'play_circle', 'Execution Workload')}
-                {navItem('/dynamic-workload', 'trending_up', 'Dynamic Workload')}
-              </>
-            )}
           </ul>
         </div>
       </aside>
@@ -133,11 +121,29 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
           <i className="material-icons-outlined">menu</i>
         </div>
 
-        <div style={{ flexGrow: 1, marginLeft: 'var(--space-5)', display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
-          <span style={{ fontSize: 'var(--text-lg)', fontWeight: 600, color: 'var(--color-text)' }}>
-            {pageTitle || 'NCM Monitoring Tool'}
-          </span>
-        </div>
+        <nav style={{ flexGrow: 1, marginLeft: 'var(--space-5)', display: 'flex', alignItems: 'center' }} aria-label="breadcrumb">
+          <ol style={{ display: 'flex', alignItems: 'center', gap: 0, listStyle: 'none', margin: 0, padding: 0, fontSize: 'var(--text-sm)' }}>
+            <li>
+              <a href="#" onClick={e => { e.preventDefault(); navigate('/dashboard'); }}
+                style={{ color: 'var(--color-text-muted)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 4 }}>
+                <i className="material-icons-outlined" style={{ fontSize: 16 }}>home</i>
+                Home
+              </a>
+            </li>
+            {crumb?.section && (
+              <li style={{ display: 'flex', alignItems: 'center' }}>
+                <i className="material-icons-outlined" style={{ fontSize: 16, color: 'var(--color-text-muted)', margin: '0 6px' }}>chevron_right</i>
+                <span style={{ color: 'var(--color-text-muted)' }}>{crumb.section}</span>
+              </li>
+            )}
+            {crumb?.page && (
+              <li style={{ display: 'flex', alignItems: 'center' }}>
+                <i className="material-icons-outlined" style={{ fontSize: 16, color: 'var(--color-text-muted)', margin: '0 6px' }}>chevron_right</i>
+                <span style={{ color: 'var(--color-text)', fontWeight: 600 }}>{crumb.page}</span>
+              </li>
+            )}
+          </ol>
+        </nav>
 
         {/* Notification Bell */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
