@@ -5701,14 +5701,43 @@ def get_enhanced_smart_execution_report(execution_id):
                 engine = exec_data['engine']
                 summary = engine.get_execution_summary()
                 report_data = summary
+                # NOTE: previously this dict only carried 6 fields, dropping
+                # successful_operations / failed_operations / success_rate /
+                # duration_minutes / start_time. The downstream renderer then
+                # fell back to ``status.get(..., 0) or 0.1``, which made the
+                # report show "0% success" and "0.1m duration" for any active
+                # AI execution. Always pass through what the engine summary
+                # already computes so the report mirrors reality.
                 status = {
                     'status': engine.phase,
                     'total_operations': engine.total_operations_executed,
+                    'successful_operations': summary.get('successful_operations', 0),
+                    'failed_operations': summary.get('failed_operations', 0),
+                    'success_rate': summary.get('success_rate', 0),
+                    'duration_minutes': summary.get('duration_minutes') or 0,
+                    'duration_seconds': summary.get('duration_seconds') or 0,
+                    'operations_per_minute': summary.get('operations_per_minute', 0),
+                    'iterations': summary.get('iterations', 0),
+                    'start_time': summary.get('start_time'),
+                    'end_time': summary.get('end_time'),
+                    'baseline_metrics': summary.get('baseline_metrics', {}),
+                    'final_metrics': summary.get('final_metrics', {}),
                     'metrics_history': [{'cpu_percent': m.get('cpu',0), 'memory_percent': m.get('memory',0), 'timestamp': m.get('timestamp','')} for m in engine.metrics_history],
                     'operations_history': list(engine.operation_history),
                     'target_config': summary.get('target_config', {}),
                     'current_metrics': summary.get('current_metrics', {}),
+                    'testbed_info': {
+                        'testbed_label': summary.get('testbed_label', 'Unknown'),
+                        'testbed_id': (summary.get('target_config') or {}).get('testbed_id'),
+                    },
                 }
+                # Compute ops/min on the fly when the engine didn't.
+                if not status.get('operations_per_minute'):
+                    dm = status.get('duration_minutes') or 0
+                    if dm > 0 and status.get('total_operations'):
+                        status['operations_per_minute'] = round(
+                            status['total_operations'] / dm, 2
+                        )
         except ImportError:
             pass
 
@@ -5844,10 +5873,63 @@ def get_enhanced_smart_execution_report(execution_id):
         from jinja2 import Environment, BaseLoader
 
         total_ops = status.get('total_operations', 0) or 0
-        duration_mins = status.get('duration_minutes', 0) or 0.1
+
+        # Derive duration honestly: prefer the engine/DB value, fall back to
+        # (now - start_time), and only use a tiny 0.1 placeholder if the
+        # execution truly hasn't started. Previously the bare ``or 0.1`` made
+        # 72-hour runs look like they completed in 6 seconds.
+        duration_mins = float(status.get('duration_minutes') or 0)
+        if duration_mins <= 0:
+            st_iso = status.get('start_time')
+            if st_iso:
+                try:
+                    from datetime import datetime as _dt, timezone as _tz
+                    st = _dt.fromisoformat(str(st_iso).replace('Z', '+00:00'))
+                    if st.tzinfo is None:
+                        st = st.replace(tzinfo=_tz.utc)
+                    et_iso = status.get('end_time')
+                    if et_iso:
+                        et = _dt.fromisoformat(str(et_iso).replace('Z', '+00:00'))
+                        if et.tzinfo is None:
+                            et = et.replace(tzinfo=_tz.utc)
+                    else:
+                        et = _dt.now(_tz.utc)
+                    duration_mins = max((et - st).total_seconds() / 60.0, 0)
+                except Exception:
+                    pass
+        if duration_mins <= 0:
+            duration_mins = 0.1  # last-ditch placeholder for cosmetic divisions
+
         ops_per_minute = status.get('operations_per_minute', 0) or (total_ops / max(duration_mins, 0.1))
-        successful_ops = status.get('successful_operations', 0)
-        success_rate = status.get('success_rate', 0) or ((successful_ops / max(total_ops, 1)) * 100)
+
+        # Recover success/fail counts when missing (e.g. legacy DB rows). Count
+        # both 'SUCCESS' (engine) and 'COMPLETED' (DB persisted) — they are
+        # semantically the same for our purposes.
+        successful_ops = int(status.get('successful_operations') or 0)
+        failed_ops_status = int(status.get('failed_operations') or 0)
+        if not successful_ops:
+            ops_for_recount = status.get('operations_history') or []
+            if ops_for_recount:
+                _SUCCESS_STATES = {'SUCCESS', 'COMPLETED', 'OK'}
+                successful_ops = sum(
+                    1 for op in ops_for_recount
+                    if (op.get('success') is True)
+                    or ((op.get('status') or '').upper() in _SUCCESS_STATES)
+                )
+                if not failed_ops_status:
+                    failed_ops_status = sum(
+                        1 for op in ops_for_recount
+                        if (op.get('status') or '').upper() == 'FAILED'
+                        or op.get('success') is False
+                    )
+
+        # Stored success_rate wins when present, else recompute. Use the
+        # ATTEMPTED denominator (success + fail) so SKIPPED ops don't drag the
+        # rate down.
+        attempted = successful_ops + failed_ops_status
+        success_rate = status.get('success_rate')
+        if not success_rate:
+            success_rate = (successful_ops / max(attempted, 1)) * 100 if attempted else 0
 
         operations_history = status.get('operations_history') or []
         if not isinstance(operations_history, list):
@@ -5867,6 +5949,17 @@ def get_enhanced_smart_execution_report(execution_id):
         entity_breakdown = status.get('entity_breakdown') or report_data.get('entity_breakdown') or {}
         operation_effectiveness = status.get('operation_effectiveness') or report_data.get('operation_effectiveness') or []
 
+        # Helper: an op is "success" when either (a) the engine flagged
+        # success=True, or (b) status is one of SUCCESS/COMPLETED/OK. The
+        # DB persists 'COMPLETED' while the engine in-memory uses 'SUCCESS';
+        # treating only 'SUCCESS' as success made every DB-loaded report
+        # collapse to 0% pass rate.
+        _SUCCESS_STATES_REPORT = {'SUCCESS', 'COMPLETED', 'OK'}
+        def _op_succeeded(op: dict) -> bool:
+            if op.get('success') is True:
+                return True
+            return (op.get('status') or '').upper() in _SUCCESS_STATES_REPORT
+
         # Recompute entity_breakdown from operations_history if stored keys
         # have entity.operation format instead of plain entity type
         if entity_breakdown and operations_history:
@@ -5878,7 +5971,7 @@ def get_enhanced_smart_execution_report(execution_id):
                     if et not in eb:
                         eb[et] = {'total': 0, 'success': 0, 'failed': 0}
                     eb[et]['total'] += 1
-                    if op.get('success') or op.get('status') == 'SUCCESS':
+                    if _op_succeeded(op):
                         eb[et]['success'] += 1
                     else:
                         eb[et]['failed'] += 1
@@ -5892,7 +5985,7 @@ def get_enhanced_smart_execution_report(execution_id):
                 if et not in eb:
                     eb[et] = {'total': 0, 'success': 0, 'failed': 0}
                 eb[et]['total'] += 1
-                if op.get('success') or op.get('status') == 'SUCCESS':
+                if _op_succeeded(op):
                     eb[et]['success'] += 1
                 else:
                     eb[et]['failed'] += 1
@@ -5907,7 +6000,7 @@ def get_enhanced_smart_execution_report(execution_id):
                     eff_map[key] = {'key': key, 'count': 0, 'successes': 0, 'total_cpu_impact': 0.0, 'total_mem_impact': 0.0}
                 b = eff_map[key]
                 b['count'] += 1
-                if op.get('success') or op.get('status') == 'SUCCESS':
+                if _op_succeeded(op):
                     b['successes'] += 1
                 b['total_cpu_impact'] += abs(float(op.get('cpu_impact', 0) or 0))
                 b['total_mem_impact'] += abs(float(op.get('memory_impact', 0) or 0))

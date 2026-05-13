@@ -309,6 +309,12 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
         entities_config=ai_engine.entities_config,
         rule_config=ai_engine.rule_config,
     )
+    # Force the controller to use the AI engine's execution_id so all rows it
+    # writes (operation_metrics, alert_summaries, execution events, …) are
+    # filterable by the same `AI-EXEC-*` ID surfaced in the UI / report URLs.
+    # Without this the controller stamps everything with its own freshly
+    # minted `SMART-*` ID and the report/alerts pages can't find anything.
+    controller.execution_id = ai_engine.execution_id
 
     # Initialize NCM client in an async context
     loop = asyncio.new_event_loop()
@@ -356,6 +362,29 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
         logger.info(f"📈 Prometheus URL for AI loop: {prom}")
     else:
         logger.warning("⚠️ No Prometheus URL available — will use synthetic metrics")
+
+    # Make sure the controller has a Prometheus URL so monitoring rule
+    # evaluation works even if NCM-client init didn't auto-discover one.
+    if prom and not getattr(controller, 'prometheus_url', None):
+        controller.prometheus_url = prom
+        logger.info(f"🔧 Seeded controller.prometheus_url = {prom} for rule evaluation")
+
+    rule_count = len(getattr(controller, 'monitoring_rules', []) or [])
+    if rule_count:
+        logger.info(
+            f"📜 {rule_count} monitoring rule(s) loaded — will be evaluated each iteration"
+        )
+
+    # Snapshot cumulative pod restart counts BEFORE the loop starts so that
+    # restart-rule evaluations can subtract the baseline and only alert on
+    # NEW restarts during the run. Without this, every iteration fires alerts
+    # for pods that crashed before the execution started (pre-existing tail
+    # of `kube_pod_container_status_restarts_total`).
+    if getattr(controller, 'prometheus_url', None):
+        try:
+            controller._capture_pod_restart_baseline()
+        except Exception as base_err:
+            logger.debug(f"Pod restart baseline capture skipped: {base_err}")
 
     t0 = time.monotonic()
     op_index = 0
@@ -434,6 +463,20 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
             controller._check_stagnation_and_escalate(current_cpu, current_memory)
         except Exception as esc_err:
             logger.debug(f"Stress-pod escalation skipped: {esc_err}")
+
+        # Evaluate user-configured Prometheus monitoring rules against live
+        # metrics so per-pod / per-node violations show up on the Alerts page
+        # and in the report. The SmartExecutionEngineAI doesn't carry rule
+        # state itself — the SmartExecutionController does — so this is the
+        # one place the rules can fire during an AI execution.
+        if getattr(controller, 'monitoring_rules', None) and getattr(controller, 'prometheus_url', None):
+            try:
+                # Reset the per-iteration "Prometheus dead" guard so a transient
+                # blip in one tick doesn't permanently mute alerting.
+                controller._prometheus_dead = False
+                loop.run_until_complete(controller._evaluate_monitoring_rules(i))
+            except Exception as eval_err:
+                logger.debug(f"Monitoring rule eval skipped (iter {i}): {eval_err}")
 
         # AI brain decides what to do
         action = ai_engine.calculate_next_action(metrics)

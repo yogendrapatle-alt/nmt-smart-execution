@@ -57,6 +57,27 @@ SPIKE_WINDOW_SECONDS = 90
 RECOVERY_THRESHOLD_PERCENT = 2.0
 MIN_SPIKE_DELTA = 5.0
 
+# An operation is treated as "successful" for QA / pass-rate purposes when it
+# carries any of these terminal-success status strings, OR when the engine
+# explicitly set ``success=True`` on the record.
+#
+# Why this matters:
+# - The in-memory engine (smart_execution_engine_ai) records ``status='SUCCESS'``
+#   and ``success=True`` on each op.
+# - Persisted rows in ``operation_metrics`` (DB) use ``status='COMPLETED'`` for
+#   successful ops (the SQLAlchemy enum chosen long ago).
+# Treating only 'SUCCESS' as success made every report rendered from DB-loaded
+# data collapse to 0% pass rate — the cause of the "28628 ops, 0% success" bug.
+SUCCESS_STATES = {'SUCCESS', 'COMPLETED', 'OK'}
+
+
+def _op_succeeded(op: dict) -> bool:
+    if not isinstance(op, dict):
+        return False
+    if op.get('success') is True:
+        return True
+    return (op.get('status') or '').upper() in SUCCESS_STATES
+
 
 class EnhancedReportService:
 
@@ -182,7 +203,7 @@ class EnhancedReportService:
             b = buckets[key]
             b['total'] += 1
             status = (op.get('status') or '').upper()
-            if status == 'SUCCESS':
+            if _op_succeeded(op):
                 b['success'] += 1
             elif status == 'FAILED':
                 b['failed'] += 1
@@ -373,7 +394,7 @@ class EnhancedReportService:
                              if op.get('iteration') == spike_iter or
                              (isinstance(op.get('iteration'), int) and abs(op.get('iteration', 0) - spike_iter) <= 1)]
             ops_count = len(ops_in_window)
-            ops_success = sum(1 for op in ops_in_window if op.get('status') == 'SUCCESS')
+            ops_success = sum(1 for op in ops_in_window if _op_succeeded(op))
             ops_failed = sum(1 for op in ops_in_window if op.get('status') == 'FAILED')
 
             spikes.append({
@@ -1717,7 +1738,7 @@ class EnhancedReportService:
 
         entity_counts = defaultdict(int)
         for op in operations_history:
-            if op.get('status') == 'SUCCESS' and op.get('operation', '').lower() == 'create':
+            if _op_succeeded(op) and op.get('operation', '').lower() == 'create':
                 entity_counts[op.get('entity_type', 'unknown')] += 1
 
         result = {
@@ -1897,7 +1918,7 @@ class EnhancedReportService:
         for op in operations_history:
             key = f"{op.get('entity_type', '?')}.{op.get('operation', '?')}"
             s = (op.get('status') or '').upper()
-            if s == 'SUCCESS':
+            if _op_succeeded(op):
                 entity_qa[key]['ok'] += 1
             elif s == 'FAILED':
                 entity_qa[key]['fail'] += 1
@@ -2394,8 +2415,8 @@ class EnhancedReportService:
                 iter_ops = self._find_ops_near_timestamp(ts, operations_history)
 
             ops_count = len(iter_ops)
-            ops_success = sum(1 for op in iter_ops if op.get('status') == 'SUCCESS')
-            ops_failed = sum(1 for op in iter_ops if op.get('status') == 'FAILED')
+            ops_success = sum(1 for op in iter_ops if _op_succeeded(op))
+            ops_failed = sum(1 for op in iter_ops if (op.get('status') or '').upper() == 'FAILED')
 
             create_count = sum(1 for op in iter_ops if 'create' in (op.get('operation', '') or '').lower())
             delete_count = sum(1 for op in iter_ops if 'delete' in (op.get('operation', '') or '').lower())
@@ -2415,9 +2436,9 @@ class EnhancedReportService:
                 if key not in op_summary:
                     op_summary[key] = {'count': 0, 'success': 0, 'failed': 0, 'avg_duration': 0, 'durations': []}
                 op_summary[key]['count'] += 1
-                if op.get('status') == 'SUCCESS':
+                if _op_succeeded(op):
                     op_summary[key]['success'] += 1
-                elif op.get('status') == 'FAILED':
+                elif (op.get('status') or '').upper() == 'FAILED':
                     op_summary[key]['failed'] += 1
                 if op.get('duration_seconds'):
                     op_summary[key]['durations'].append(op['duration_seconds'])

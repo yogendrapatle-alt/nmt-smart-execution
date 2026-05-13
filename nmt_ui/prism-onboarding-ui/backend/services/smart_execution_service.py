@@ -6756,35 +6756,65 @@ class SmartExecutionController:
             logger.debug(f"Could not get resource allocation: {e}")
             return {}
     
-    async def _query_prometheus(self, query: str) -> Optional[float]:
-        """Query Prometheus and return the metric value (tries both HTTP and HTTPS)"""
+    async def _query_prometheus(
+        self,
+        query: str,
+        aggregator: str = 'first',
+    ) -> Optional[float]:
+        """Query Prometheus and return a single metric value.
+
+        ``aggregator`` controls how multi-series responses are reduced:
+          * ``'first'`` (default) — historical behaviour, picks ``results[0]``
+          * ``'max'``  — worst-case across all series (use for ``>`` / ``>=`` rules)
+          * ``'min'``  — best-case across all series (use for ``<`` / ``<=`` rules)
+
+        Returning a single max/min preserves the legacy single-value contract
+        while making per-pod / per-node rule evaluation actually fire when ANY
+        series crosses the threshold instead of silently looking only at the
+        first series Prometheus happens to return (which is usually a healthy
+        pod and so the rule never fires).
+        """
         if getattr(self, '_prometheus_dead', False):
             return None
-        
+
         urls_to_try = [self.prometheus_url]
         if self.prometheus_url_https:
             urls_to_try.append(self.prometheus_url_https)
-        
+
         for url_base in urls_to_try:
             try:
                 url = urljoin(url_base, '/api/v1/query')
                 params = {'query': query}
-                
+
                 logger.debug(f"🔍 Trying Prometheus: {url} with query={query}")
-                
+
                 response = requests.get(
                     url,
                     params=params,
                     verify=False,
                     timeout=3
                 )
-                
+
                 if response.status_code == 200:
                     data = response.json()
                     if data.get('status') == 'success':
                         results = data.get('data', {}).get('result', [])
                         if results:
-                            value = float(results[0].get('value', [0, 0])[1])
+                            if aggregator in ('max', 'min') and len(results) > 1:
+                                vals = []
+                                for r in results:
+                                    v = r.get('value')
+                                    if not v or len(v) < 2:
+                                        continue
+                                    try:
+                                        vals.append(float(v[1]))
+                                    except (TypeError, ValueError):
+                                        continue
+                                if not vals:
+                                    return None
+                                value = max(vals) if aggregator == 'max' else min(vals)
+                            else:
+                                value = float(results[0].get('value', [0, 0])[1])
                             if url_base != self.prometheus_url:
                                 logger.info(f"✅ Switching to working URL: {url_base}")
                                 self.prometheus_url = url_base
@@ -6794,11 +6824,8 @@ class SmartExecutionController:
             except Exception as e:
                 logger.warning(f"❌ Prometheus query failed for {url_base}: {e}")
                 continue
-        
-        # All URLs failed — mark dead to skip subsequent queries this cycle
+
         self._prometheus_dead = True
-        
-        # All URLs failed
         return None
     
     # ── Monitoring Rule Evaluation ─────────────────────────────────────
@@ -7003,6 +7030,327 @@ class SmartExecutionController:
             'scope': scope,
         }
 
+    @staticmethod
+    def _series_key(rule_id: str, metric: Dict) -> str:
+        """Stable cooldown key per (rule, target series)."""
+        ns = metric.get('namespace', '') if isinstance(metric, dict) else ''
+        pod = metric.get('pod', '') if isinstance(metric, dict) else ''
+        container = metric.get('container', '') if isinstance(metric, dict) else ''
+        node = ((metric.get('instance', '') if isinstance(metric, dict) else '')
+                or (metric.get('node', '') if isinstance(metric, dict) else ''))
+        return f"{rule_id}|{ns}|{pod}|{container}|{node}"
+
+    def _eval_rule_per_series(
+        self,
+        rule_id: str,
+        rule_name: str,
+        severity: str,
+        description: str,
+        cond: Dict,
+        iteration: int,
+        now_ts: float,
+    ) -> bool:
+        """Evaluate a pod/node-scoped single-condition rule per Prometheus series.
+
+        Returns True if this code path fully handled the rule (either fired N
+        per-series violations or determined no series violates). Returns False
+        when the rule is not eligible for per-series eval (e.g. cluster-scoped
+        or ``_query_prometheus_multi`` returned empty due to a transient blip);
+        the caller then falls through to the legacy scalar evaluator.
+        """
+        resolved = self._resolve_condition(cond)
+        scope = resolved.get('scope') or 'pod'
+        if scope not in ('pod', 'node'):
+            return False
+        prom_query = resolved.get('prom_query')
+        if not prom_query:
+            return False
+
+        try:
+            series = self._query_prometheus_multi(prom_query)
+        except Exception as e:
+            logger.debug(f"_query_prometheus_multi failed for '{rule_name}': {e}")
+            return False
+        if not series:
+            return False
+
+        operator = resolved['operator']
+        threshold = resolved['threshold']
+        # Per-series cooldown: 5 minutes — long enough that a single flaky pod
+        # doesn't carpet-bomb alerts every iteration, short enough that
+        # re-occurring issues still show fresh entries in the report.
+        per_series_cooldown_s = 300
+        # Cap how many NEW violations one rule can fan out per evaluation so
+        # the very first scrape against a busy cluster (e.g. 200 pods over
+        # threshold) doesn't blow up the DB / Slack in a single tick.
+        # Subsequent ticks pick up the rest as their per-series cooldowns
+        # expire naturally.
+        max_per_eval = 25
+
+        # Look up the rule once for per-rule Slack throttling decisions.
+        rule_obj = next(
+            (r for r in (self.monitoring_rules or []) if r.get('id') == rule_id),
+            None,
+        )
+        slack_silenced = bool(
+            rule_obj and (
+                rule_obj.get('silenceSlack')
+                or rule_obj.get('silence_slack')
+                or rule_obj.get('notify_slack') is False
+            )
+        )
+
+        # Detect cumulative-counter rules (kube_pod_container_status_restarts_total
+        # etc.) — for these we MUST subtract the baseline captured at execution
+        # start, otherwise we keep alerting forever on pods that crashed BEFORE
+        # the run began (the value never decreases). Also forces a sane "0 means
+        # no NEW restarts" reading so the message says e.g. "3 new restarts"
+        # instead of "value=12".
+        raw_q = (resolved.get('raw_query') or '').lower()
+        prom_q_lower = (prom_query or '').lower()
+        is_restart_counter = (
+            'restart' in raw_q
+            or 'kube_pod_container_status_restarts_total' in prom_q_lower
+        )
+        baseline_lookup = self._pod_restart_baseline if is_restart_counter else None
+
+        fired = 0
+        skipped_due_cooldown = 0
+        skipped_due_baseline = 0
+        evaluated = 0
+        # Collect violating rows so we can persist per-pod rows but send only
+        # ONE Slack summary message per rule per evaluation (huge noise win on
+        # a flaky cluster where ~25 pods violate the same rule each tick).
+        # Dedup by (ns, pod) so a pod with N containers doesn't show up N times
+        # in the Slack summary — keep the worst container's value per pod.
+        violating_summary_by_pod: Dict[tuple, tuple] = {}  # (ns,pod_or_node) -> (ns,pod,node,value)
+        first_violation_for_slack: Optional[Dict] = None
+
+        for s in series:
+            metric = s.get('metric', {}) or {}
+            val_pair = s.get('value') or [0, 0]
+            try:
+                value = float(val_pair[1])
+            except (TypeError, ValueError):
+                continue
+            evaluated += 1
+
+            ns = metric.get('namespace', '') or ''
+            pod = metric.get('pod', '') or metric.get('container', '') or ''
+            node = metric.get('instance', '') or metric.get('node', '') or ''
+
+            # Baseline subtraction for cumulative counters: alert ONLY on
+            # increases since execution start. If pod had 4 restarts when we
+            # started and still has 4, delta=0 → no alert. If it goes to 5,
+            # delta=1 → fires with value=1 ("1 new restart").
+            #
+            # Important: some Prometheus queries aggregate across containers
+            # (e.g. ``PodRestarts`` is ``sum by (pod, namespace) (...)``), so
+            # the resulting series has NO container label. In that case fall
+            # back to summing the baseline across all containers for that pod
+            # — otherwise lookup misses, base=0, every pod with any historic
+            # restart count fires alerts on every iteration. (This was the
+            # root cause of the "static 4.000 4.000 4.000" Slack spam.)
+            if baseline_lookup is not None:
+                container = metric.get('container', '')
+                if container:
+                    key = f"{pod}/{ns}/{container}"
+                    base = baseline_lookup.get(key, 0)
+                else:
+                    # Aggregated-by-pod series → sum baseline across the pod's
+                    # containers so the comparison is apples-to-apples.
+                    prefix = f"{pod}/{ns}/"
+                    base = sum(
+                        v for k, v in baseline_lookup.items()
+                        if k.startswith(prefix)
+                    )
+                delta = value - base
+                if delta <= 0:
+                    skipped_due_baseline += 1
+                    continue
+                value = delta  # report NEW restarts, not cumulative
+
+            if not self._compare(value, operator, threshold):
+                continue
+
+            series_key = self._series_key(rule_id, metric)
+            last = self._rule_cooldowns.get(series_key, 0)
+            if now_ts - last < per_series_cooldown_s:
+                skipped_due_cooldown += 1
+                continue
+
+            if fired >= max_per_eval:
+                # Don't update cooldown — let it fire next tick.
+                continue
+
+            self._rule_cooldowns[series_key] = now_ts
+            scope_label = ''
+            if pod:
+                scope_label += f' pod={pod}'
+            if ns:
+                scope_label += f' ns={ns}'
+            if node:
+                scope_label += f' node={node}'
+
+            violation = {
+                'rule_id': rule_id,
+                'rule_name': rule_name,
+                'query': resolved['raw_query'],
+                'prom_query': prom_query,
+                'operator': operator,
+                'threshold': threshold,
+                'actual_value': round(value, 4),
+                'severity': severity,
+                'description': description,
+                'namespace': ns or 'All',
+                'pod_name': pod or 'All',
+                'node': node,
+                'iteration': iteration,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'execution_id': self.execution_id,
+                'is_composite': False,
+                'logical_operator': None,
+                'series_labels': dict(metric),
+                'scope': scope,
+            }
+            self.monitoring_rule_violations.append(violation)
+            fired += 1
+            # Dedup by (ns, pod_or_node) — one row per pod (or per node), keep
+            # the worst container's value so the Slack summary doesn't list
+            # the same pod five times for its five containers.
+            dedup_key = (ns, pod or node or '<cluster>')
+            existing = violating_summary_by_pod.get(dedup_key)
+            if (existing is None) or (value > existing[3]):
+                violating_summary_by_pod[dedup_key] = (ns, pod, node, value)
+            if first_violation_for_slack is None:
+                first_violation_for_slack = violation
+
+            logger.warning(
+                f"🚨 Monitoring rule violated: {rule_name}{scope_label} "
+                f"(value={value:.3f} {operator} {threshold})"
+            )
+            try:
+                self._log_event(
+                    'WARNING',
+                    f'Monitoring rule violated: {rule_name}{scope_label}',
+                    rule_violation=violation,
+                )
+            except Exception:
+                pass
+            try:
+                self._emit_event(
+                    'monitoring_rule_violated',
+                    f'{rule_name}{scope_label}',
+                    severity=severity.lower(),
+                    iteration=iteration,
+                    metadata={'rule_id': rule_id, 'pod': pod, 'namespace': ns, 'node': node},
+                )
+            except Exception:
+                pass
+            try:
+                self._persist_rule_violation_alert(violation)
+            except Exception as e:
+                logger.debug(f"persist alert failed for {rule_name}{scope_label}: {e}")
+
+        # ── ONE rolled-up Slack message per rule per evaluation ──────
+        # Per-pod violations all land in `alert_summaries` (UI Alerts page +
+        # Report still show every offender). Slack just gets a digest so the
+        # channel is signal-rich rather than spammed with 25 near-duplicate
+        # messages every iteration.
+        if (not slack_silenced) and first_violation_for_slack and violating_summary_by_pod:
+            try:
+                self._send_rule_violation_slack_summary(
+                    first_violation_for_slack,
+                    list(violating_summary_by_pod.values()),
+                    is_delta=is_restart_counter,
+                )
+            except Exception as e:
+                logger.debug(f"slack summary send failed for {rule_name}: {e}")
+
+        # Trim in-memory violations list to avoid unbounded growth over a 72h run.
+        if len(self.monitoring_rule_violations) > 5000:
+            self.monitoring_rule_violations = self.monitoring_rule_violations[-5000:]
+
+        if fired or skipped_due_cooldown or skipped_due_baseline:
+            if fired or skipped_due_cooldown:
+                self._rule_cooldowns[rule_id] = now_ts
+            logger.info(
+                f"📋 Rule '{rule_name}' per-series eval: evaluated={evaluated} "
+                f"fired={fired} cooldown_suppressed={skipped_due_cooldown} "
+                f"baseline_suppressed={skipped_due_baseline} "
+                f"slack={'1 summary' if (fired and not slack_silenced) else 'silenced'}"
+            )
+        return True
+
+    def _send_rule_violation_slack_summary(
+        self,
+        sample_violation: Dict,
+        offenders: list,
+        is_delta: bool = False,
+    ):
+        """Send ONE Slack message summarising N per-series violations.
+
+        ``is_delta`` should be True for cumulative-counter rules (restarts) —
+        the values in ``offenders`` are NEW counts since execution start, so
+        we label them as such ("3 new") instead of an opaque cumulative number.
+        """
+        try:
+            testbed_uid = self.testbed_info.get('unique_testbed_id')
+            webhook = get_slack_webhook_for_testbed(testbed_uid)
+            if not webhook:
+                return
+            sev_emoji = {
+                'Critical': ':rotating_light:',
+                'Moderate': ':warning:',
+                'Low': ':information_source:',
+            }
+            emoji = sev_emoji.get(sample_violation.get('severity'), ':bell:')
+            n = len(offenders)
+            lines = [
+                f"{emoji} *Monitoring Rule Violated*",
+                f"*Rule:* {sample_violation.get('rule_name')}",
+                f"*Severity:* {sample_violation.get('severity')}",
+                f"*Threshold:* {sample_violation.get('operator')} {sample_violation.get('threshold')}",
+                f"*Affected:* {n} pod(s)" if is_delta else f"*Affected:* {n} target(s)",
+                f"*Execution:* {sample_violation.get('execution_id', 'N/A')} "
+                f"(iteration {sample_violation.get('iteration', '?')})",
+            ]
+            # Show worst offenders first
+            top = sorted(offenders, key=lambda o: o[3], reverse=True)[:10]
+            sample_lines = []
+            for ns, pod, node, val in top:
+                tag = pod or node or 'cluster'
+                if ns and pod:
+                    tag = f"{ns}/{pod}"
+                elif node:
+                    tag = node
+                if is_delta:
+                    iv = int(round(val))
+                    sample_lines.append(
+                        f"  • {tag} → {iv} new restart{'s' if iv != 1 else ''} since start"
+                    )
+                else:
+                    sample_lines.append(f"  • {tag} = {val:.2f}")
+            if sample_lines:
+                lines.append("*Top offenders:*")
+                lines.extend(sample_lines)
+            if n > len(top):
+                lines.append(f"  …and {n - len(top)} more (see Alerts page)")
+
+            text = "\n".join(lines)
+            if post_slack_incoming_webhook(webhook, text):
+                logger.info(
+                    f"📢 Slack summary sent: {sample_violation.get('rule_name')} "
+                    f"({n} offender{'s' if n != 1 else ''})"
+                )
+            else:
+                logger.debug(
+                    f"Slack webhook delivery failed for summary: "
+                    f"{sample_violation.get('rule_name')}"
+                )
+        except Exception as e:
+            logger.debug(f"Could not send Slack rollup notification: {e}")
+
     async def _evaluate_monitoring_rules(self, iteration: int):
         """Evaluate user-configured monitoring rules against live Prometheus data.
 
@@ -7024,11 +7372,6 @@ class SmartExecutionController:
             rule_name = rule.get('name', 'Unnamed Rule')
             severity = rule.get('severity', 'Moderate')
             description = rule.get('description', '')
-
-            # Cooldown: don't re-alert for the same rule within 60 seconds
-            last_fired = self._rule_cooldowns.get(rule_id, 0)
-            if now_ts - last_fired < 60:
-                continue
 
             # ── Decide rule shape ──────────────────────────────────────
             conditions = rule.get('conditions') or []
@@ -7053,7 +7396,32 @@ class SmartExecutionController:
                     'node_instances': rule.get('node_instances') or rule.get('nodeInstances'),
                 }]
 
-            # ── Evaluate each condition ────────────────────────────────
+            # ── Per-series fast path (single-condition pod/node rules) ─
+            # When a rule has exactly one condition AND that condition is
+            # pod/node-scoped, fan out one violation per matching series so
+            # debugging a flaky cluster shows which pods are bad — not just
+            # "rule fired once". Cluster-scoped rules and composite (AND/OR)
+            # rules fall through to the original scalar path below.
+            if (not is_composite and len(conditions) == 1
+                    and not getattr(self, '_prometheus_dead', False)):
+                try:
+                    if self._eval_rule_per_series(
+                        rule_id, rule_name, severity, description,
+                        conditions[0], iteration, now_ts,
+                    ):
+                        # Per-series fast path handled this rule (fired or all
+                        # under threshold). Skip the scalar evaluator below.
+                        continue
+                except Exception as e:
+                    logger.debug(f"per-series eval failed for '{rule_name}', falling back to scalar: {e}")
+
+            # Cooldown for the scalar path: don't re-alert for the same rule
+            # within 60 seconds.
+            last_fired = self._rule_cooldowns.get(rule_id, 0)
+            if now_ts - last_fired < 60:
+                continue
+
+            # ── Evaluate each condition (scalar / composite path) ──────
             condition_results = []  # list of dicts with violated/value/details
             try:
                 for cond in conditions:
@@ -7064,7 +7432,9 @@ class SmartExecutionController:
                             **resolved, 'value': None, 'violated': False, 'error': 'empty_query',
                         })
                         continue
-                    value = await self._query_prometheus(prom_query)
+                    op = resolved.get('operator', '>')
+                    aggregator = 'max' if op in ('>', '>=') else ('min' if op in ('<', '<=') else 'first')
+                    value = await self._query_prometheus(prom_query, aggregator=aggregator)
                     if value is None:
                         condition_results.append({
                             **resolved, 'value': None, 'violated': False, 'error': 'no_data',
@@ -7152,8 +7522,28 @@ class SmartExecutionController:
                 logger.warning(f"Failed to evaluate monitoring rule '{rule_name}': {e}")
 
     def _send_rule_violation_slack(self, violation: Dict, scope_label: str = ''):
-        """Send Slack notification for a monitoring rule violation."""
+        """Send Slack notification for a monitoring rule violation.
+
+        Honours the per-rule ``silenceSlack`` (or ``silence_slack``) flag — when
+        set, the violation is still persisted to ``alert_summaries`` (visible on
+        the Alerts page + Report) but no Slack message is sent. Defaults to
+        sending Slack so existing rule configs keep their old behaviour.
+        """
         try:
+            # Per-rule silence: look up the originating rule by id and honour
+            # its silenceSlack flag (covers both new per-series violations and
+            # the legacy scalar/composite path).
+            rule_id = violation.get('rule_id')
+            if rule_id:
+                rule = next(
+                    (r for r in (self.monitoring_rules or [])
+                     if r.get('id') == rule_id),
+                    None,
+                )
+                if rule and (rule.get('silenceSlack') or rule.get('silence_slack')
+                             or rule.get('notify_slack') is False):
+                    return
+
             testbed_uid = self.testbed_info.get('unique_testbed_id')
             webhook = get_slack_webhook_for_testbed(testbed_uid)
             if not webhook:
