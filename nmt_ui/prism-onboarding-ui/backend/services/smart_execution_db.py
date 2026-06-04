@@ -38,6 +38,18 @@ def save_smart_execution(execution_data: Dict) -> bool:
         
         session.commit()
         session.close()
+
+        # Layer-2 (Phase D): when an execution lands in a terminal state, warm
+        # its report snapshot in the background so the first open is instant.
+        try:
+            if (execution_data.get('status') or '').upper() in (
+                'COMPLETED', 'STOPPED', 'FAILED', 'TIMEOUT', 'CANCELLED', 'ERROR'
+            ):
+                from services.smart_execution_report_snapshot_service import schedule_proactive_capture
+                schedule_proactive_capture(execution_id, execution_data.get('status'))
+        except Exception:
+            logger.debug("Proactive snapshot scheduling skipped for %s", execution_id, exc_info=True)
+
         return True
         
     except Exception as e:

@@ -947,6 +947,26 @@ class ExecutionManager:
     def get_execution_status(self, execution_id: str) -> Optional[Dict[str, Any]]:
         """Get execution status (alias for compatibility)"""
         return self.get_status(execution_id)
+
+    def list_active_executions(self) -> List[str]:
+        """Return execution_ids currently in a non-terminal state.
+
+        The adapter (`NMTExecutionAdapter.list_active_executions`) wraps this
+        into ``{success, execution_ids, count}``. Completed/failed/stopped
+        contexts may linger in ``active_executions`` after finishing, so we
+        filter them out and only surface executions that are still
+        pending/starting/running/paused.
+        """
+        terminal = {
+            ExecutionStatus.COMPLETED.value,
+            ExecutionStatus.FAILED.value,
+            ExecutionStatus.STOPPED.value,
+        }
+        with self._lock:
+            return [
+                eid for eid, ctx in self.active_executions.items()
+                if getattr(ctx, 'status', None) not in terminal
+            ]
     
     def pause_execution(self, execution_id: str) -> bool:
         """Pause execution"""

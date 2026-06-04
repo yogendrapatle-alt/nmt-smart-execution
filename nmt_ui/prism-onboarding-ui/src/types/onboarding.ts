@@ -56,6 +56,10 @@ export interface Alert {
   is_actionable?: boolean;
   resolved_reason?: string;
   diagnostic_context?: Record<string, unknown>;
+  // Phase 3.2 — set when this alert was produced by a monitor-only session
+  // (execution_id starts with "MON-"). UI can render a "from monitor X" badge.
+  source_monitor_id?: string | null;
+  source_monitor_name?: string | null;
 }
 
 export interface AlertTimelineEvent {

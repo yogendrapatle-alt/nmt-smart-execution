@@ -96,6 +96,57 @@ CORS(app, resources={
     }
 })
 
+# ---------------------------------------------------------------------------
+# Transparent gzip compression for large JSON/HTML responses.
+#
+# Several endpoints legitimately return multi-MB JSON (e.g. /api/alerts and the
+# monitor report downloads). In production we sit behind nginx (which can gzip),
+# but this stdlib-only hook guarantees compression regardless of the front
+# proxy and for direct backend access — with NO extra dependency to install on
+# the VM. Repetitive JSON of this shape compresses ~10-20x, turning an 8.6 MB
+# alert list into a few hundred KB on the wire.
+# ---------------------------------------------------------------------------
+import gzip as _gzip
+
+_COMPRESSIBLE_TYPES = frozenset({
+    'application/json', 'application/javascript', 'text/html',
+    'text/css', 'text/plain', 'application/xml', 'text/xml',
+})
+_GZIP_MIN_BYTES = 1024  # don't pay the gzip overhead on tiny responses
+
+
+@app.after_request
+def _gzip_response(response):
+    """Compress eligible responses when the client advertises gzip support."""
+    try:
+        if 'gzip' not in (request.headers.get('Accept-Encoding') or '').lower():
+            return response
+        # Never touch the realtime transport — engine.io polling is sensitive.
+        if request.path.startswith('/socket.io'):
+            return response
+        # Skip streaming/SSE/file passthrough and already-encoded bodies.
+        if response.direct_passthrough or response.headers.get('Content-Encoding'):
+            return response
+        if (response.mimetype or '').lower() not in _COMPRESSIBLE_TYPES:
+            return response
+        data = response.get_data()
+        if len(data) < _GZIP_MIN_BYTES:
+            return response
+
+        compressed = _gzip.compress(data, compresslevel=6)
+        response.set_data(compressed)
+        response.headers['Content-Encoding'] = 'gzip'
+        response.headers['Content-Length'] = str(len(compressed))
+        vary = response.headers.get('Vary')
+        if not vary:
+            response.headers['Vary'] = 'Accept-Encoding'
+        elif 'accept-encoding' not in vary.lower():
+            response.headers['Vary'] = vary + ', Accept-Encoding'
+        return response
+    except Exception:
+        # Compression must never break a response — fall back to the original.
+        return response
+
 # --- Config API Endpoints ---
 from database import save_config_to_db, fetch_latest_config_for_pc_ip, fetch_latest_config_for_testbed, init_db, SessionLocal, save_workload_to_db, save_testbed_to_db, fetch_workloads_by_pc_ip, fetch_testbeds_by_pc_ip, fetch_workload_by_uuid, fetch_testbed_by_uuid, fetch_all_testbed_labels, fetch_latest_testbed_by_label, fetch_all_workload_labels, fetch_latest_workload_by_label, fetch_workloads_by_testbed_label, fetch_latest_workload_by_testbed_label, save_env_run_to_db, fetch_env_run_by_uuid, save_dynamic_workload_to_db, fetch_dynamic_workloads_by_uuid,fetch_latest_workload_by_unique_testbed_id, update_testbed_deployment_info, fetch_testbed_by_unique_id, recover_orphaned_executions, get_pool_status, log_pool_status
 from models.config import Config
@@ -171,6 +222,10 @@ app.register_blueprint(smart_execution_ai_bp)
 # Monitor-Only Testbed flow (Phase-4) — standalone Prometheus rule watcher
 from routes.monitor_only_routes import monitor_only_bp
 app.register_blueprint(monitor_only_bp)
+# NOTE: monitor-only scheduler is started AFTER init_db() further down so the
+# Phase-1 column migrations have run by the time the first scheduler tick
+# tries to query monitor_sessions. Avoids a transient ProgrammingError on
+# fresh databases that don't yet have baseline_health/cluster_health_snapshot.
 
 # Phase 3: Register Scheduled Execution routes
 from routes.scheduled_execution_routes import scheduled_execution_bp
@@ -200,6 +255,16 @@ app.register_blueprint(migration_bp)
 
 # Initialize the database (create tables if not exist)
 init_db()
+
+# Monitor-Only scheduler (Phase 4.2) — daemon thread that materialises
+# pending scheduled monitors. Started AFTER init_db() so the new
+# monitor_sessions columns (baseline_health, cluster_health_snapshot, etc.)
+# are guaranteed to exist before the first tick fires its SELECT.
+try:
+    from services.monitor_only_service import start_scheduler_thread as _start_mo_scheduler
+    _start_mo_scheduler()
+except Exception as _e:
+    logging.warning(f"Monitor-only scheduler failed to start: {_e}")
 
 # Recover any orphaned executions from previous backend restart/crash
 logging.info("🔍 Checking for orphaned executions from previous backend restart...")
@@ -876,7 +941,12 @@ def collect_continuous_testbed_metrics():
                     full_metrics=snapshot
                 )
                 
-                logging.debug(f"✅ Metrics collected for {testbed_label}: CPU={cpu_percent:.1f}%, Memory={memory_percent:.1f}%")
+                # cpu/memory can be None when Prometheus is unreachable — guard
+                # the format so the success log doesn't raise
+                # "unsupported format string passed to NoneType.__format__".
+                _cpu_s = f"{cpu_percent:.1f}%" if cpu_percent is not None else "n/a"
+                _mem_s = f"{memory_percent:.1f}%" if memory_percent is not None else "n/a"
+                logging.debug(f"✅ Metrics collected for {testbed_label}: CPU={_cpu_s}, Memory={_mem_s}")
                 
             except Exception as e:
                 logging.warning(f"Error collecting metrics for testbed {testbed.get('testbed_label')}: {e}")
@@ -1723,6 +1793,57 @@ def save_testbed_monitoring_rules(testbed_id):
     except Exception as e:
         logging.error(f"Error saving monitoring rules for {testbed_id}: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/testbed/<testbed_id>/refresh-prometheus', methods=['POST'])
+def refresh_testbed_prometheus_endpoint(testbed_id):
+    """Re-resolve and persist the Prometheus URL for a single testbed.
+
+    Resolution chain:
+      1. Probe the currently stored URL (and http/https flip).
+      2. Probe the standard port-9090 fallback on pc_ip / ncm_ip.
+      3. SSH into the PC and run kubectl to rediscover the NodePort of
+         the `prometheus-automation` service in `ntnx-system`. If the
+         service is missing, re-run `kubectl expose` and re-read.
+
+    Step 3 requires `username` + `password` on the testbed row (set
+    during onboarding). When credentials are missing the response will
+    include `kubectl_skipped=true` so the UI can prompt the operator
+    to re-onboard.
+
+    Used by the testbed list "Refresh Prometheus" button and the new
+    monitor / smart-execution start flows to self-heal stale NodePort
+    URLs after NCM reinstall / NCM VM reboot / svc delete-recreate.
+    """
+    try:
+        from services.prometheus_url import refresh_testbed_prometheus
+
+        # Optional override flags from the UI
+        body = request.get_json(silent=True) or {}
+        force_kubectl = body.get('force_kubectl', True)
+
+        result = refresh_testbed_prometheus(
+            testbed_id,
+            force_kubectl=bool(force_kubectl),
+        )
+
+        # Bust the per-process _testbed_meta cache so the next monitor /
+        # report build picks up the freshly-resolved URL immediately
+        # instead of waiting up to 30s for the TTL to expire.
+        try:
+            from services.monitor_only_service import _invalidate_testbed_meta_cache
+            _invalidate_testbed_meta_cache(testbed_id)
+        except Exception:
+            pass
+
+        # Translate "not found" into a proper 404
+        if not result.get('success') and result.get('error') == 'testbed_not_found':
+            return jsonify(result), 404
+
+        return jsonify(result), 200
+    except Exception as e:
+        logging.exception(f"refresh-prometheus failed for {testbed_id}")
+        return jsonify({'success': False, 'testbed_id': testbed_id, 'error': str(e)}), 500
 
 
 @app.route('/api/get-workload-labels', methods=['GET'])
@@ -3715,9 +3836,17 @@ def get_ncm_deployment_status():
 
 @app.route('/api/alerts/<testbed_id>', methods=['GET'])
 def get_alerts_for_testbed(testbed_id):
-    """Get alerts for a specific testbed from the alert_summaries table."""
+    """Get alerts for a specific testbed from the alert_summaries table.
+
+    Phase 3.2: when an alert's ``diagnostic_context.execution_id`` matches a
+    monitor session id (``MON-*``), we surface ``source_monitor_id`` and
+    ``source_monitor_name`` on the row so the Alerts page can show a
+    "from monitor X" badge — making it easy to tell at a glance which alerts
+    were produced by a monitor-only run vs an AI execution.
+    """
     try:
         import psycopg2
+        import json as _json
         DB_CFG = dict(dbname="alerts", user="alertuser", password="alertpass", host="localhost", port="5432")
 
         sev_map = {'critical': 'Critical', 'warning': 'Moderate', 'info': 'Low'}
@@ -3735,13 +3864,47 @@ def get_alerts_for_testbed(testbed_id):
             LIMIT 200
         """, (testbed_id,))
         rows = cur.fetchall()
+
+        # Phase 3.2: bulk-load monitor session names for any MON-* execution
+        # ids in this page of alerts so we can attach a friendly name without
+        # an N+1 query per row.
+        mon_ids = set()
+        diag_by_row = []
+        for r in rows:
+            diag = r[10] if len(r) > 10 else None
+            if isinstance(diag, str):
+                try:
+                    diag = _json.loads(diag)
+                except (ValueError, TypeError):
+                    diag = {}
+            if not isinstance(diag, dict):
+                diag = {}
+            diag_by_row.append(diag)
+            exec_id = diag.get('execution_id')
+            if isinstance(exec_id, str) and exec_id.startswith('MON-'):
+                mon_ids.add(exec_id)
+
+        monitor_names: dict = {}
+        if mon_ids:
+            try:
+                cur.execute(
+                    "SELECT monitor_id, name FROM monitor_sessions WHERE monitor_id = ANY(%s)",
+                    (list(mon_ids),),
+                )
+                for mid, mname in cur.fetchall():
+                    monitor_names[mid] = mname
+            except Exception as me:
+                logging.debug(f"alerts: monitor name lookup failed: {me}")
+
         cur.close()
         conn.close()
 
         alert_list = []
-        for row in rows:
+        for row, diag in zip(rows, diag_by_row):
             raw_sev = (row[2] or '').lower()
             raw_sts = (row[3] or '').lower()
+            exec_id = diag.get('execution_id') if isinstance(diag, dict) else None
+            source_monitor_id = exec_id if isinstance(exec_id, str) and exec_id.startswith('MON-') else None
             alert_list.append({
                 'id': str(row[0]),
                 'testbed_id': testbed_id,
@@ -3754,6 +3917,8 @@ def get_alerts_for_testbed(testbed_id):
                 'timestamp': row[7].isoformat() + 'Z' if row[7] else None,
                 'duration_minutes': row[8],
                 'resolved_at': row[9].isoformat() + 'Z' if row[9] else None,
+                'source_monitor_id': source_monitor_id,
+                'source_monitor_name': monitor_names.get(source_monitor_id) if source_monitor_id else None,
             })
 
         return jsonify({
@@ -4210,6 +4375,41 @@ def start_smart_execution_api():
             'category': {'create': 3, 'delete': 2, 'list': 2},
             'project': {'create': 3, 'delete': 2, 'list': 2},
         }
+        def _normalize_ops_list(ops_list):
+            """Turn a list of operation specs into a {op_name: weight} dict.
+
+            Defensive against mixed shapes so a bad payload never 500s:
+              ["create", "delete"]                      -> {'create': 5, 'delete': 5}
+              [{"create": 5}, {"delete": 3}]            -> {'create': 5, 'delete': 3}
+              [{"operation": "create", "count": 5}]     -> {'create': 5}
+              [{"op": "list", "weight": 2}]             -> {'list': 2}
+            Unrecognizable / non-hashable items are skipped instead of raising.
+            """
+            norm = {}
+            for op in ops_list:
+                if isinstance(op, str):
+                    norm[op.strip().lower()] = 5
+                elif isinstance(op, dict):
+                    name = op.get('operation') or op.get('op') or op.get('name') or op.get('type')
+                    weight = op.get('count') or op.get('weight') or op.get('value') or op.get('num')
+                    if not name:
+                        # single-key mapping like {"create": 5}
+                        meta_keys = {'count', 'weight', 'value', 'num', 'quantity'}
+                        cand = [k for k in op.keys()
+                                if isinstance(k, str) and k.lower() not in meta_keys]
+                        if len(cand) == 1:
+                            name = cand[0]
+                            if weight is None:
+                                weight = op.get(cand[0])
+                    if name:
+                        try:
+                            weight = int(weight) if weight is not None else 5
+                        except (TypeError, ValueError):
+                            weight = 5
+                        norm[str(name).strip().lower()] = weight
+                # any other type (int, list, None, ...) is ignored
+            return norm
+
         normalized_entities = {}
         for entity, ops in entities_config.items():
             entity_lower = entity.lower().replace(' ', '_')
@@ -4218,7 +4418,7 @@ def start_smart_execution_api():
             elif ops is False or ops is None:
                 continue
             elif isinstance(ops, list):
-                normalized_entities[entity_lower] = {op: 5 for op in ops}
+                normalized_entities[entity_lower] = _normalize_ops_list(ops)
             elif isinstance(ops, dict):
                 normalized_entities[entity_lower] = ops
         
@@ -4329,8 +4529,8 @@ def get_smart_execution_status(execution_id):
                 'target_config': db_data.get('target_config', {}),
                 'baseline_metrics': db_data.get('baseline_metrics', {}),
                 'current_metrics': db_data.get('final_metrics', {}),
-                'operations_history': db_data.get('operations_history', [])[-10:],
-                'metrics_history': db_data.get('metrics_history', [])[-20:],
+                'operations_history': (db_data.get('operations_history') or [])[-10:],
+                'metrics_history': (db_data.get('metrics_history') or [])[-20:],
                 'threshold_reached': db_data.get('threshold_reached', False),
                 'entity_breakdown': db_data.get('entity_breakdown', {}),
                 'testbed_info': {
@@ -5298,9 +5498,33 @@ def get_smart_execution_history():
         min_success_rate = request.args.get('min_success_rate', type=float)
         min_operations = request.args.get('min_operations', type=int)
         threshold_reached_filter = request.args.get('threshold_reached')
-        
+        # Pagination: clamp to a sane upper bound to protect the JSON response from runaway growth.
+        limit_param = request.args.get('limit', type=int)
+        list_limit = max(1, min(limit_param or 200, 500))
+
         executions_list = get_all_smart_executions()
-        
+
+        # Per-row bloat strip for the list view. These JSONB columns can each grow to 100+ MB
+        # on long-running soaks (full_execution_data is a denormalized snapshot of the entire run;
+        # metrics_history and operations_history grow with every checkpoint). The list page only
+        # renders summary fields, so shipping these is pure waste and has historically caused
+        # multi-hundred-MB responses that hang the dashboard and trigger OOM in nginx gzip.
+        # Detail pages should call the per-execution status/report endpoints, not this list.
+        _HISTORY_BLOAT_FIELDS = (
+            'full_execution_data',
+            'metrics_history',
+            'operations_history',
+            'created_entities',
+            'entity_breakdown',
+            'resource_summary',
+            'ml_stats',
+            'anomaly_data',
+            'baseline_metrics',
+            'final_metrics',
+            'pid_stats',
+            'checkpoint_data',
+        )
+
         # Enrich executions with target and final metrics for frontend
         enriched_executions = []
         for exec_data in executions_list:
@@ -5345,7 +5569,11 @@ def get_smart_execution_history():
                         enriched['duration_minutes'] = 0
                 else:
                     enriched['duration_minutes'] = 0
-            
+
+            # Drop heavyweight JSONB fields after all summary derivations are done.
+            for _bloat_key in _HISTORY_BLOAT_FIELDS:
+                enriched.pop(_bloat_key, None)
+
             enriched_executions.append(enriched)
         
         # Apply filters
@@ -5395,20 +5623,26 @@ def get_smart_execution_history():
                 e for e in filtered_executions 
                 if e.get('threshold_reached', False) == threshold_bool
             ]
-        
-        # Calculate summary statistics
-        if filtered_executions:
-            success_rates = [e.get('success_rate', 0) for e in filtered_executions if e.get('success_rate')]
-            ops_per_min = [e.get('operations_per_minute', 0) for e in filtered_executions if e.get('operations_per_minute')]
-            durations = [e.get('duration_minutes', 0) for e in filtered_executions if e.get('duration_minutes')]
-            
+
+        # Cap the returned list to the requested (clamped) limit so the JSON response
+        # cannot grow unbounded as history accumulates. The summary block below is still
+        # computed over the full filtered set for accurate aggregate stats.
+        unbounded_filtered = filtered_executions
+        filtered_executions = filtered_executions[:list_limit]
+
+        # Calculate summary statistics over the full filtered set (not the limited list).
+        if unbounded_filtered:
+            success_rates = [e.get('success_rate', 0) for e in unbounded_filtered if e.get('success_rate')]
+            ops_per_min = [e.get('operations_per_minute', 0) for e in unbounded_filtered if e.get('operations_per_minute')]
+            durations = [e.get('duration_minutes', 0) for e in unbounded_filtered if e.get('duration_minutes')]
+
             summary = {
                 'avg_success_rate': sum(success_rates) / len(success_rates) if success_rates else 0,
                 'avg_operations_per_min': sum(ops_per_min) / len(ops_per_min) if ops_per_min else 0,
                 'avg_duration_minutes': sum(durations) / len(durations) if durations else 0,
-                'total_executions': len(filtered_executions),
-                'completed_count': sum(1 for e in filtered_executions if e.get('status') == 'COMPLETED'),
-                'threshold_reached_count': sum(1 for e in filtered_executions if e.get('threshold_reached', False))
+                'total_executions': len(unbounded_filtered),
+                'completed_count': sum(1 for e in unbounded_filtered if e.get('status') == 'COMPLETED'),
+                'threshold_reached_count': sum(1 for e in unbounded_filtered if e.get('threshold_reached', False))
             }
         else:
             summary = {
@@ -5419,12 +5653,14 @@ def get_smart_execution_history():
                 'completed_count': 0,
                 'threshold_reached_count': 0
             }
-        
+
         return jsonify({
             'success': True,
             'executions': filtered_executions,
             'total': len(executions_list),
-            'filtered': len(filtered_executions),
+            'filtered': len(unbounded_filtered),
+            'returned': len(filtered_executions),
+            'limit': list_limit,
             'summary': summary
         }), 200
             
@@ -5679,15 +5915,130 @@ def download_smart_execution_report(execution_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _enh_fmtts(raw):
+    """Format an ISO timestamp string into a human-readable local time."""
+    if not raw:
+        return '—'
+    try:
+        from dateutil import parser as dtparser
+        dt = dtparser.isoparse(str(raw))
+        return dt.strftime('%b %d, %Y %H:%M:%S')
+    except Exception:
+        s = str(raw)
+        return s[:19].replace('T', ' ') if len(s) > 10 else s
+
+
+def _enh_fmtduration(raw):
+    """Render seconds as a compact human duration (86400→'1d 0h', 45→'45s')."""
+    if raw is None or raw == '':
+        return '—'
+    try:
+        secs = float(raw)
+    except (TypeError, ValueError):
+        return '—'
+    if secs < 0:
+        return '—'
+    if secs < 60:
+        return f"{int(secs)}s"
+    mins = int(secs // 60)
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    mins = mins % 60
+    if hours < 24:
+        return f"{hours}h {mins}m"
+    days = hours // 24
+    hours = hours % 24
+    return f"{days}d {hours}h"
+
+
+def _enhanced_report_template():
+    """Build the enhanced-report Jinja template with the report filters
+    registered. Shared by the live render path and the snapshot re-render path
+    so snapshot-served HTML is byte-for-byte identical to a live render."""
+    from jinja2 import Environment, BaseLoader
+    template_path = os.path.join(os.path.dirname(__file__), 'templates', 'enhanced_report.html')
+    with open(template_path, 'r') as f:
+        env = Environment(loader=BaseLoader(), autoescape=False)
+        env.filters['fmtts'] = _enh_fmtts
+        env.filters['fmtduration'] = _enh_fmtduration
+        return env.from_string(f.read())
+
+
+def _enhanced_html_response(html_content, execution_id):
+    """Wrap rendered HTML in a UTF-8 response with inline/attachment disposition."""
+    from flask import make_response
+    response = make_response(html_content)
+    response.headers['Content-Type'] = 'text/html; charset=utf-8'
+    force_download = (request.args.get('download', '').lower() in ('1', 'true', 'yes'))
+    disposition = 'attachment' if force_download else 'inline'
+    response.headers['Content-Disposition'] = (
+        f'{disposition}; filename="smart-execution-enhanced-{execution_id[:10]}.html"'
+    )
+    return response
+
+
+def _serve_enhanced_from_snapshot(execution_id, row):
+    """Render an enhanced-report response from a stored snapshot row (no
+    Prometheus / engine access). Returns a Flask response, or None if the
+    stored payload is unusable (caller falls back to live)."""
+    try:
+        payload = row.get('payload') or {}
+        render_kwargs = payload.get('render_kwargs')
+        if not isinstance(render_kwargs, dict):
+            return None
+        fmt = request.args.get('format', 'download')
+        if fmt == 'json':
+            from services.smart_execution_report_snapshot_service import reconstruct_enhanced_data
+            return jsonify({
+                'success': True,
+                'enhanced_report': reconstruct_enhanced_data(payload),
+                'execution_id': execution_id,
+                'testbed_label': render_kwargs.get('testbed_label', 'Unknown'),
+                'status': render_kwargs.get('status', 'UNKNOWN'),
+                'served_from': 'snapshot',
+                'snapshot_generated_at': row.get('generated_at'),
+            })
+        template = _enhanced_report_template()
+        html_content = template.render(**render_kwargs)
+        resp = _enhanced_html_response(html_content, execution_id)
+        resp.headers['X-Report-Source'] = 'snapshot'
+        if row.get('generated_at'):
+            resp.headers['X-Report-Generated-At'] = str(row.get('generated_at'))
+        return resp
+    except Exception:  # noqa: BLE001
+        logging.exception("[%s] failed to serve enhanced report from snapshot", execution_id)
+        return None
+
+
 @app.route('/api/smart-execution/report/<execution_id>/enhanced', methods=['GET'])
 def get_enhanced_smart_execution_report(execution_id):
     """
     Generate AI-enhanced HTML report with spike analysis, cluster health,
     failure grouping, capacity planning, and historical comparison.
+
+    Layer-2 (Phase D): a materialised snapshot is served first when available
+    (fast, Prometheus-independent). ``?source=live`` forces a fresh build;
+    ``?source=snapshot`` forces the stored copy; ``auto`` (default) serves a
+    terminal snapshot when present and otherwise builds live + captures.
     """
     try:
         from services.smart_execution_service import get_smart_execution
         from services.smart_execution_db import load_smart_execution
+        from services import smart_execution_report_snapshot_service as _snap_svc
+
+        # ── Dual-read: serve a stored snapshot before the heavy build ──────
+        _source = _snap_svc.resolve_source(request.args.get('source'))
+        _nocache = request.args.get('nocache', '').lower() in ('1', 'true', 'yes')
+        if not _nocache:
+            try:
+                _row = _snap_svc.load_servable(execution_id, _source)
+            except Exception:  # noqa: BLE001
+                _row = None
+            if _row:
+                _resp = _serve_enhanced_from_snapshot(execution_id, _row)
+                if _resp is not None:
+                    return _resp
 
         status = None
         report_data = None
@@ -5701,6 +6052,82 @@ def get_enhanced_smart_execution_report(execution_id):
                 engine = exec_data['engine']
                 summary = engine.get_execution_summary()
                 report_data = summary
+                # Pull the Prometheus URL the AI engine has been using so the
+                # enhanced-report's pod_health classifier can hit the same
+                # endpoint. Without this the active-execution report path
+                # always lands at ``prometheus_url_not_configured`` and v3's
+                # events / sparkline data stay empty.
+                #
+                # The AI engine itself does NOT define a public
+                # ``prometheus_url`` attribute (see SmartExecutionEngineAI in
+                # services/smart_execution_engine_ai.py). The control loop
+                # in routes/smart_execution_ai_routes.py instead stores the
+                # resolved URL on ``ai_engine._prometheus_url`` AFTER the
+                # loop exits, and ``engine.testbed_info`` always carries
+                # ``prometheus_endpoint`` from the start. Reading only
+                # ``engine.prometheus_url`` therefore returned None for
+                # every still-running AI execution, which made the v5 Pod
+                # Health table render empty rows ("most fields are missing
+                # in the report"). Reach for every known location, in the
+                # order they become populated, before giving up.
+                _tb_info = getattr(engine, 'testbed_info', None) or {}
+                if not isinstance(_tb_info, dict):
+                    _tb_info = {}
+                _pc_ip = (_tb_info.get('pc_ip') or '').strip()
+                _ncm_ip = (_tb_info.get('ncm_ip') or '').strip()
+                prometheus_url = (
+                    getattr(engine, 'prometheus_url', None)
+                    or getattr(engine, '_prometheus_url', None)
+                    or (exec_data.get('config') or {}).get('prometheus_url')
+                    or (summary.get('prometheus_url') if isinstance(summary, dict) else None)
+                    or (_tb_info.get('prometheus_url')
+                        or _tb_info.get('prometheus_endpoint')
+                        or '').strip()
+                    or (f'https://{_pc_ip}:30546' if _pc_ip else None)
+                    or (f'https://{_ncm_ip}:30546' if _ncm_ip else None)
+                )
+                # ── Belt-and-suspenders DB-testbed fallback ──────────────
+                # If none of the in-memory sources gave us a URL (e.g. the
+                # engine was constructed without pc_ip/ncm_ip populated, or
+                # testbed_info was somehow trimmed), do the same DB lookup
+                # the DB-loaded branch already does. This guarantees the
+                # active-path download never falls through to None purely
+                # because the runtime dict was sparse.
+                if not prometheus_url:
+                    try:
+                        _tid = (
+                            _tb_info.get('unique_testbed_id')
+                            or _tb_info.get('testbed_id')
+                            or (summary.get('target_config') or {}).get('testbed_id')
+                        )
+                        if _tid:
+                            _tb_row = fetch_testbed_by_unique_id(g.db, _tid)
+                            if not _tb_row:
+                                _tb_row = fetch_testbed_by_uuid(g.db, _tid)
+                            if _tb_row:
+                                _tj = _tb_row.testbed_json or {}
+                                if isinstance(_tj, str):
+                                    import json as _json
+                                    try:
+                                        _tj = _json.loads(_tj) if _tj else {}
+                                    except Exception:
+                                        _tj = {}
+                                prometheus_url = (
+                                    (_tj.get('prometheus_url') or '').strip() or None
+                                    or (_tj.get('prometheus_endpoint') or '').strip() or None
+                                )
+                                if not prometheus_url:
+                                    _pc2 = getattr(_tb_row, 'pc_ip', None) or _tj.get('pc_ip')
+                                    _ncm2 = _tj.get('ncm_ip') or getattr(_tb_row, 'ncm_ip', None)
+                                    if _pc2:
+                                        prometheus_url = f'https://{_pc2}:30546'
+                                    elif _ncm2:
+                                        prometheus_url = f'https://{_ncm2}:30546'
+                    except Exception as _tb_err:
+                        logging.debug(
+                            'Enhanced report active-path: DB testbed fallback failed for %s: %s',
+                            execution_id, _tb_err,
+                        )
                 # NOTE: previously this dict only carried 6 fields, dropping
                 # successful_operations / failed_operations / success_rate /
                 # duration_minutes / start_time. The downstream renderer then
@@ -5708,6 +6135,23 @@ def get_enhanced_smart_execution_report(execution_id):
                 # report show "0% success" and "0.1m duration" for any active
                 # AI execution. Always pass through what the engine summary
                 # already computes so the report mirrors reality.
+                # v4 — pull the cluster health snapshot + restart tracking
+                # the engine captured before tunnel teardown. Without these
+                # the Pod Health (v4) section renders "0 pods classified"
+                # for any execution whose engine is still in
+                # ``active_ai_executions`` (which it is for the first
+                # ~hour after completion). Plumbing them into ``status``
+                # lets the same report endpoint pick them up regardless
+                # of whether the engine is in memory or only on disk.
+                _ch_snap = getattr(engine, '_cluster_health_snapshot', {}) or {}
+                if not isinstance(_ch_snap, dict):
+                    _ch_snap = {}
+                _restart_tracking = {}
+                try:
+                    if hasattr(engine, '_get_pod_restart_tracking'):
+                        _restart_tracking = engine._get_pod_restart_tracking() or {}
+                except Exception:
+                    _restart_tracking = {}
                 status = {
                     'status': engine.phase,
                     'total_operations': engine.total_operations_executed,
@@ -5728,8 +6172,26 @@ def get_enhanced_smart_execution_report(execution_id):
                     'current_metrics': summary.get('current_metrics', {}),
                     'testbed_info': {
                         'testbed_label': summary.get('testbed_label', 'Unknown'),
-                        'testbed_id': (summary.get('target_config') or {}).get('testbed_id'),
+                        # Resolve testbed_id with multiple fallbacks so the
+                        # historical comparison card in the enhanced report
+                        # actually finds prior runs on the same testbed.
+                        # The engine summary now exposes ``testbed_id`` at
+                        # the top level (from testbed_info.unique_testbed_id);
+                        # ``active_ai_executions`` is the authoritative source
+                        # captured at start_ai time; target_config is a legacy
+                        # spot some callers used to stash it.
+                        'testbed_id': (
+                            summary.get('testbed_id')
+                            or getattr(engine, 'testbed_info', {}).get('unique_testbed_id')
+                            or active_ai_executions.get(execution_id, {}).get('testbed_id')
+                            or (summary.get('target_config') or {}).get('testbed_id')
+                        ),
                     },
+                    # v4 — see comment above. Keys mirror the DB load path
+                    # so EnhancedReportService.generate_enhanced_report can
+                    # pick them up unchanged.
+                    'cluster_health_snapshot': _ch_snap,
+                    'pod_restart_tracking': _restart_tracking,
                 }
                 # Compute ops/min on the fly when the engine didn't.
                 if not status.get('operations_per_minute'):
@@ -5738,6 +6200,31 @@ def get_enhanced_smart_execution_report(execution_id):
                         status['operations_per_minute'] = round(
                             status['total_operations'] / dm, 2
                         )
+                # Many testbeds persist Prometheus URLs as ``http://`` even
+                # though the NCM nodePort only speaks HTTPS. Probe both
+                # schemes once so the downstream EnhancedReportService can
+                # actually reach Prometheus and populate every Pod Health /
+                # Cluster Infrastructure field instead of rendering a
+                # skeleton report.
+                if prometheus_url:
+                    try:
+                        from services.prometheus_url import resolve_working_prometheus_url
+                        resolved = resolve_working_prometheus_url(prometheus_url)
+                        if resolved:
+                            prometheus_url = resolved
+                    except Exception:
+                        pass
+                # Surface the testbed_id so EnhancedReportService can fetch
+                # historical comparisons + ML insights for active runs too.
+                _tb_id = (
+                    _tb_info.get('unique_testbed_id')
+                    or _tb_info.get('testbed_id')
+                    or (status.get('target_config') or {}).get('testbed_id')
+                )
+                if _tb_id:
+                    ti = status.setdefault('testbed_info', {})
+                    if isinstance(ti, dict):
+                        ti.setdefault('testbed_id', _tb_id)
         except ImportError:
             pass
 
@@ -5854,12 +6341,46 @@ def get_enhanced_smart_execution_report(execution_id):
 
         # Generate enhanced report data
         from services.enhanced_report_service import EnhancedReportService
+        logging.info(f"[ENHANCED REPORT] execution_id={execution_id} prometheus_url={prometheus_url!r} ops_history_len={len((status or {}).get('operations_history') or [])} metrics_history_len={len((status or {}).get('metrics_history') or [])}")
         enhanced_svc = EnhancedReportService(prometheus_url=prometheus_url)
 
         testbed_id = None
         testbed_info = status.get('testbed_info') or {}
         if isinstance(testbed_info, dict):
-            testbed_id = testbed_info.get('testbed_id')
+            testbed_id = (
+                testbed_info.get('testbed_id')
+                or testbed_info.get('unique_testbed_id')
+            )
+        # Fallback chain — historical comparison needs a testbed_id to
+        # query prior runs. Older reports persisted the id at the top
+        # level of ``status``/``report_data`` instead of inside
+        # ``testbed_info``; pull it from any of those before giving up.
+        if not testbed_id:
+            testbed_id = (
+                status.get('testbed_id')
+                or report_data.get('testbed_id')
+                or (report_data.get('target_config') or {}).get('testbed_id')
+            )
+        # Final fallback: the smart_executions DB row itself has the
+        # column, even when the JSON snapshot doesn't. Without this the
+        # active-execution payload may report a label like
+        # "Sizing_2.1_GF" but no id, leaving historical_comparison empty.
+        if not testbed_id:
+            try:
+                from database import SessionLocal
+                from sqlalchemy import text
+                _s = SessionLocal()
+                try:
+                    _row = _s.execute(
+                        text("SELECT testbed_id FROM smart_executions WHERE execution_id = :eid LIMIT 1"),
+                        {'eid': execution_id}
+                    ).fetchone()
+                    if _row and _row[0]:
+                        testbed_id = _row[0]
+                finally:
+                    _s.close()
+            except Exception:
+                pass
 
         enhanced_data = enhanced_svc.generate_enhanced_report(
             report_data=report_data,
@@ -5870,7 +6391,6 @@ def get_enhanced_smart_execution_report(execution_id):
 
         # Prepare template variables
         import json as json_mod
-        from jinja2 import Environment, BaseLoader
 
         total_ops = status.get('total_operations', 0) or 0
 
@@ -6021,25 +6541,34 @@ def get_enhanced_smart_execution_report(execution_id):
         if testbed_label == 'Unknown':
             testbed_label = status.get('testbed_label', 'Unknown')
 
-        def _fmtts(raw):
-            """Format an ISO timestamp string into a human-readable local time."""
-            if not raw:
-                return '—'
-            try:
-                from dateutil import parser as dtparser
-                dt = dtparser.isoparse(str(raw))
-                return dt.strftime('%b %d, %Y %H:%M:%S')
-            except Exception:
-                s = str(raw)
-                return s[:19].replace('T', ' ') if len(s) > 10 else s
+        template = _enhanced_report_template()
 
-        template_path = os.path.join(os.path.dirname(__file__), 'templates', 'enhanced_report.html')
-        with open(template_path, 'r') as f:
-            env = Environment(loader=BaseLoader(), autoescape=False)
-            env.filters['fmtts'] = _fmtts
-            template = env.from_string(f.read())
+        # ── Phase 7 perf projection (computed once, before render) ────────
+        # ``operations_history`` can be 28k+ entries on a 72-hour run.
+        # Embedding the full list as JSON inflated the rendered HTML to ~45 MB
+        # and triggered Nginx HTTP 499 (browser timeout). The timeline chart
+        # actually only needs (timestamp, status, entity_type, operation) for
+        # the first ~50 ops (see template ``opIdx < 50`` cap). We project +
+        # cap server-side so the JSON we ship is ~10 KB instead of 20 MB.
+        _ops_for_chart = [
+            {
+                'timestamp': op.get('timestamp') or op.get('started_at') or op.get('start_time'),
+                'status': op.get('status'),
+                'entity_type': op.get('entity_type'),
+                'operation': op.get('operation'),
+            }
+            for op in (operations_history or [])[:200]
+            if op.get('timestamp') or op.get('started_at') or op.get('start_time')
+        ]
+        # The inline operations <table> can also explode the HTML on big runs.
+        # Cap the rendered rows here and pass the truncated count so the
+        # template can show a banner ("Showing first N of M operations").
+        _OPS_TABLE_RENDER_CAP = int(os.environ.get('REPORT_OPS_TABLE_CAP', '5000'))
+        _ops_for_table = (operations_history or [])[:_OPS_TABLE_RENDER_CAP]
+        _ops_total = len(operations_history or [])
+        _ops_truncated = max(0, _ops_total - len(_ops_for_table))
 
-        html_content = template.render(
+        render_kwargs = dict(
             execution_id=execution_id,
             testbed_label=testbed_label,
             status=status.get('status', 'UNKNOWN'),
@@ -6053,7 +6582,12 @@ def get_enhanced_smart_execution_report(execution_id):
             target_config=target_config,
             baseline_metrics=baseline_metrics,
             final_metrics=final_metrics,
-            operations_history=operations_history,
+            # Phase 7: render-capped list (full list still goes via the API
+            # for the React UI / CSV download). Templates also receive the
+            # truncated count so they can show a "showing N of M" banner.
+            operations_history=_ops_for_table,
+            operations_history_total=_ops_total,
+            operations_history_truncated=_ops_truncated,
             operation_effectiveness=operation_effectiveness if isinstance(operation_effectiveness, list) else [],
             threshold_reached=status.get('threshold_reached', False),
             # Enhanced data
@@ -6065,6 +6599,14 @@ def get_enhanced_smart_execution_report(execution_id):
             node_stability=enhanced_data.get('node_stability') or [],
             cluster_health=enhanced_data['cluster_health'],
             historical_comparison=enhanced_data['historical_comparison'],
+            # v5: these three sections were always computed by
+            # EnhancedReportService but never forwarded to the HTML render
+            # (they were exposed only via the JSON endpoint). Surfacing them
+            # here so the new ``Health Assessment`` / ``ML Insights`` /
+            # ``Capacity Planning`` cards in the template can render.
+            health_assessment=enhanced_data.get('health_assessment') or {},
+            ml_report_insights=enhanced_data.get('ml_report_insights') or {},
+            capacity_planning=enhanced_data.get('capacity_planning') or {},
             iteration_timeline=enhanced_data.get('iteration_timeline') or {},
             entity_operation_counts=enhanced_data.get('entity_operation_counts') or [],
             report_metadata=enhanced_data.get('report_metadata') or {},
@@ -6083,11 +6625,44 @@ def get_enhanced_smart_execution_report(execution_id):
                 or (report_data.get('full_execution_data') or {}).get('monitoring_rule_violations')
                 or []
             ),
-            # JSON for charts
+            # JSON for charts — uses the small projected list, not the
+            # full operations_history (see Phase 7 comment above the render).
             metrics_history_json=json_mod.dumps(metrics_history),
-            operations_history_json=json_mod.dumps(operations_history),
+            operations_history_json=json_mod.dumps(_ops_for_chart),
             failure_timeline_json=json_mod.dumps(enhanced_data.get('failure_analysis', {}).get('failure_timeline', [])),
+            # Phase 4 (pod-coverage) — also forward classified pod_health to the
+            # template so the new tiered section renders. Falls back gracefully
+            # when missing (older executions persisted before classifier).
+            pod_health=enhanced_data.get('pod_health') or {},
         )
+
+        # Stamp a single-source-of-truth data-quality banner so the live HTML
+        # and the snapshot-served HTML show the identical banner (Layer-2).
+        try:
+            from services.report_snapshot_builder import classify_smart_quality
+            _dq, _banner = classify_smart_quality(enhanced_data.get('cluster_health'))
+            render_kwargs['operational'] = {'data_quality': _dq, 'banner_text': _banner}
+        except Exception:
+            render_kwargs.setdefault('operational', {})
+
+        html_content = template.render(**render_kwargs)
+
+        # ── Read-through capture: persist a fast snapshot for terminal execs ──
+        # We store EXACTLY what we just rendered, so a future snapshot read is
+        # byte-identical and needs no Prometheus. Running execs are skipped
+        # (data still changing) and re-captured on their next terminal view.
+        try:
+            _exec_status = status.get('status', 'UNKNOWN')
+            _snap_svc.capture_async(
+                execution_id, render_kwargs, enhanced_data,
+                meta={
+                    'status': _exec_status,
+                    'testbed_label': testbed_label,
+                    'captured_via': 'enhanced_report_route',
+                },
+            )
+        except Exception:
+            logging.debug("[%s] enhanced report snapshot capture skipped", execution_id, exc_info=True)
 
         fmt = request.args.get('format', 'download')
         if fmt == 'json':
@@ -6099,11 +6674,8 @@ def get_enhanced_smart_execution_report(execution_id):
                 'status': status.get('status', 'UNKNOWN'),
             })
 
-        from flask import make_response
-        response = make_response(html_content)
-        response.headers['Content-Type'] = 'text/html'
-        response.headers['Content-Disposition'] = f'attachment; filename=smart-execution-enhanced-{execution_id[:10]}.html'
-
+        response = _enhanced_html_response(html_content, execution_id)
+        response.headers['X-Report-Source'] = 'live'
         return response
 
     except Exception as e:
@@ -6120,7 +6692,13 @@ def _smart_execution_legacy_download_response(execution_id):
         return resp
     ct = resp.headers.get('Content-Type', '')
     if ct and 'text/html' in ct:
-        resp.headers['Content-Disposition'] = f'attachment; filename=smart-execution-{execution_id[:10]}.html'
+        # Make sure we don't strip the charset when the parent route added it.
+        if 'charset=' not in ct.lower():
+            resp.headers['Content-Type'] = 'text/html; charset=utf-8'
+        resp.headers['Content-Disposition'] = (
+            f'attachment; filename="smart-execution-'
+            f'{execution_id[:10]}.html"'
+        )
     return resp
 
 
@@ -6951,6 +7529,64 @@ def get_smart_execution_report(execution_id):
                     normalized_ops.append(nop)
                 summary['operations_history'] = normalized_ops
                 summary['entity_breakdown'] = _build_entity_breakdown(engine.operation_history)
+                # Forward the cluster-health snapshot + pod-restart tracking
+                # the engine has accumulated so the React UI / non-HTML
+                # consumers see the same Pod Health data the v5 enhanced
+                # report renders. Without this, the basic JSON report shows
+                # ``pod_health: {}`` for every active execution and the
+                # frontend renders empty Pod Health / Cluster Infrastructure
+                # widgets even though the engine has the data on hand.
+                try:
+                    _ch_snap = getattr(engine, '_cluster_health_snapshot', {}) or {}
+                    if isinstance(_ch_snap, dict) and _ch_snap:
+                        summary['cluster_health_snapshot'] = _ch_snap
+                except Exception:
+                    pass
+                try:
+                    if hasattr(engine, '_get_pod_restart_tracking'):
+                        _prt = engine._get_pod_restart_tracking() or {}
+                        if isinstance(_prt, dict):
+                            summary['pod_restart_tracking'] = _prt
+                except Exception:
+                    pass
+                # Compute the v5 ``pod_health`` block lazily so the same
+                # endpoint can satisfy the React UI's Pod Health summary
+                # cards (count of critical / watch / healthy) without
+                # forcing the consumer to parse the full HTML report.
+                try:
+                    _tb_info = getattr(engine, 'testbed_info', None) or {}
+                    if not isinstance(_tb_info, dict):
+                        _tb_info = {}
+                    _pc_ip = (_tb_info.get('pc_ip') or '').strip()
+                    _ncm_ip = (_tb_info.get('ncm_ip') or '').strip()
+                    _prom = (
+                        getattr(engine, 'prometheus_url', None)
+                        or getattr(engine, '_prometheus_url', None)
+                        or (_tb_info.get('prometheus_url')
+                            or _tb_info.get('prometheus_endpoint')
+                            or '').strip()
+                        or (f'https://{_pc_ip}:30546' if _pc_ip else None)
+                        or (f'https://{_ncm_ip}:30546' if _ncm_ip else None)
+                    )
+                    if _prom:
+                        from services.prometheus_url import resolve_working_prometheus_url
+                        try:
+                            _prom = resolve_working_prometheus_url(_prom) or _prom
+                        except Exception:
+                            pass
+                    from services.enhanced_report_service import EnhancedReportService
+                    _ers = EnhancedReportService(prometheus_url=_prom)
+                    _enh = _ers.generate_enhanced_report(
+                        report_data=summary,
+                        status_data=summary,
+                        execution_id=execution_id,
+                        testbed_id=_tb_info.get('unique_testbed_id'),
+                    )
+                    summary['pod_health'] = _enh.get('pod_health') or {}
+                    summary['cluster_health'] = _enh.get('cluster_health') or {}
+                except Exception as _enh_err:
+                    logging.debug("pod_health enrichment skipped for %s: %s",
+                                  execution_id, _enh_err)
                 return jsonify(summary), 200
         except ImportError:
             pass

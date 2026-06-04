@@ -75,18 +75,71 @@ def get_alerts_from_db():
             where_conditions.append("(t.testbed_label ILIKE %s OR t.pc_ip = %s)")
             params.extend([f'%{testbed_filter}%', testbed_filter])
 
-        query = base_query
-        if where_conditions:
-            query += " WHERE " + " AND ".join(where_conditions)
-        query += " ORDER BY a.created_at DESC"
+        where_sql = (" WHERE " + " AND ".join(where_conditions)) if where_conditions else ""
 
-        cur.execute(query, params)
+        # Total (pre-pagination) count for the same filter set, so the UI can
+        # show "N of TOTAL" without downloading every row.
+        try:
+            cur.execute(
+                "SELECT COUNT(*) FROM alert_summaries a "
+                "LEFT JOIN testbeds t ON a.testbed_id = t.unique_testbed_id" + where_sql,
+                params,
+            )
+            total_count = cur.fetchone()[0]
+        except Exception:
+            total_count = None
+
+        # Opt-in server-side pagination. When the client passes ?limit=, we cap
+        # at 2000 rows/page to keep the payload bounded; without it, behaviour is
+        # unchanged (return the full filtered set) so existing client-side
+        # grouping/paging keeps working. The heavy diagnostic_context blob is
+        # always stripped from the list (lazy-loaded via /api/alerts/detail/<id>).
+        limit = request.args.get('limit', type=int)
+        offset = request.args.get('offset', type=int) or 0
+        offset = max(0, offset)
+
+        query = base_query + where_sql + " ORDER BY a.created_at DESC"
+        page_params = list(params)
+        if limit is not None:
+            limit = max(1, min(limit, 2000))
+            query += " LIMIT %s OFFSET %s"
+            page_params.extend([limit, offset])
+
+        cur.execute(query, page_params)
         rows = cur.fetchall()
 
         from services.alert_diagnostic_service import generate_short_diagnosis, is_actionable
 
+        # Phase 3.2: bulk-fetch monitor session names for any MON-* execution
+        # ids referenced in this page so the UI can render "from monitor X" badges.
+        mon_ids = set()
+        diag_cache = []
+        for r in rows:
+            diag = r[14] or {}
+            if isinstance(diag, str):
+                import json as _json
+                try:
+                    diag = _json.loads(diag)
+                except Exception:
+                    diag = {}
+            diag_cache.append(diag if isinstance(diag, dict) else {})
+            exec_id = (diag or {}).get('execution_id') if isinstance(diag, dict) else None
+            if isinstance(exec_id, str) and exec_id.startswith('MON-'):
+                mon_ids.add(exec_id)
+        monitor_names: dict = {}
+        if mon_ids:
+            try:
+                cur.execute(
+                    "SELECT monitor_id, name FROM monitor_sessions WHERE monitor_id = ANY(%s)",
+                    (list(mon_ids),),
+                )
+                for mid, mname in cur.fetchall():
+                    monitor_names[mid] = mname
+            except Exception as me:
+                logger.debug(f"monitor name bulk lookup failed: {me}")
+
         alert_dicts = []
-        for row in rows:
+        for ridx, row in enumerate(rows):
             testbed_label = row[10] or row[11] or 'Unknown'
             alert_type = row[1] or 'Unknown'
             severity = _severity_label(row[2])
@@ -99,13 +152,8 @@ def get_alerts_from_db():
             if metric_val is not None and threshold_val is not None:
                 description += f" (value: {metric_val:.1f}, threshold: {threshold_val:.1f})"
 
-            diag_ctx = row[14] or {}
-            if isinstance(diag_ctx, str):
-                import json as _json
-                try:
-                    diag_ctx = _json.loads(diag_ctx)
-                except Exception:
-                    diag_ctx = {}
+            # diag was already normalised into diag_cache above (Phase 3.2)
+            diag_ctx = diag_cache[ridx]
 
             short_diag = generate_short_diagnosis(
                 alert_type, metric_val, threshold_val, dur_min, row[3] or '',
@@ -113,6 +161,8 @@ def get_alerts_from_db():
             actionable = is_actionable(
                 alert_type, severity, status, metric_val, threshold_val)
 
+            exec_id = (diag_ctx or {}).get('execution_id') if isinstance(diag_ctx, dict) else None
+            source_monitor_id = exec_id if isinstance(exec_id, str) and exec_id.startswith('MON-') else None
             alert_dicts.append({
                 'id': row[0],
                 'ruleName': alert_type,
@@ -131,7 +181,11 @@ def get_alerts_from_db():
                 'short_diagnosis': short_diag,
                 'is_actionable': actionable,
                 'resolved_reason': row[15],
-                'diagnostic_context': diag_ctx,
+                # NOTE: the full diagnostic_context blob is intentionally NOT
+                # included in the list payload (it dominated the response size).
+                # The UI lazy-loads it per alert via /api/alerts/detail/<id>.
+                'source_monitor_id': source_monitor_id,
+                'source_monitor_name': monitor_names.get(source_monitor_id) if source_monitor_id else None,
             })
 
         cur.close()
@@ -141,7 +195,15 @@ def get_alerts_from_db():
             logger.info("alert_summaries returned 0 rows, trying legacy alerts table")
             return _get_alerts_legacy(severity_filter, status_filter, testbed_filter, date_filter)
 
-        return jsonify({'alerts': alert_dicts, 'count': len(alert_dicts)})
+        resp_body = {
+            'alerts': alert_dicts,
+            'count': len(alert_dicts),
+            'total': total_count if total_count is not None else len(alert_dicts),
+        }
+        if limit is not None:
+            resp_body['limit'] = limit
+            resp_body['offset'] = offset
+        return jsonify(resp_body)
     except Exception as e:
         logger.exception("Error querying alert_summaries")
         return _get_alerts_legacy(

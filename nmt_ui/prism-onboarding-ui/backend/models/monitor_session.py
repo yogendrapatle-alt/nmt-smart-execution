@@ -60,6 +60,32 @@ class MonitorSession(Base):
     # We cap each list at MAX_SAMPLES (~720 = 6h at 30s polling) by downsampling.
     metric_samples = Column(JSON, nullable=True)
 
+    # Enhanced-report parity (Phase 1):
+    #   baseline_health         — one-shot cluster_health snapshot captured at
+    #                             monitor start. Lets the report show
+    #                             "Total restarts: 12 → 38 (+26 during window)".
+    #   cluster_health_snapshot — periodic (every ~5 min) snapshot of the
+    #                             full pod/node/container health structure so
+    #                             the report has rich per-pod data even after
+    #                             the monitor process is gone.
+    #   consecutive_failed_polls — count of consecutive Prometheus probe
+    #                             failures. Flips status -> DEGRADED above the
+    #                             threshold so the Live view can warn testers.
+    #   last_prometheus_error   — most recent Prometheus failure reason (string).
+    #   rule_history            — audit trail of rule hot-swaps. Each entry:
+    #                             {ts, replaced_count, dropped_cooldowns,
+    #                              total_rules, source}
+    #   slack_channel_override  — per-monitor Slack channel override (Phase 3).
+    #   schedule                — {start_at: iso, repeat: 'once|daily|weekly',
+    #                              status: 'pending|materialised'} (Phase 4).
+    baseline_health = Column(JSON, nullable=True)
+    cluster_health_snapshot = Column(JSON, nullable=True)
+    consecutive_failed_polls = Column(Integer, default=0, nullable=False)
+    last_prometheus_error = Column(Text, nullable=True)
+    rule_history = Column(JSON, nullable=True)
+    slack_channel_override = Column(String(128), nullable=True)
+    schedule = Column(JSON, nullable=True)
+
     def to_dict(self):
         return {
             'monitor_id': self.monitor_id,
@@ -78,4 +104,11 @@ class MonitorSession(Base):
             'total_polls': self.total_polls,
             'total_violations': self.total_violations,
             'metric_samples': self.metric_samples,
+            'baseline_health': self.baseline_health,
+            'cluster_health_snapshot': self.cluster_health_snapshot,
+            'consecutive_failed_polls': self.consecutive_failed_polls or 0,
+            'last_prometheus_error': self.last_prometheus_error,
+            'rule_history': self.rule_history,
+            'slack_channel_override': self.slack_channel_override,
+            'schedule': self.schedule,
         }

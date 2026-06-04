@@ -13,6 +13,46 @@ const MyTestbeds: React.FC = () => {
   const { addToast, confirm: toastConfirm } = useToast();
   const { testbeds, loading, error, refetch } = useTestbeds();
   const [deleteLoading, setDeleteLoading] = useState<string | null>(null);
+  const [promRefreshLoading, setPromRefreshLoading] = useState<string | null>(null);
+
+  const handleRefreshPrometheus = async (testbed: any) => {
+    if (IS_FAKE_MODE) {
+      addToast('info', 'Prometheus refresh skipped in DEMO mode');
+      return;
+    }
+    setPromRefreshLoading(testbed.unique_testbed_id);
+    try {
+      const backendUrl = getApiBase();
+      const response = await fetch(
+        `${backendUrl}/api/testbed/${testbed.unique_testbed_id}/refresh-prometheus`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ force_kubectl: true }),
+        }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        addToast('error', `Refresh failed: ${data.error || response.statusText}`);
+        return;
+      }
+      if (data.healthy) {
+        if (data.changed) {
+          addToast('success', `Prometheus URL updated: ${data.new_url}`);
+        } else {
+          addToast('success', `Prometheus URL verified: ${data.new_url}`);
+        }
+      } else {
+        addToast('warning', `URL set to ${data.new_url || 'unchanged'} but not responding`);
+      }
+      invalidateCache('testbeds');
+      refetch();
+    } catch (err: any) {
+      addToast('error', `Refresh failed: ${err?.message || 'network error'}`);
+    } finally {
+      setPromRefreshLoading(null);
+    }
+  };
 
   const handleView = (testbed: any) => {
     localStorage.setItem('selected_testbed_label', testbed.testbed_label);
@@ -297,6 +337,19 @@ const MyTestbeds: React.FC = () => {
                             style={{ borderRadius: 6, padding: '6px 12px' }}
                           >
                             <i className="material-icons-outlined" style={{ fontSize: 18 }}>settings</i>
+                          </button>
+                          <button
+                            className="btn btn-sm btn-outline-warning"
+                            onClick={() => handleRefreshPrometheus(testbed)}
+                            title="Refresh Prometheus URL (re-discover NodePort via kubectl)"
+                            disabled={promRefreshLoading === testbed.unique_testbed_id}
+                            style={{ borderRadius: 6, padding: '6px 12px' }}
+                          >
+                            {promRefreshLoading === testbed.unique_testbed_id ? (
+                              <span className="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+                            ) : (
+                              <i className="material-icons-outlined" style={{ fontSize: 18 }}>sync</i>
+                            )}
                           </button>
                           <button
                             className="btn btn-sm btn-outline-danger"

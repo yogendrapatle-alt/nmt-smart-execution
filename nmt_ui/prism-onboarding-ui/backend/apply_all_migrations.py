@@ -52,9 +52,17 @@ def run_all():
     from migrations.add_execution_templates_table import migrate_execution_templates
     migrate_execution_templates()
 
-    logger.info("\n[7/7] add_missing_columns (smart_executions + alert_summaries)")
+    logger.info("\n[7/8] add_missing_columns (smart_executions + alert_summaries)")
     from migrations.add_missing_columns import add_missing_columns
     add_missing_columns()
+
+    logger.info("\n[8/9] add_report_snapshot_tables (Layer-2 materialised reports)")
+    from migrations.add_report_snapshot_tables import create_report_snapshot_tables
+    create_report_snapshot_tables()
+
+    logger.info("\n[9/9] add_execution_api_log_columns (operation_id / sequence_number)")
+    from migrations.add_execution_api_log_columns import add_execution_api_log_columns
+    add_execution_api_log_columns()
 
     logger.info("\n" + "=" * 60)
     logger.info("All migrations complete.")

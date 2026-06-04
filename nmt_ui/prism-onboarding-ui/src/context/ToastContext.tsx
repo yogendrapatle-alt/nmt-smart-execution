@@ -24,6 +24,10 @@ interface ToastContextValue {
 
 const ToastContext = createContext<ToastContextValue | null>(null);
 
+// This module intentionally exports both the provider component and the
+// useToast hook so consumers have a single import site; that trips the
+// react-refresh "only-export-components" HMR lint rule, which is dev-only.
+// eslint-disable-next-line react-refresh/only-export-components
 export const useToast = (): ToastContextValue => {
   const ctx = useContext(ToastContext);
   if (!ctx) throw new Error('useToast must be used inside ToastProvider');

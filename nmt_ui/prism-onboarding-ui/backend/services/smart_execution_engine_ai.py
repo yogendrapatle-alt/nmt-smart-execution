@@ -344,7 +344,9 @@ class SmartExecutionEngineAI:
         metrics_after: Dict,
         success: bool,
         duration: float,
-        entity_name: str = ''
+        entity_name: str = '',
+        iteration: Optional[int] = None,
+        result: Optional[Dict] = None,
     ):
         """
         Record operation result for ML training
@@ -357,9 +359,21 @@ class SmartExecutionEngineAI:
             success: Whether operation succeeded
             duration: Operation duration in seconds
             entity_name: Name of the entity that was operated on
+            iteration: The control-loop iteration index this op belonged to.
+                Required for ``failure_timeline`` and ``iteration_timeline``
+                grouping in the enhanced report — without it every failure
+                renders as "Iter #None" and ``_op_iteration_matches`` can't
+                bucket ops by iteration.
+            result: The raw dict returned by ``_execute_single_operation``.
+                We harvest ``http_status_code``, ``error``, ``error_type``,
+                ``error_code``, ``api_url``, ``http_method``, ``request_payload``
+                and ``response_body`` so the report's
+                ``error_code_breakdown`` and "Failure Root Cause Analysis"
+                cards can show actual HTTP codes / error categories instead
+                of falling back to the "Unknown" bucket.
         """
         self.total_operations_executed += 1
-        
+
         if not success:
             self.consecutive_failures += 1
             if self.consecutive_failures >= self.max_consecutive_failures:
@@ -367,11 +381,13 @@ class SmartExecutionEngineAI:
                 logger.error(f"⚠️  {self.consecutive_failures} consecutive failures!")
         else:
             self.consecutive_failures = 0  # Reset on success
-        
+
         # Calculate impact
         cpu_impact = metrics_after.get('cpu', 0) - metrics_before.get('cpu', 0)
         memory_impact = metrics_after.get('memory', 0) - metrics_before.get('memory', 0)
-        
+
+        result = result if isinstance(result, dict) else {}
+
         # Record operation
         operation_record = {
             'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -386,7 +402,22 @@ class SmartExecutionEngineAI:
             'metrics_after': metrics_after,
             'cpu_impact': cpu_impact,
             'memory_impact': memory_impact,
-            'phase': self.phase
+            'phase': self.phase,
+            'iteration': iteration if iteration is not None else self.iteration,
+            'mode': result.get('mode'),
+            'http_status_code': result.get('http_status_code') or result.get('error_code'),
+            'error_code': result.get('error_code'),
+            'error': result.get('error'),
+            'error_type': result.get('error_type'),
+            'api_url': result.get('api_url'),
+            'http_method': result.get('http_method'),
+            'request_payload': result.get('request_payload'),
+            'response_body': result.get('response_body'),
+            'entity_uuid': result.get('entity_uuid') or result.get('uuid'),
+            'operation_id': result.get('operation_id'),
+            'sequence_number': result.get('sequence_number'),
+            'start_time': result.get('start_time'),
+            'end_time': result.get('end_time'),
         }
         
         self.operation_history.append(operation_record)
@@ -508,6 +539,14 @@ class SmartExecutionEngineAI:
             'start_time': self.start_time.isoformat() if self.start_time else None,
             'end_time': self.end_time.isoformat() if self.end_time else None,
             'testbed_label': self.testbed_info.get('testbed_label', 'Unknown'),
+            # Surface testbed_id at the top level so EnhancedReportService's
+            # historical comparison query has something to filter on.
+            # ``target_config`` doesn't carry testbed_id, so without this
+            # ``historical_comparison.reason`` is permanently "No testbed ID".
+            'testbed_id': (
+                self.testbed_info.get('unique_testbed_id')
+                or self.testbed_info.get('testbed_id')
+            ),
             'target_config': self.target_config,
             'target': {
                 'cpu': self.target_cpu,

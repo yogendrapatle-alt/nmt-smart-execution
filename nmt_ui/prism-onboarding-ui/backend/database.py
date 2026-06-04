@@ -36,6 +36,13 @@ from models.monitor_session import MonitorSession  # noqa: F401
 # Import the AlertLogBundle model (Phase-4 log collection on rule violation)
 from models.alert_log_bundle import AlertLogBundle  # noqa: F401
 
+# Import the MonitorReportSnapshot model (Layer-2 materialised reports) so
+# Base.metadata.create_all() provisions monitor_report_snapshots on startup.
+from models.monitor_report_snapshot import MonitorReportSnapshot  # noqa: F401
+
+# Import the SmartExecutionReportSnapshot model (Layer-2, Phase D).
+from models.smart_execution_report_snapshot import SmartExecutionReportSnapshot  # noqa: F401
+
 # Use 127.0.0.1 (not localhost) so libpq uses TCP + md5/pg_hba "host" rules; "localhost" can use ::1 or socket.
 DATABASE_URL = os.environ.get(
     'DATABASE_URL',
@@ -81,6 +88,22 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     _migrate_pod_events_columns()
     _migrate_testbed_monitoring_rules()
+    _migrate_monitor_sessions_columns()
+    _migrate_report_snapshot_tables()
+
+
+def _migrate_report_snapshot_tables():
+    """Provision Layer-2 report snapshot tables + indexes (idempotent).
+
+    Base.metadata.create_all already creates monitor_report_snapshots from the
+    model, but we also run the explicit migration so the smart-execution
+    snapshot table and the generated_at indexes exist even before Phase-D.
+    """
+    try:
+        from migrations.add_report_snapshot_tables import create_report_snapshot_tables
+        create_report_snapshot_tables()
+    except Exception as e:
+        logging.debug(f"[migrate] report snapshot tables migration skipped: {e}")
 
 
 def _migrate_pod_events_columns():
@@ -126,6 +149,38 @@ def _migrate_testbed_monitoring_rules():
                 conn.rollback()
     except Exception as e:
         logging.debug(f"[migrate] testbed monitoring_rules_config migration skipped: {e}")
+
+
+def _migrate_monitor_sessions_columns():
+    """Add Phase-1 enhanced-report parity columns to monitor_sessions.
+
+    Each ALTER is wrapped in its own try/except so a single pre-existing
+    column doesn't abort the whole migration. Safe to run on every startup.
+    """
+    new_cols = {
+        'baseline_health': 'JSONB',
+        'cluster_health_snapshot': 'JSONB',
+        'consecutive_failed_polls': 'INTEGER DEFAULT 0',
+        'last_prometheus_error': 'TEXT',
+        'rule_history': 'JSONB',
+        'slack_channel_override': 'VARCHAR(128)',
+        'schedule': 'JSONB',
+    }
+    try:
+        with engine.connect() as conn:
+            for col, dtype in new_cols.items():
+                try:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE monitor_sessions ADD COLUMN {col} {dtype}"
+                        )
+                    )
+                    conn.commit()
+                    logging.info(f"[migrate] Added column monitor_sessions.{col}")
+                except Exception:
+                    conn.rollback()
+    except Exception as e:
+        logging.debug(f"[migrate] monitor_sessions column migration skipped: {e}")
 
 
 

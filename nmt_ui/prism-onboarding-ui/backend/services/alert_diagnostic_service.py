@@ -434,15 +434,56 @@ class AlertDiagnosticService:
         return out
 
     def _query_top_cpu(self) -> List[Dict]:
-        results = _prom_query(self.prom_url,
+        # Get raw cores + per-pod limits + per-pod requests in three small
+        # queries (cheap), then derive cpu_pct using the same
+        # limit→request→unspecified chain as the report. Old code did
+        # ``min(cores * 100, 100)`` which silently reported any 1-core pod
+        # without a CPU limit as "100%" in alert details and Slack
+        # messages — same bug as the report (eg. ncm-data-processor-1).
+        cores_results = _prom_query(self.prom_url,
             'topk(10, sum(rate(container_cpu_usage_seconds_total{container!="", container!="POD"}[1m])) by (pod, namespace))')
-        out = []
-        for r in results:
+        limit_results = _prom_query(self.prom_url,
+            'sum(kube_pod_container_resource_limits{resource="cpu", container!=""}) by (pod, namespace)')
+        request_results = _prom_query(self.prom_url,
+            'sum(kube_pod_container_resource_requests{resource="cpu", container!=""}) by (pod, namespace)')
+
+        cpu_limits = {}
+        for r in limit_results:
             m = r.get('metric', {})
+            v = float(r.get('value', [0, 0])[1])
+            if v > 0:
+                cpu_limits[(m.get('pod', ''), m.get('namespace', ''))] = v
+        cpu_requests = {}
+        for r in request_results:
+            m = r.get('metric', {})
+            v = float(r.get('value', [0, 0])[1])
+            if v > 0:
+                cpu_requests[(m.get('pod', ''), m.get('namespace', ''))] = v
+
+        out = []
+        for r in cores_results:
+            m = r.get('metric', {})
+            pod = m.get('pod', 'unknown')
+            ns = m.get('namespace', 'unknown')
             cores = float(r.get('value', [0, 0])[1])
+            limit = cpu_limits.get((pod, ns))
+            request = cpu_requests.get((pod, ns))
+            if limit and limit > 0:
+                pct = round(min((cores / limit) * 100, 100.0), 1)
+                basis = 'limit'
+            elif request and request > 0:
+                pct = round((cores / request) * 100, 1)
+                basis = 'request'
+            else:
+                pct = None
+                basis = 'unspecified'
             out.append({
-                'pod': m.get('pod', 'unknown'), 'namespace': m.get('namespace', 'unknown'),
-                'cpu_cores': round(cores, 3), 'cpu_pct': round(min(cores * 100, 100), 1),
+                'pod': pod, 'namespace': ns,
+                'cpu_cores': round(cores, 3),
+                'cpu_pct': pct,
+                'cpu_basis': basis,
+                'cpu_limit_cores': round(limit, 3) if limit else None,
+                'cpu_request_cores': round(request, 3) if request else None,
             })
         return out
 
@@ -566,7 +607,17 @@ class AlertDiagnosticService:
             throttled = live_data.get('cpu_throttling', [])
             if top_pods:
                 top = top_pods[0]
-                top_list = ', '.join(f"{p['pod']} ({p['cpu_pct']}%)" for p in top_pods[:3])
+                # cpu_pct may be None when a pod has neither CPU limit nor
+                # request defined (cpu_basis='unspecified'). Show absolute
+                # cores in that case so the Slack/email message remains
+                # informative instead of saying "(None%)".
+                def _fmt_cpu(p):
+                    pct = p.get('cpu_pct')
+                    if pct is not None:
+                        return f"{p['pod']} ({pct:.1f}% of {p.get('cpu_basis', 'limit')})"
+                    cores = p.get('cpu_cores')
+                    return f"{p['pod']} ({cores} cores, no limit)" if cores is not None else f"{p['pod']}"
+                top_list = ', '.join(_fmt_cpu(p) for p in top_pods[:3])
                 cause = f"Top CPU consumers: {top_list}."
                 if throttled:
                     cause += f" {len(throttled)} containers are being CPU-throttled."

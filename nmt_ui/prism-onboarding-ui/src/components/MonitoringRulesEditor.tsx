@@ -235,7 +235,12 @@ const MonitoringRulesEditor: React.FC<MonitoringRulesEditorProps> = ({
   const removeCondition = (idx: number) =>
     setDraftRule(d => d && d.conditions ? { ...d, conditions: d.conditions.filter((_, i) => i !== idx) } : d);
 
-  // ── Optional Test-now button ─────────────────────────────────
+  // ── Optional Test-now buttons ────────────────────────────────
+  // ``runTestQuery`` only probes the underlying PromQL — it doesn't apply the
+  // operator/threshold or composite logical operator. The new ``runTestRule``
+  // (Phase 2.6) evaluates the FULL rule (resolution + threshold + composite
+  // logical_operator) via the monitor-only test-rule endpoint so testers can
+  // see "would fire (3 pods)" / "did not fire" before starting a long monitor.
   const runTestQuery = async () => {
     if (!draftRule || !testbedId) return;
     setTestResult('Running…');
@@ -256,6 +261,29 @@ const MonitoringRulesEditor: React.FC<MonitoringRulesEditorProps> = ({
         setTestResult(`✓ Returned ${data.series_count ?? 0} series; max value=${data.max_value ?? 'n/a'}`);
       } else {
         setTestResult(`✗ ${data?.error || 'No data returned'}`);
+      }
+    } catch (err) {
+      setTestResult(`✗ ${(err as Error).message}`);
+    }
+  };
+
+  const runTestRule = async () => {
+    if (!draftRule || !testbedId) return;
+    setTestResult('Evaluating full rule…');
+    try {
+      const res = await fetch(`${getApiBase()}/api/monitor-only/test-rule`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ testbed_id: testbedId, rule: draftRule }),
+      });
+      const data = await res.json();
+      if (data?.success) {
+        if (data.fired) {
+          setTestResult(`✓ Would FIRE (${data.violation_count} violation${data.violation_count === 1 ? '' : 's'} right now)`);
+        } else {
+          setTestResult('✓ Would NOT fire (rule evaluated cleanly against current Prometheus data)');
+        }
+      } else {
+        setTestResult(`✗ ${data?.error || 'Rule evaluation failed'}`);
       }
     } catch (err) {
       setTestResult(`✗ ${(err as Error).message}`);
@@ -610,7 +638,15 @@ const MonitoringRulesEditor: React.FC<MonitoringRulesEditorProps> = ({
             <button type="button" onClick={runTestQuery}
               style={{ padding: '6px 12px', background: 'white', border: '1px solid #14b8a6', color: '#0f766e',
                 borderRadius: 6, fontSize: 12, cursor: 'pointer', fontWeight: 600 }}>
-              Test query against Prometheus
+              Test query
+            </button>
+          )}
+          {testbedId && (
+            <button type="button" onClick={runTestRule}
+              title="Evaluate the full rule (operator + threshold + composite logic) against current Prometheus data."
+              style={{ padding: '6px 12px', background: 'white', border: '1px solid #f59e0b', color: '#92400e',
+                borderRadius: 6, fontSize: 12, cursor: 'pointer', fontWeight: 600 }}>
+              Test full rule
             </button>
           )}
 

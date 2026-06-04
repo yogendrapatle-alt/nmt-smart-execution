@@ -201,7 +201,7 @@ export const QUICK_RULE_TEMPLATES: Omit<MonitoringRule, 'id' | 'enabled'>[] = [
   { name: 'Pod Memory Usage', query: 'PodMemoryUsage', operator: '>', threshold: 80, severity: 'Critical', scope: 'pod', description: 'Alert when any pod memory usage exceeds threshold' },
   { name: 'Container Restarts', query: 'ContainerRestarts', operator: '>', threshold: 5, severity: 'Moderate', scope: 'pod', description: 'Alert when container restart count exceeds threshold' },
   { name: 'Pod Restarts', query: 'PodRestarts', operator: '>', threshold: 3, severity: 'Moderate', scope: 'pod', description: 'Alert when pod restart count exceeds threshold' },
-  { name: 'CPU Throttling', query: 'ContainerCPUThrottling', operator: '>', threshold: 25, severity: 'Moderate', scope: 'pod', description: 'Alert when CPU throttling percentage exceeds threshold' },
+  { name: 'CPU Throttling', query: 'ContainerCPUThrottling', operator: '>', threshold: 80, severity: 'Critical', scope: 'pod', description: 'Alert when CPU throttling percentage exceeds 80% (per documented threshold)' },
   { name: 'CH CPU Usage', query: 'CHCPUUsage', operator: '>', threshold: 85, severity: 'Critical', scope: 'pod', description: 'Alert when Cluster Health CPU usage exceeds threshold' },
   { name: 'CH Memory Usage', query: 'CHMemoryUsage', operator: '>', threshold: 85, severity: 'Critical', scope: 'pod', description: 'Alert when Cluster Health Memory usage exceeds threshold' },
   { name: 'IDF CPU Usage', query: 'IDFCPUUsage', operator: '>', threshold: 80, severity: 'Moderate', scope: 'pod', description: 'Alert when IDF CPU usage exceeds threshold' },

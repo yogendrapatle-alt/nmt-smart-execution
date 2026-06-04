@@ -23,6 +23,11 @@ const AlertSummary: React.FC = () => {
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [itemsPerPage] = useState<number>(10);
 
+  // Phase 6: when ON, collapse repeats of the same (rule, pod) into one row
+  // so the "lots of slack messages" feedback stops applying to the UI too.
+  // Default OFF to preserve existing user expectations.
+  const [groupByPodRule, setGroupByPodRule] = useState<boolean>(false);
+
   const [prometheusEndpoint, setPrometheusEndpoint] = useState<string>('');
 
   useEffect(() => {
@@ -109,7 +114,7 @@ const AlertSummary: React.FC = () => {
   const endIndex = startIndex + itemsPerPage;
   const paginatedAlerts = searchFilteredAlerts.slice(startIndex, endIndex);
 
-  React.useEffect(() => { setCurrentPage(1); }, [selectedDate, selectedTestbed, selectedSeverity, selectedStatus, sortBy]);
+  React.useEffect(() => { setCurrentPage(1); }, [selectedDate, selectedTestbed, selectedSeverity, selectedStatus, sortBy, groupByPodRule]);
   React.useEffect(() => { setSelectedTestbed(''); }, [selectedDate]);
 
   const getTestbedOptions = () => {
@@ -120,6 +125,84 @@ const AlertSummary: React.FC = () => {
   const totalAlerts = alertDigests.reduce((sum, d) => sum + Object.values(d.testbeds).flat().length, 0);
   const activeCount = filteredAlerts.filter(a => a.status === 'Active').length;
   const criticalCount = filteredAlerts.filter(a => a.severity === 'Critical').length;
+
+  // Phase 6 KPI: distinct (rule, pod) offenders vs total alerts. Big delta
+  // means the same pods are firing the same rule over and over → consistent
+  // with Phase 5's first-fire-then-silent gating story for Slack.
+  const distinctOffenders = React.useMemo(() => {
+    const set = new Set<string>();
+    for (const a of filteredAlerts) {
+      const key = `${a.ruleName}::${a.namespace || ''}::${a.podName || ''}`;
+      set.add(key);
+    }
+    return set.size;
+  }, [filteredAlerts]);
+  const repeatAlertCount = Math.max(0, filteredAlerts.length - distinctOffenders);
+
+  // When grouping is ON, fold the per-iteration rows into one row per
+  // (rule, pod) showing first-seen / last-seen / firing-count / max-severity.
+  type GroupedAlert = {
+    key: string;
+    ruleName: string;
+    podName: string;
+    namespace: string;
+    severity: 'Low' | 'Moderate' | 'Critical';
+    fireCount: number;
+    firstSeen: string;
+    lastSeen: string;
+    statusLatest: string;
+    representative: Alert; // for the detail-modal click-through
+  };
+
+  const SEV_RANK: Record<string, number> = { low: 0, moderate: 1, critical: 2 };
+
+  const groupedAlerts = React.useMemo<GroupedAlert[]>(() => {
+    if (!groupByPodRule) return [];
+    const buckets = new Map<string, GroupedAlert>();
+    for (const a of searchFilteredAlerts) {
+      const key = `${a.ruleName}::${a.namespace || ''}::${a.podName || ''}`;
+      const existing = buckets.get(key);
+      const ts = a.timestamp || '';
+      if (!existing) {
+        buckets.set(key, {
+          key,
+          ruleName: a.ruleName,
+          podName: a.podName || '',
+          namespace: a.namespace || '',
+          severity: a.severity,
+          fireCount: 1,
+          firstSeen: ts,
+          lastSeen: ts,
+          statusLatest: a.status,
+          representative: a,
+        });
+      } else {
+        existing.fireCount += 1;
+        if (ts && ts < existing.firstSeen) existing.firstSeen = ts;
+        if (ts && ts > existing.lastSeen) {
+          existing.lastSeen = ts;
+          existing.statusLatest = a.status;
+          existing.representative = a;
+        }
+        const incomingRank = SEV_RANK[(a.severity || '').toLowerCase()] ?? 1;
+        const currentRank = SEV_RANK[(existing.severity || '').toLowerCase()] ?? 1;
+        if (incomingRank > currentRank) existing.severity = a.severity;
+      }
+    }
+    // Sort: critical first, then highest fireCount.
+    return Array.from(buckets.values()).sort((x, y) => {
+      const sx = SEV_RANK[(x.severity || '').toLowerCase()] ?? 1;
+      const sy = SEV_RANK[(y.severity || '').toLowerCase()] ?? 1;
+      if (sy !== sx) return sy - sx;
+      return y.fireCount - x.fireCount;
+    });
+  }, [searchFilteredAlerts, groupByPodRule]);
+
+  const groupedTotalItems = groupedAlerts.length;
+  const groupedTotalPages = Math.ceil(groupedTotalItems / itemsPerPage);
+  const groupedPaginated = groupByPodRule
+    ? groupedAlerts.slice(startIndex, endIndex)
+    : [];
 
   return (
     <div className="main-content">
@@ -143,16 +226,20 @@ const AlertSummary: React.FC = () => {
         </div>
       </div>
 
-      {/* Quick stat cards */}
+      {/* Quick stat cards (Phase 6: now includes "Distinct Offenders" + "Repeats"
+          so a tester can see at a glance whether 200 alerts are 200 distinct
+          problems or one problem firing 200 times). */}
       {!loading && alertDigests.length > 0 && (
         <div className="row g-3 mb-4">
           {[
             { icon: 'notifications', label: 'Total Alerts', value: totalAlerts, color: '#3b82f6', sub: `Across ${alertDigests.length} days` },
             { icon: 'error', label: 'Active Now', value: activeCount, color: activeCount > 0 ? '#ef4444' : '#22c55e', sub: activeCount > 0 ? 'Require attention' : 'All clear' },
             { icon: 'warning', label: 'Critical', value: criticalCount, color: criticalCount > 0 ? '#dc2626' : '#22c55e', sub: criticalCount > 0 ? 'High priority' : 'No critical alerts' },
+            { icon: 'fingerprint', label: 'Distinct Offenders', value: distinctOffenders, color: '#0ea5e9', sub: 'Unique (rule × pod) combos' },
+            { icon: 'replay', label: 'Repeated Alerts', value: repeatAlertCount, color: repeatAlertCount > 0 ? '#f59e0b' : '#22c55e', sub: repeatAlertCount > 0 ? 'Same issue re-firing' : 'All alerts are first-time' },
             { icon: 'dns', label: 'Testbeds', value: getTestbedOptions().length, color: '#8b5cf6', sub: 'With alerts today' },
           ].map((c, i) => (
-            <div className="col-md-3" key={i}>
+            <div className="col-6 col-md-4 col-lg-2" key={i}>
               <div className="card rounded-4 border shadow-none h-100">
                 <div className="card-body d-flex align-items-center gap-3 p-3">
                   <div className="d-flex align-items-center justify-content-center rounded-3 flex-shrink-0" style={{ width: 44, height: 44, background: `${c.color}15` }}>
@@ -245,6 +332,29 @@ const AlertSummary: React.FC = () => {
                   <label className="form-label fw-medium small">Search</label>
                   <input type="text" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} placeholder="Search alerts..." className="form-control form-control-sm rounded-3" />
                 </div>
+                {/* Phase 6: Group toggle — collapse repeats of (rule × pod). */}
+                <div className="col-md-2 d-flex align-items-end">
+                  <div className="form-check form-switch">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      role="switch"
+                      id="groupByPodRule"
+                      checked={groupByPodRule}
+                      onChange={(e) => setGroupByPodRule(e.target.checked)}
+                    />
+                    <label
+                      className="form-check-label small fw-medium"
+                      htmlFor="groupByPodRule"
+                      title="Collapse alerts firing repeatedly for the same rule + pod into one row with first/last seen timestamps and a fire count."
+                    >
+                      Group by Pod + Rule
+                      {groupByPodRule && (
+                        <span className="badge bg-info text-dark ms-1" style={{ fontSize: '0.62rem' }}>{groupedTotalItems} groups</span>
+                      )}
+                    </label>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -313,9 +423,19 @@ const AlertSummary: React.FC = () => {
                   </h6>
                   {searchFilteredAlerts.length > 0 && (
                     <span className="text-muted small">
-                      {searchFilteredAlerts.length} alert{searchFilteredAlerts.length !== 1 ? 's' : ''}
-                      {searchTerm && ` matching "${searchTerm}"`}
-                      {totalPages > 1 && ` — Page ${currentPage} of ${totalPages}`}
+                      {groupByPodRule ? (
+                        <>
+                          {groupedTotalItems} unique offender{groupedTotalItems !== 1 ? 's' : ''} (from {searchFilteredAlerts.length} firing{searchFilteredAlerts.length !== 1 ? 's' : ''})
+                          {searchTerm && ` matching "${searchTerm}"`}
+                          {groupedTotalPages > 1 && ` — Page ${currentPage} of ${groupedTotalPages}`}
+                        </>
+                      ) : (
+                        <>
+                          {searchFilteredAlerts.length} alert{searchFilteredAlerts.length !== 1 ? 's' : ''}
+                          {searchTerm && ` matching "${searchTerm}"`}
+                          {totalPages > 1 && ` — Page ${currentPage} of ${totalPages}`}
+                        </>
+                      )}
                     </span>
                   )}
                 </div>
@@ -343,6 +463,64 @@ const AlertSummary: React.FC = () => {
                     <p className="text-muted mb-0">No alerts match the current filters.</p>
                   )}
                 </div>
+              ) : groupByPodRule ? (
+                /* Phase 6: grouped view — one row per (rule, pod), shows
+                   first-seen / last-seen / fire-count so a tester can see
+                   "200 alerts = 5 unique problems each firing 40 times". */
+                <div className="table-responsive">
+                  <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: '0.82rem' }}>
+                    <thead className="table-light">
+                      <tr>
+                        <th className="px-3 py-3">Severity</th>
+                        <th className="px-3 py-3">Latest Status</th>
+                        <th className="px-3 py-3">Rule</th>
+                        <th className="px-3 py-3">Pod / Namespace</th>
+                        <th className="px-3 py-3 text-center">Fires</th>
+                        <th className="px-3 py-3">First Seen</th>
+                        <th className="px-3 py-3">Last Seen</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {groupedPaginated.map((g) => {
+                        const isCriticalActive = g.severity === 'Critical' && g.statusLatest === 'Active';
+                        return (
+                          <tr
+                            key={g.key}
+                            onClick={() => handleAlertClick(g.representative)}
+                            style={{ cursor: 'pointer', borderLeft: isCriticalActive ? '3px solid #dc2626' : undefined }}
+                          >
+                            <td className="px-3">
+                              <span className={`badge rounded-pill ${g.severity === 'Critical' ? 'bg-danger' : g.severity === 'Moderate' ? 'bg-warning text-dark' : 'bg-success'}`}>
+                                {g.severity}
+                              </span>
+                            </td>
+                            <td className="px-3">
+                              <span className={`badge rounded-pill ${g.statusLatest === 'Active' ? 'bg-danger' : g.statusLatest === 'Resolved' ? 'bg-success' : 'bg-secondary'}`}>
+                                {g.statusLatest}
+                              </span>
+                            </td>
+                            <td className="px-3 fw-medium">{g.ruleName}</td>
+                            <td className="px-3">
+                              <code className="small d-block" title={g.podName}>{g.podName || '—'}</code>
+                              <span className="text-muted" style={{ fontSize: '0.7rem' }}>{g.namespace || '—'}</span>
+                            </td>
+                            <td className="px-3 text-center">
+                              <span className={`badge rounded-pill ${g.fireCount > 10 ? 'bg-danger' : g.fireCount > 1 ? 'bg-warning text-dark' : 'bg-secondary'}`}>
+                                {g.fireCount}×
+                              </span>
+                            </td>
+                            <td className="px-3 small">
+                              {g.firstSeen ? new Date(g.firstSeen).toLocaleString('en-US', { timeZone: 'UTC' }) : '—'}
+                            </td>
+                            <td className="px-3 small">
+                              {g.lastSeen ? new Date(g.lastSeen).toLocaleString('en-US', { timeZone: 'UTC' }) : '—'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
               ) : (
                 <div className="table-responsive">
                   <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: '0.82rem' }}>
@@ -354,6 +532,9 @@ const AlertSummary: React.FC = () => {
                           </th>
                         ))}
                         <th className="px-3 py-3">Alert Name</th>
+                        {/* Phase 6: explicit Pod / Namespace column — was buried in
+                            the Diagnosis text before, easy to miss. */}
+                        <th className="px-3 py-3">Pod / Namespace</th>
                         <th className="px-3 py-3">Duration</th>
                         <th className="px-3 py-3" style={{ minWidth: 220 }}>Diagnosis</th>
                       </tr>
@@ -388,6 +569,24 @@ const AlertSummary: React.FC = () => {
                             <td className="px-3 fw-medium">
                               {alert.ruleName}
                               {alert.is_actionable && <span className="badge bg-danger ms-2" style={{ fontSize: '0.62rem' }}>NEEDS ATTENTION</span>}
+                              {alert.source_monitor_id && (
+                                <span
+                                  className="badge ms-2"
+                                  style={{ background: '#0ea5e9', color: 'white', fontSize: '0.62rem' }}
+                                  title={`Produced by monitor-only session ${alert.source_monitor_id}`}>
+                                  monitor: {alert.source_monitor_name || alert.source_monitor_id}
+                                </span>
+                              )}
+                            </td>
+                            <td className="px-3">
+                              {alert.podName ? (
+                                <>
+                                  <code className="small d-block" title={alert.podName}>{alert.podName}</code>
+                                  <span className="text-muted" style={{ fontSize: '0.7rem' }}>{alert.namespace || '—'}</span>
+                                </>
+                              ) : (
+                                <span className="text-muted small">{alert.namespace || '—'}</span>
+                              )}
                             </td>
                             <td className="px-3 text-center text-nowrap">
                               {durLabel ? (
@@ -409,36 +608,41 @@ const AlertSummary: React.FC = () => {
             </div>
           </div>
 
-          {/* Pagination */}
-          {totalPages > 1 && (
-            <div className="d-flex justify-content-center align-items-center gap-2 mb-4">
-              <button className="btn btn-outline-primary btn-sm rounded-3" onClick={() => setCurrentPage(p => Math.max(p - 1, 1))} disabled={currentPage === 1}>Previous</button>
-              {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
-                let page: number;
-                if (totalPages <= 7) {
-                  page = i + 1;
-                } else if (currentPage <= 4) {
-                  page = i + 1;
-                } else if (currentPage >= totalPages - 3) {
-                  page = totalPages - 6 + i;
-                } else {
-                  page = currentPage - 3 + i;
-                }
-                return (
-                  <button
-                    key={page}
-                    className={`btn btn-sm rounded-3 ${currentPage === page ? 'btn-primary' : 'btn-outline-secondary'}`}
-                    onClick={() => setCurrentPage(page)}
-                    style={{ minWidth: 36 }}
-                  >
-                    {page}
-                  </button>
-                );
-              })}
-              <button className="btn btn-outline-primary btn-sm rounded-3" onClick={() => setCurrentPage(p => Math.min(p + 1, totalPages))} disabled={currentPage === totalPages}>Next</button>
-              <span className="text-muted small ms-2">Showing {startIndex + 1}–{Math.min(endIndex, totalItems)} of {totalItems}</span>
-            </div>
-          )}
+          {/* Pagination — uses the appropriate total based on grouping toggle. */}
+          {(() => {
+            const pageTotal = groupByPodRule ? groupedTotalPages : totalPages;
+            const itemTotal = groupByPodRule ? groupedTotalItems : totalItems;
+            if (pageTotal <= 1) return null;
+            return (
+              <div className="d-flex justify-content-center align-items-center gap-2 mb-4">
+                <button className="btn btn-outline-primary btn-sm rounded-3" onClick={() => setCurrentPage(p => Math.max(p - 1, 1))} disabled={currentPage === 1}>Previous</button>
+                {Array.from({ length: Math.min(pageTotal, 7) }, (_, i) => {
+                  let page: number;
+                  if (pageTotal <= 7) {
+                    page = i + 1;
+                  } else if (currentPage <= 4) {
+                    page = i + 1;
+                  } else if (currentPage >= pageTotal - 3) {
+                    page = pageTotal - 6 + i;
+                  } else {
+                    page = currentPage - 3 + i;
+                  }
+                  return (
+                    <button
+                      key={page}
+                      className={`btn btn-sm rounded-3 ${currentPage === page ? 'btn-primary' : 'btn-outline-secondary'}`}
+                      onClick={() => setCurrentPage(page)}
+                      style={{ minWidth: 36 }}
+                    >
+                      {page}
+                    </button>
+                  );
+                })}
+                <button className="btn btn-outline-primary btn-sm rounded-3" onClick={() => setCurrentPage(p => Math.min(p + 1, pageTotal))} disabled={currentPage === pageTotal}>Next</button>
+                <span className="text-muted small ms-2">Showing {startIndex + 1}–{Math.min(endIndex, itemTotal)} of {itemTotal}{groupByPodRule ? ' offenders' : ' alerts'}</span>
+              </div>
+            );
+          })()}
 
           {/* Email Schedule */}
           <MultiUserEmailSchedule

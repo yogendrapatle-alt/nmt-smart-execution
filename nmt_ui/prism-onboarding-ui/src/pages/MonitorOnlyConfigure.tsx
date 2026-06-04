@@ -15,6 +15,9 @@ interface Testbed {
   prometheus_endpoint?: string;
 }
 
+const DEFAULT_DURATION_HOURS = 24;
+const POLL_INTERVAL_S = 30;
+
 const MonitorOnlyConfigure: React.FC = () => {
   const navigate = useNavigate();
   const { addToast } = useToast();
@@ -23,9 +26,7 @@ const MonitorOnlyConfigure: React.FC = () => {
   const [loadingTestbeds, setLoadingTestbeds] = useState(true);
   const [selectedTestbed, setSelectedTestbed] = useState('');
   const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [pollIntervalS, setPollIntervalS] = useState(30);
-  const [durationHours, setDurationHours] = useState(0);
+  const [durationHours, setDurationHours] = useState(DEFAULT_DURATION_HOURS);
   const [rules, setRules] = useState<MonitoringRule[]>([]);
 
   const [availableNamespaces, setAvailableNamespaces] = useState<string[]>([]);
@@ -34,7 +35,6 @@ const MonitorOnlyConfigure: React.FC = () => {
   const [loadingPods, setLoadingPods] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  // Load testbeds on mount
   useEffect(() => {
     (async () => {
       setLoadingTestbeds(true);
@@ -55,7 +55,6 @@ const MonitorOnlyConfigure: React.FC = () => {
     })();
   }, [addToast]);
 
-  // Load namespaces/pods when testbed changes
   useEffect(() => {
     if (!selectedTestbed) {
       setAvailableNamespaces([]); setAvailablePods([]); setPodsByNamespace({});
@@ -75,13 +74,12 @@ const MonitorOnlyConfigure: React.FC = () => {
           setPodsByNamespace(data.pods_by_namespace || {});
         }
       } catch {
-        // leave dropdowns empty
+        // pickers stay empty; user can still start without rules
       } finally {
         setLoadingPods(false);
       }
     })();
 
-    // Pre-load saved monitoring rules from this testbed (so reusing is one click)
     (async () => {
       try {
         const res = await fetch(`${getApiBase()}/api/testbed/${selectedTestbed}/monitoring-rules`);
@@ -96,7 +94,7 @@ const MonitorOnlyConfigure: React.FC = () => {
   }, [selectedTestbed]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const enabledRules = rules.filter(r => r.enabled);
-  const canStart = !!selectedTestbed && enabledRules.length > 0 && !submitting;
+  const canStart = !!selectedTestbed && !submitting;
 
   const start = async () => {
     if (!canStart) return;
@@ -107,9 +105,8 @@ const MonitorOnlyConfigure: React.FC = () => {
         body: JSON.stringify({
           testbed_id: selectedTestbed,
           name: name.trim() || undefined,
-          description: description.trim() || undefined,
           monitoring_rules: enabledRules,
-          poll_interval_s: pollIntervalS,
+          poll_interval_s: POLL_INTERVAL_S,
           duration_hours: durationHours > 0 ? durationHours : null,
         }),
       });
@@ -136,7 +133,7 @@ const MonitorOnlyConfigure: React.FC = () => {
         icon="visibility"
         iconGradient="linear-gradient(135deg, #0ea5e9, #0369a1)"
         title="Monitor-Only Testbed"
-        subtitle="Watch live Prometheus metrics on a testbed without generating any workload."
+        subtitle="Watch live Prometheus metrics on a testbed without generating any workload. Pod restarts, OOM kills, CPU throttling and full pod/cluster health are always included in the report."
         actions={
           <button type="button" className="btn btn-outline-secondary"
             onClick={() => navigate('/monitor-only/sessions')}>
@@ -167,11 +164,34 @@ const MonitorOnlyConfigure: React.FC = () => {
         )}
       </section>
 
-      {/* Step 2: rules */}
+      {/* Step 2: duration */}
       <section className="config-section" style={{ marginBottom: 16 }}>
-        <h2><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>monitoring</i> 2. Monitoring Rules</h2>
+        <h2><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>timer</i> 2. Duration</h2>
+        <div className="row g-3" style={{ maxWidth: 720 }}>
+          <div className="col-md-4">
+            <label className="form-label" style={{ fontSize: 12, fontWeight: 600 }}>How long to monitor (hours)</label>
+            <input type="number" className="form-control" min={0} max={720} value={durationHours}
+              onChange={e => setDurationHours(Math.max(0, Math.min(720, Number(e.target.value) || 0)))} />
+            <small className="text-muted">Default 24h. Set 0 to run until manually stopped.</small>
+          </div>
+          <div className="col-md-8">
+            <label className="form-label" style={{ fontSize: 12, fontWeight: 600 }}>Session name (optional)</label>
+            <input type="text" className="form-control" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Pre-prod soak watch" />
+          </div>
+        </div>
+      </section>
+
+      {/* Step 3: optional rules */}
+      <section className="config-section" style={{ marginBottom: 16 }}>
+        <h2>
+          <i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>monitoring</i>
+          {' '}3. Monitoring Rules
+          <span className="text-muted" style={{ fontSize: 12, fontWeight: 400, marginLeft: 8 }}>(optional)</span>
+        </h2>
         <p className="text-muted" style={{ fontSize: 'var(--text-xs)', marginBottom: 12 }}>
-          Add Pod / Node / Cluster rules. Use <strong>Add Custom Rule</strong> to combine multiple conditions with AND/OR.
+          Leave empty to just collect metrics. Pod restarts, OOM kills, CPU throttling and the full
+          cluster health snapshot are <strong>always</strong> in the report — rules are only needed
+          if you want Slack/email pings on specific thresholds.
         </p>
         {!selectedTestbed && <div className="text-muted" style={{ fontSize: 12 }}>Pick a testbed above first to populate Pod / Node pickers.</div>}
         {selectedTestbed && loadingPods && <div className="text-muted" style={{ fontSize: 12, marginBottom: 8 }}>Loading namespaces &amp; pods…</div>}
@@ -186,37 +206,12 @@ const MonitorOnlyConfigure: React.FC = () => {
         />
       </section>
 
-      {/* Step 3: timing */}
-      <section className="config-section" style={{ marginBottom: 16 }}>
-        <h2><i className="material-icons-outlined" style={{ fontSize: 20, verticalAlign: 'middle' }}>schedule</i> 3. Schedule</h2>
-        <div className="row g-3" style={{ maxWidth: 720 }}>
-          <div className="col-md-4">
-            <label className="form-label" style={{ fontSize: 12, fontWeight: 600 }}>Name (optional)</label>
-            <input type="text" className="form-control" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Pre-prod soak watch" />
-          </div>
-          <div className="col-md-4">
-            <label className="form-label" style={{ fontSize: 12, fontWeight: 600 }}>Poll interval (seconds)</label>
-            <input type="number" className="form-control" min={10} max={600} value={pollIntervalS}
-              onChange={e => setPollIntervalS(Math.max(10, Math.min(600, Number(e.target.value) || 30)))} />
-            <small className="text-muted">10–600 seconds. Default 30s.</small>
-          </div>
-          <div className="col-md-4">
-            <label className="form-label" style={{ fontSize: 12, fontWeight: 600 }}>Duration (hours, 0 = until stopped)</label>
-            <input type="number" className="form-control" min={0} max={720} value={durationHours}
-              onChange={e => setDurationHours(Math.max(0, Math.min(720, Number(e.target.value) || 0)))} />
-          </div>
-          <div className="col-12">
-            <label className="form-label" style={{ fontSize: 12, fontWeight: 600 }}>Description (optional)</label>
-            <textarea className="form-control" rows={2} value={description} onChange={e => setDescription(e.target.value)} />
-          </div>
-        </div>
-      </section>
-
       {/* Footer */}
       <div className="d-flex justify-content-between align-items-center" style={{ marginTop: 20 }}>
         <div className="text-muted" style={{ fontSize: 12 }}>
-          <strong>{enabledRules.length}</strong> enabled rule{enabledRules.length !== 1 ? 's' : ''} · poll every <strong>{pollIntervalS}s</strong>
-          {durationHours > 0 ? <> · stops after <strong>{durationHours}h</strong></> : <> · runs <strong>until stopped</strong></>}
+          <strong>{enabledRules.length}</strong> enabled rule{enabledRules.length !== 1 ? 's' : ''} ·
+          {' '}{durationHours > 0 ? <>runs for <strong>{durationHours}h</strong></> : <>runs <strong>until stopped</strong></>}
+          {' '}· poll every <strong>{POLL_INTERVAL_S}s</strong>
         </div>
         <button type="button" className="btn btn-primary" onClick={start} disabled={!canStart}>
           {submitting && <span className="spinner-border spinner-border-sm me-2" />}

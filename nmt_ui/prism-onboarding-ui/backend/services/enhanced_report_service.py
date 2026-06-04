@@ -50,6 +50,14 @@ import requests
 from urllib.parse import urljoin
 
 from services.prometheus_url import resolve_working_prometheus_url
+# Pod-coverage v2: single source of truth for pod severity. Used here to add a
+# ``pod_health`` block to the report payload (Critical / Watch / Healthy tiers,
+# per-namespace grouping, sort score). The same module is consumed later by the
+# Slack notifier and the Alerts page so the three views can never disagree.
+from services.pod_health_classifier import (
+    ClassifierThresholds,
+    PodHealthClassifier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +77,64 @@ MIN_SPIKE_DELTA = 5.0
 # Treating only 'SUCCESS' as success made every report rendered from DB-loaded
 # data collapse to 0% pass rate — the cause of the "28628 ops, 0% success" bug.
 SUCCESS_STATES = {'SUCCESS', 'COMPLETED', 'OK'}
+
+
+# ---------------------------------------------------------------------------
+#  Pod-coverage v1 — feature flag + sanity caps
+# ---------------------------------------------------------------------------
+# Set ``POD_COVERAGE_V1=false`` in the environment to fall back to the legacy
+# ``topk(20)/topk(30)`` behaviour. Default is on, because the legacy caps
+# silently dropped pods 21..N from the report (the "we only see 30 of 273
+# pods" complaint).
+#
+# Even with the flag on, every new field is *additive* — no existing key is
+# removed or renamed. So flipping the flag back off is safe and the UI keeps
+# working. Anything that fails (e.g. kube-state-metrics not installed) leaves
+# the affected new key as an empty list / empty dict.
+import os as _os
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = _os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {'1', 'true', 'yes', 'on', 'y', 't'}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+# Master toggle for the full pod-coverage payload (cluster_summary,
+# cluster_allocation, node_breakdown, container_cpu, container_memory,
+# window_pod_cpu_max, window_pod_memory_max, window_restarts, window_oom_events).
+POD_COVERAGE_V1_ENABLED = _env_bool('POD_COVERAGE_V1', True)
+
+# When the legacy ``topk(N)`` is removed, Prometheus may hand back hundreds of
+# pods. We still cap the rendered list so a single rogue cluster can't OOM
+# the browser. 1000 rows × ~200 bytes each = ~200 KB JSON which is fine.
+POD_COVERAGE_MAX_ROWS = _env_int('POD_COVERAGE_MAX_ROWS', 1000)
+
+# Pod-coverage v3 — per-pod sparkline series for the redesigned report.
+# OFF by default (one extra Prometheus range query per non-healthy pod) —
+# flip POD_COVERAGE_V3=true to enable. The payload is small (~30 [ts, pct]
+# pairs per pod × 2 series) but the queries cost ~1-2s each so we only
+# run them for non-healthy pods.
+POD_COVERAGE_V3_ENABLED = _env_bool('POD_COVERAGE_V3', True)
+
+# Cap how many pods get sparkline series — the rest fall back to the
+# scalar peak we already compute (cpu_pct_max_in_run / memory_pct_max_in_run).
+POD_COVERAGE_V3_MAX_PODS = _env_int('POD_COVERAGE_V3_MAX_PODS', 80)
+
+# Number of points per sparkline. 30 keeps the SVG path tiny and the
+# per-pod range queries cheap.
+POD_COVERAGE_V3_SERIES_POINTS = _env_int('POD_COVERAGE_V3_SERIES_POINTS', 30)
 
 
 def _op_succeeded(op: dict) -> bool:
@@ -106,7 +172,27 @@ class EnhancedReportService:
         target_config = report_data.get('target_config') or status_data.get('target_config') or {}
 
         spike_analysis = self._analyze_spikes(metrics_history, operations_history, pod_correlation, detected_anomalies, target_config)
-        live_cluster_health = self._collect_cluster_health()
+        # Pod-coverage v1: pass the execution window so range queries can
+        # compute per-pod max CPU%/Mem% / window restarts / window OOM events.
+        # Falls back to (None, None) when the run hasn't started or these
+        # fields aren't on the status payload (legacy execution data).
+        exec_start = (
+            status_data.get('start_time')
+            or report_data.get('start_time')
+            or (report_data.get('full_execution_data', {}) or {}).get('start_time')
+        )
+        exec_end = (
+            status_data.get('end_time')
+            or report_data.get('end_time')
+            or (report_data.get('full_execution_data', {}) or {}).get('end_time')
+        )
+        # If the run is still in flight, "now" is a fine proxy for the
+        # window-end so range queries still cover everything seen so far.
+        if exec_start and not exec_end:
+            exec_end = datetime.now(tz=timezone.utc).isoformat()
+        live_cluster_health = self._collect_cluster_health(
+            execution_window=(exec_start, exec_end) if exec_start else None
+        )
         cluster_health = live_cluster_health
         persisted_health = report_data.get('cluster_health_snapshot') or status_data.get('cluster_health_snapshot')
         cluster_health_source = 'unavailable'
@@ -122,9 +208,146 @@ class EnhancedReportService:
             for live_key in ('unhealthy_pods', 'terminated_containers', 'total_restarts',
                              'problem_pods', 'pod_phase_summary', 'pods_not_ready',
                              'api_server_latency', 'etcd_healthy',
-                             'node_cpu', 'node_memory', 'node_disk', 'restart_timestamps'):
+                             'node_cpu', 'node_memory', 'node_disk', 'restart_timestamps',
+                             # Pod-coverage v1 — additive, never present on
+                             # legacy persisted snapshots so the merge below
+                             # is safe.
+                             'pod_coverage_v1', 'cluster_summary',
+                             'cluster_allocation', 'node_breakdown',
+                             'container_cpu', 'container_memory',
+                             'window_pod_cpu_max', 'window_pod_memory_max',
+                             'window_restarts', 'window_oom_events',
+                             'execution_window'):
                 if live_key in live_cluster_health:
                     cluster_health[live_key] = live_cluster_health[live_key]
+
+        # ------------------------------------------------------------------
+        # v5 — bidirectional merge: even when LIVE Prometheus is reachable
+        # the per-pod / per-container arrays it produces can be partial
+        # (e.g. cAdvisor scrape was delayed, NCM nodePort flapped between
+        # iterations, or only node-level series were available at query
+        # time). The pre-v5 logic was all-or-nothing — picked the live
+        # snapshot whole, discarding the richer persisted snapshot the
+        # engine had captured during the run. That made the v5 unified
+        # Pod Health table render "—" for CPU Max %, Mem Max %, CPU Limit,
+        # Mem Limit and container_count even though the run had collected
+        # all of it on disk (verified end-to-end on 10.114.54.238-longivity
+        # — 181 pod_cpu / pod_memory / container_cpu / container_memory rows
+        # in the persisted snapshot, 0 in the live one).
+        # Strategy:
+        #   * For scalar / dict-shaped keys: live wins, fall back to
+        #     persisted only when live is empty.
+        #   * For list-of-rows keys with a (namespace, pod[, container])
+        #     identity: UNION live + persisted, with live entries winning
+        #     on tuple collisions (so the live snapshot's freshness still
+        #     beats the persisted one) but every persisted row that the
+        #     live scrape missed is preserved instead of being dropped.
+        #     This is the only thing that fixes the otel-collector case
+        #     where live had ~5 container_cpu rows and persisted had 248.
+        if (cluster_health_source == 'live_prometheus'
+                and isinstance(persisted_health, dict)
+                and persisted_health):
+            _SCALAR_KEYS = (
+                'pod_phase_summary', 'cluster_summary', 'cluster_allocation',
+                'etcd_healthy', 'execution_window',
+            )
+            # Union keys are arrays of dicts where (ns, pod[, container])
+            # uniquely identifies each row. Three-tuple keys are listed
+            # explicitly so we pick up the container axis.
+            _UNION_KEYS_POD: Tuple[str, ...] = (
+                'pod_cpu', 'pod_memory', 'pods_not_ready', 'problem_pods',
+                'unhealthy_pods', 'window_pod_cpu_max',
+                'window_pod_memory_max', 'window_restarts',
+                'window_oom_events', 'oom_killed', 'restart_timestamps',
+            )
+            _UNION_KEYS_CONTAINER: Tuple[str, ...] = (
+                'container_cpu', 'container_memory', 'container_restarts',
+                'total_restarts', 'cpu_throttling', 'terminated_containers',
+            )
+            _UNION_KEYS_NODE: Tuple[str, ...] = (
+                'node_conditions', 'node_breakdown', 'node_cpu',
+                'node_memory', 'node_disk',
+            )
+            _UNION_KEYS_OTHER: Tuple[str, ...] = (
+                'api_server_latency', 'pvc_health',
+            )
+
+            def _union(live_list, pers_list, key_fn):
+                live_list = live_list if isinstance(live_list, list) else []
+                pers_list = pers_list if isinstance(pers_list, list) else []
+                if not pers_list:
+                    return live_list
+                seen = set()
+                out: List[Any] = []
+                for row in live_list:
+                    if not isinstance(row, dict):
+                        out.append(row)
+                        continue
+                    try:
+                        k = key_fn(row)
+                    except Exception:
+                        k = None
+                    if k is not None:
+                        seen.add(k)
+                    out.append(row)
+                for row in pers_list:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        k = key_fn(row)
+                    except Exception:
+                        k = None
+                    if k is None or k not in seen:
+                        out.append(row)
+                        if k is not None:
+                            seen.add(k)
+                return out
+
+            _pod_key = lambda r: (r.get('namespace'), r.get('pod'))
+            _ctr_key = lambda r: (r.get('namespace'), r.get('pod'),
+                                  r.get('container'))
+            _node_key = lambda r: r.get('node') or r.get('instance')
+            _generic_key = lambda r: tuple(sorted(
+                (k, str(v)) for k, v in r.items()
+                if k in ('namespace', 'pod', 'container', 'node',
+                         'instance', 'pvc_name', 'verb', 'resource')
+            ))
+
+            for k in _UNION_KEYS_POD:
+                cluster_health[k] = _union(
+                    cluster_health.get(k), persisted_health.get(k),
+                    _pod_key,
+                )
+            for k in _UNION_KEYS_CONTAINER:
+                cluster_health[k] = _union(
+                    cluster_health.get(k), persisted_health.get(k),
+                    _ctr_key,
+                )
+            for k in _UNION_KEYS_NODE:
+                cluster_health[k] = _union(
+                    cluster_health.get(k), persisted_health.get(k),
+                    _node_key,
+                )
+            for k in _UNION_KEYS_OTHER:
+                cluster_health[k] = _union(
+                    cluster_health.get(k), persisted_health.get(k),
+                    _generic_key,
+                )
+            for k in _SCALAR_KEYS:
+                live_v = cluster_health.get(k)
+                pers_v = persisted_health.get(k)
+                empty_live = (
+                    live_v is None
+                    or (isinstance(live_v, (list, dict)) and len(live_v) == 0)
+                )
+                if empty_live and pers_v:
+                    cluster_health[k] = pers_v
+            # Preserve pod_coverage_v1 and any other simple flag the live
+            # snapshot didn't bother to set.
+            for k in ('pod_coverage_v1',):
+                if k not in cluster_health and k in persisted_health:
+                    cluster_health[k] = persisted_health[k]
+            cluster_health_source = 'live_prometheus+persisted'
         failure_groups = self._group_failures(operations_history)
         heatmap = self._build_operation_heatmap(operations_history)
         pod_stability = self._compute_pod_stability(pod_correlation, cluster_health)
@@ -163,10 +386,80 @@ class EnhancedReportService:
             or {}
         )
 
+        # ------------------------------------------------------------------
+        # Pod-coverage v2/v3: classify every pod into Critical / Watch /
+        # Healthy using a single, shared severity engine. v3 additionally
+        # enriches each pod with:
+        #   * events[]  — chronological timeline (restart/oom/throttle/term)
+        #   * cpu_series / memory_series — tiny sparklines (top-N pods only)
+        # The output drives:
+        #   - the tiered Pod Coverage section in the report
+        #   - the Slack notifier's first-fire-then-silent gating (Phase 5)
+        #   - the Alerts page severity column (Phase 6)
+        # Wrapped in try/except + feature flag so a classifier-side bug can
+        # never break report generation; consumers fall back to the raw
+        # ``cluster_health`` arrays they were already using.
+        pod_health_block: Dict[str, Any] = {}
+        if POD_COVERAGE_V1_ENABLED:
+            # v3 sparkline series — only for non-healthy pods (saves Prometheus).
+            pod_series: Dict[Tuple[str, str], Dict[str, List]] = {}
+            if POD_COVERAGE_V3_ENABLED and exec_start and self.prometheus_url:
+                try:
+                    pod_series = self._collect_pod_series(
+                        cluster_health=cluster_health or {},
+                        execution_window=(exec_start, exec_end),
+                        max_pods=POD_COVERAGE_V3_MAX_PODS,
+                        points=POD_COVERAGE_V3_SERIES_POINTS,
+                    )
+                except Exception as series_err:  # noqa: BLE001
+                    logger.warning(
+                        "Pod sparkline collection failed for %s: %s",
+                        execution_id, series_err, exc_info=True,
+                    )
+                    pod_series = {}
+            # v4 — kube_pod_info-driven full-cluster seed (Node, Uptime, Phase).
+            # This is what guarantees "no missing pods" in the v4 table even
+            # when a pod had zero per-pod metric samples in cluster_health.
+            pod_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            if self.prometheus_url:
+                try:
+                    pod_meta = self._collect_pod_meta()
+                except Exception as meta_err:  # noqa: BLE001
+                    logger.warning(
+                        "Pod metadata collection failed for %s: %s",
+                        execution_id, meta_err, exc_info=True,
+                    )
+                    pod_meta = {}
+            try:
+                pod_health_block = PodHealthClassifier(
+                    ClassifierThresholds.from_env()
+                ).classify(
+                    cluster_health or {},
+                    pod_restart_tracking=pod_restart_tracking,
+                    pod_series=pod_series or None,
+                    pod_meta=pod_meta or None,
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive, log + continue
+                logger.warning(
+                    "PodHealthClassifier failed for execution %s: %s",
+                    execution_id, exc, exc_info=True,
+                )
+                pod_health_block = {'error': str(exc), 'pods': [], 'summary': {
+                    'total': 0, 'critical': 0, 'watch': 0, 'healthy': 0,
+                }}
+            # Mirror the block under cluster_health so persisted snapshots can
+            # carry it forward (DB JSONB column already serialises cluster_health).
+            if isinstance(cluster_health, dict):
+                cluster_health['pod_health'] = pod_health_block
+
         return {
             'verdict': verdict,
             'spike_analysis': spike_analysis,
             'cluster_health': cluster_health,
+            # Top-level for direct template access (e.g. ``pod_health.summary.critical``).
+            # Same object is also reachable as ``cluster_health.pod_health`` below
+            # so existing per-cluster JSON consumers can find it without a UI change.
+            'pod_health': pod_health_block,
             'failure_analysis': failure_groups,
             'operation_heatmap': heatmap,
             'pod_stability': pod_stability,
@@ -566,7 +859,18 @@ class EnhancedReportService:
         except Exception as e:
             return False, str(e)[:200]
 
-    def _collect_cluster_health(self) -> Dict:
+    def _collect_cluster_health(
+        self,
+        execution_window: Optional[Tuple[Optional[str], Optional[str]]] = None,
+    ) -> Dict:
+        """Collect cluster-health snapshot from Prometheus.
+
+        ``execution_window`` is an optional ``(start_iso, end_iso)`` pair. When
+        provided AND ``POD_COVERAGE_V1`` is enabled, additional range queries
+        compute the per-pod max CPU% / Mem% / restart deltas / OOM events that
+        occurred specifically *during the run*. Without a window, only the
+        current/lifetime snapshot is built (legacy behaviour).
+        """
         health = {
             'cpu_throttling': [],
             'container_restarts': [],
@@ -576,6 +880,22 @@ class EnhancedReportService:
             'collection_status': 'unavailable',
             'collection_reason': 'prometheus_url_not_configured',
         }
+        # Pod-coverage v1 fields — pre-seeded so callers never NPE on missing
+        # keys even when Prometheus is down or kube-state-metrics absent.
+        if POD_COVERAGE_V1_ENABLED:
+            health.update({
+                'pod_coverage_v1': True,
+                'cluster_summary': {},
+                'cluster_allocation': {},
+                'node_breakdown': [],
+                'container_cpu': [],
+                'container_memory': [],
+                'window_pod_cpu_max': [],
+                'window_pod_memory_max': [],
+                'window_restarts': [],
+                'window_oom_events': [],
+                'execution_window': {},
+            })
         if not self.prometheus_url:
             return health
 
@@ -588,12 +908,24 @@ class EnhancedReportService:
         try:
             url = urljoin(self.prometheus_url, '/api/v1/query')
 
-            throttle_query = (
-                'topk(20, rate(container_cpu_cfs_throttled_periods_total'
-                '{container!="", image!=""}[5m]) / '
-                'rate(container_cpu_cfs_periods_total'
-                '{container!="", image!=""}[5m]))'
-            )
+            # CPU throttling — was ``topk(20, ...)`` which silently dropped pods
+            # 21..N. Pod-coverage v1 returns the FULL list (filtered to >1% so
+            # noise doesn't dominate), sorted worst-first, capped at
+            # ``POD_COVERAGE_MAX_ROWS`` for browser sanity.
+            if POD_COVERAGE_V1_ENABLED:
+                throttle_query = (
+                    'rate(container_cpu_cfs_throttled_periods_total'
+                    '{container!="", image!=""}[5m]) / '
+                    'rate(container_cpu_cfs_periods_total'
+                    '{container!="", image!=""}[5m])'
+                )
+            else:
+                throttle_query = (
+                    'topk(20, rate(container_cpu_cfs_throttled_periods_total'
+                    '{container!="", image!=""}[5m]) / '
+                    'rate(container_cpu_cfs_periods_total'
+                    '{container!="", image!=""}[5m]))'
+                )
             throttle_data = self._prom_query(url, throttle_query)
             for r in throttle_data:
                 m = r.get('metric', {})
@@ -609,11 +941,25 @@ class EnhancedReportService:
                         'throttle_ratio': round(ratio * 100, 1),
                         'timestamp': ts_str,
                     })
+            if POD_COVERAGE_V1_ENABLED and health['cpu_throttling']:
+                health['cpu_throttling'].sort(
+                    key=lambda x: x.get('throttle_ratio', 0), reverse=True
+                )
+                health['cpu_throttling'] = health['cpu_throttling'][:POD_COVERAGE_MAX_ROWS]
 
-            restart_query = (
-                'topk(20, increase(kube_pod_container_status_restarts_total'
-                '{container!=""}[1h]))'
-            )
+            # Container restarts in last 1h — same drop-the-cap treatment as
+            # throttling above. Filter ``count >= 1`` keeps the list bounded
+            # to actually-restarted containers; final cap protects the UI.
+            if POD_COVERAGE_V1_ENABLED:
+                restart_query = (
+                    'increase(kube_pod_container_status_restarts_total'
+                    '{container!=""}[1h])'
+                )
+            else:
+                restart_query = (
+                    'topk(20, increase(kube_pod_container_status_restarts_total'
+                    '{container!=""}[1h]))'
+                )
             restart_data = self._prom_query(url, restart_query)
             for r in restart_data:
                 m = r.get('metric', {})
@@ -625,6 +971,11 @@ class EnhancedReportService:
                         'container': m.get('container', 'unknown'),
                         'restart_count': int(count),
                     })
+            if POD_COVERAGE_V1_ENABLED and health['container_restarts']:
+                health['container_restarts'].sort(
+                    key=lambda x: x.get('restart_count', 0), reverse=True
+                )
+                health['container_restarts'] = health['container_restarts'][:POD_COVERAGE_MAX_ROWS]
 
             oom_query = (
                 'kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}'
@@ -683,53 +1034,135 @@ class EnhancedReportService:
                     })
 
             # Per-pod CPU usage (normalized by limit where available)
-            pod_cpu_cores_query = (
-                'topk(30, sum(rate(container_cpu_usage_seconds_total'
-                '{container!="", container!="POD"}[1m])) by (pod, namespace))'
-            )
+            # Pod-coverage v1 drops the ``topk(30)`` so all pods are visible.
+            # Key by ``(pod, namespace)`` not just ``pod`` — two pods with the
+            # same name in different namespaces (common with operators) used
+            # to collide and inherit the wrong limit.
+            if POD_COVERAGE_V1_ENABLED:
+                pod_cpu_cores_query = (
+                    'sum(rate(container_cpu_usage_seconds_total'
+                    '{container!="", container!="POD"}[1m])) by (pod, namespace)'
+                )
+            else:
+                pod_cpu_cores_query = (
+                    'topk(30, sum(rate(container_cpu_usage_seconds_total'
+                    '{container!="", container!="POD"}[1m])) by (pod, namespace))'
+                )
             pod_cpu_limit_query = (
                 'sum(kube_pod_container_resource_limits'
                 '{resource="cpu", container!=""}) by (pod, namespace)'
             )
+            pod_cpu_request_query = (
+                'sum(kube_pod_container_resource_requests'
+                '{resource="cpu", container!=""}) by (pod, namespace)'
+            )
             cpu_cores_data = self._prom_query(url, pod_cpu_cores_query)
             cpu_limit_data = self._prom_query(url, pod_cpu_limit_query)
-            cpu_limits = {}
+            cpu_request_data = self._prom_query(url, pod_cpu_request_query)
+            cpu_limits: Dict[Tuple[str, str], float] = {}
             for r in cpu_limit_data:
                 m = r.get('metric', {})
                 limit_cores = float(r.get('value', [0, 0])[1])
                 if limit_cores > 0:
-                    cpu_limits[m.get('pod', '')] = limit_cores
+                    cpu_limits[(m.get('pod', ''), m.get('namespace', ''))] = limit_cores
+            cpu_requests: Dict[Tuple[str, str], float] = {}
+            for r in cpu_request_data:
+                m = r.get('metric', {})
+                req_cores = float(r.get('value', [0, 0])[1])
+                if req_cores > 0:
+                    cpu_requests[(m.get('pod', ''), m.get('namespace', ''))] = req_cores
 
             health['pod_cpu'] = []
             for r in cpu_cores_data:
                 m = r.get('metric', {})
                 pod = m.get('pod', 'unknown')
+                ns = m.get('namespace', 'unknown')
                 cores = float(r.get('value', [0, 0])[1])
-                limit = cpu_limits.get(pod)
-                pct = min((cores / limit) * 100, 100.0) if (limit and limit > 0) else min(cores * 100, 100.0)
+                limit = cpu_limits.get((pod, ns)) or cpu_limits.get((pod, ''))
+                request = cpu_requests.get((pod, ns)) or cpu_requests.get((pod, ''))
+                # Honest CPU% calculation. The old fallback ``min(cores*100, 100)``
+                # made any pod with no limit but ~1 core of usage look like it
+                # was pegged at 100% (eg. ntnx-ncm-common/ncm-data-processor-1),
+                # which fired bogus "High CPU" entries and poisoned the
+                # stability score. New chain:
+                #   1. limit defined  -> % of limit, capped at 100
+                #   2. request defined -> % of request (NOT capped — burst above
+                #      request is normal for burstable QoS pods and the user
+                #      should see eg. 250% to know they're burstable)
+                #   3. neither       -> cpu_pct = None; UI shows raw cores
+                if limit and limit > 0:
+                    pct = round(min((cores / limit) * 100, 100.0), 1)
+                    basis = 'limit'
+                elif request and request > 0:
+                    pct = round((cores / request) * 100, 1)
+                    basis = 'request'
+                else:
+                    pct = None
+                    basis = 'unspecified'
                 health['pod_cpu'].append({
                     'pod': pod,
-                    'namespace': m.get('namespace', 'unknown'),
+                    'namespace': ns,
                     'cpu_cores': round(cores, 3),
                     'cpu_limit_cores': round(limit, 3) if limit else None,
-                    'cpu_pct': round(pct, 1),
+                    'cpu_request_cores': round(request, 3) if request else None,
+                    'cpu_pct': pct,
+                    'cpu_basis': basis,
                 })
+            if POD_COVERAGE_V1_ENABLED and health['pod_cpu']:
+                # Sort by cpu_pct desc, treating None as -1 so unspecified pods
+                # land at the bottom (UI shows them with cores instead).
+                health['pod_cpu'].sort(
+                    key=lambda x: x.get('cpu_pct') if x.get('cpu_pct') is not None else -1,
+                    reverse=True,
+                )
+                health['pod_cpu'] = health['pod_cpu'][:POD_COVERAGE_MAX_ROWS]
 
-            # Per-pod Memory usage
-            pod_mem_query = (
-                'topk(30, sum(container_memory_working_set_bytes'
-                '{container!="", container!="POD"}) by (pod, namespace))'
-            )
+            # Per-pod Memory usage — same drop-the-cap treatment, plus joins
+            # against the memory limit so the JSON carries ``memory_pct`` and
+            # ``memory_limit_mb`` (UI uses them for the 80% colour threshold).
+            if POD_COVERAGE_V1_ENABLED:
+                pod_mem_query = (
+                    'sum(container_memory_working_set_bytes'
+                    '{container!="", container!="POD"}) by (pod, namespace)'
+                )
+            else:
+                pod_mem_query = (
+                    'topk(30, sum(container_memory_working_set_bytes'
+                    '{container!="", container!="POD"}) by (pod, namespace))'
+                )
             pod_mem_data = self._prom_query(url, pod_mem_query)
+            pod_mem_limits: Dict[Tuple[str, str], float] = {}
+            if POD_COVERAGE_V1_ENABLED:
+                pod_mem_limit_query = (
+                    'sum(kube_pod_container_resource_limits'
+                    '{resource="memory", container!=""}) by (pod, namespace)'
+                )
+                for r in self._prom_query(url, pod_mem_limit_query):
+                    m = r.get('metric', {})
+                    lim_bytes = float(r.get('value', [0, 0])[1])
+                    if lim_bytes > 0:
+                        pod_mem_limits[(m.get('pod', ''), m.get('namespace', ''))] = lim_bytes
             health['pod_memory'] = []
             for r in pod_mem_data:
                 m = r.get('metric', {})
+                pod = m.get('pod', 'unknown')
+                ns = m.get('namespace', 'unknown')
                 mem_bytes = float(r.get('value', [0, 0])[1])
-                health['pod_memory'].append({
-                    'pod': m.get('pod', 'unknown'),
-                    'namespace': m.get('namespace', 'unknown'),
+                lim_bytes = pod_mem_limits.get((pod, ns))
+                row = {
+                    'pod': pod,
+                    'namespace': ns,
                     'memory_mb': round(mem_bytes / (1024 * 1024), 1),
-                })
+                }
+                if lim_bytes:
+                    row['memory_limit_mb'] = round(lim_bytes / (1024 * 1024), 1)
+                    row['memory_pct'] = round(min(mem_bytes / lim_bytes * 100, 100.0), 1)
+                health['pod_memory'].append(row)
+            if POD_COVERAGE_V1_ENABLED and health['pod_memory']:
+                health['pod_memory'].sort(
+                    key=lambda x: x.get('memory_pct', 0) or 0, reverse=True
+                )
+                health['pod_memory'] = health['pod_memory'][:POD_COVERAGE_MAX_ROWS]
 
             # ----- Unhealthy pod states (CrashLoopBackOff, ImagePullBackOff, etc.) -----
             waiting_query = 'kube_pod_container_status_waiting_reason{reason!=""}'
@@ -779,9 +1212,17 @@ class EnhancedReportService:
                 tc['exit_code'] = exitcode_map.get(key, None)
 
             # ----- Cumulative restart count (total restarts ever, not just last 1h) -----
-            total_restart_query = (
-                'topk(20, kube_pod_container_status_restarts_total{container!=""})'
-            )
+            # Drop the cap so EVERY restart-bearing container shows up; the
+            # ``count >= 1`` filter keeps the list bounded to interesting rows
+            # and the sort+cap below keeps it browser-friendly.
+            if POD_COVERAGE_V1_ENABLED:
+                total_restart_query = (
+                    'kube_pod_container_status_restarts_total{container!=""}'
+                )
+            else:
+                total_restart_query = (
+                    'topk(20, kube_pod_container_status_restarts_total{container!=""})'
+                )
             total_restart_data = self._prom_query(url, total_restart_query)
             health['total_restarts'] = []
             for r in total_restart_data:
@@ -794,6 +1235,11 @@ class EnhancedReportService:
                         'container': m.get('container', 'unknown'),
                         'total_restarts': int(count),
                     })
+            if POD_COVERAGE_V1_ENABLED and health['total_restarts']:
+                health['total_restarts'].sort(
+                    key=lambda x: x.get('total_restarts', 0), reverse=True
+                )
+                health['total_restarts'] = health['total_restarts'][:POD_COVERAGE_MAX_ROWS]
 
             # ----- Pod phase distribution (Running, Pending, Failed, Succeeded) -----
             phase_query = 'kube_pod_status_phase{phase!=""}'
@@ -902,11 +1348,21 @@ class EnhancedReportService:
                 })
 
             # ----- Pod restart timestamps (last termination time per container) -----
-            restart_ts_query = (
-                'topk(30, kube_pod_container_status_restarts_total{container!=""}) '
-                '* on(pod, namespace, container) group_left() '
-                '(kube_pod_container_status_last_terminated_finished_at{container!=""} > 0)'
-            )
+            # Drop the topk(30); the post-process cap below still keeps the
+            # rendered list small. The ``> 0`` filter on the join already
+            # restricts the result to containers that have actually terminated.
+            if POD_COVERAGE_V1_ENABLED:
+                restart_ts_query = (
+                    'kube_pod_container_status_restarts_total{container!=""} '
+                    '* on(pod, namespace, container) group_left() '
+                    '(kube_pod_container_status_last_terminated_finished_at{container!=""} > 0)'
+                )
+            else:
+                restart_ts_query = (
+                    'topk(30, kube_pod_container_status_restarts_total{container!=""}) '
+                    '* on(pod, namespace, container) group_left() '
+                    '(kube_pod_container_status_last_terminated_finished_at{container!=""} > 0)'
+                )
             restart_ts_data = self._prom_query(url, restart_ts_query)
             health['restart_timestamps'] = []
             for r in restart_ts_data:
@@ -949,7 +1405,8 @@ class EnhancedReportService:
             health['restart_timestamps'].sort(
                 key=lambda x: x.get('terminated_epoch', 0), reverse=True
             )
-            health['restart_timestamps'] = health['restart_timestamps'][:30]
+            _ts_cap = POD_COVERAGE_MAX_ROWS if POD_COVERAGE_V1_ENABLED else 30
+            health['restart_timestamps'] = health['restart_timestamps'][:_ts_cap]
 
             # Build a map of pod/ns/container → last_terminated_at from restart_timestamps
             ts_map = {}
@@ -1020,6 +1477,19 @@ class EnhancedReportService:
                 key = f"{t['pod']}/{t['namespace']}/{t['container']}"
                 t['throttle_history'] = throttle_history_map.get(key, [])
 
+            # ----- Pod-coverage v1: cluster summary, allocation, node
+            # breakdown, per-container metrics, and (if a window was supplied)
+            # execution-window maxes. Each sub-section is wrapped in its own
+            # try/except inside the helper so a missing kube-state-metrics
+            # series can't fail the whole collection.
+            if POD_COVERAGE_V1_ENABLED:
+                try:
+                    self._collect_pod_coverage(url, health, execution_window)
+                except Exception as cov_err:
+                    # Never fatal — main cluster_health stays usable.
+                    logger.warning(f"pod_coverage v1 collection failed: {cov_err}")
+                    health['pod_coverage_collection_error'] = str(cov_err)[:300]
+
             health['collection_status'] = 'success'
             health['collection_reason'] = ''
         except Exception as e:
@@ -1028,6 +1498,802 @@ class EnhancedReportService:
             health['collection_reason'] = str(e)[:300]
 
         return health
+
+    # ------------------------------------------------------------------
+    #  Pod-coverage v1 — extra Prometheus probes
+    # ------------------------------------------------------------------
+    def _collect_pod_coverage(
+        self,
+        url: str,
+        health: Dict,
+        execution_window: Optional[Tuple[Optional[str], Optional[str]]] = None,
+    ) -> None:
+        """Populate the pod-coverage v1 fields on ``health``.
+
+        Six independent sub-collectors, each in its own try/except so a single
+        missing kube-state-metrics series never breaks the others. Mutates
+        ``health`` in place; never raises.
+        """
+        # 1. Cluster-level KPI counts (nodes / namespaces / pods / containers)
+        try:
+            health['cluster_summary'] = self._cov_cluster_summary(url)
+        except Exception as e:
+            logger.debug(f"cluster_summary skipped: {e}")
+
+        # 2. Cluster-level CPU/Mem capacity / requests / limits / utilisation
+        try:
+            health['cluster_allocation'] = self._cov_cluster_allocation(url)
+        except Exception as e:
+            logger.debug(f"cluster_allocation skipped: {e}")
+
+        # 3. Per-node breakdown (capacity, pods, containers, usage%)
+        try:
+            health['node_breakdown'] = self._cov_node_breakdown(url, health)
+        except Exception as e:
+            logger.debug(f"node_breakdown skipped: {e}")
+
+        # 4. Per-container CPU + Memory tables (was only per-pod before)
+        try:
+            cc, cm = self._cov_container_tables(url)
+            health['container_cpu'] = cc
+            health['container_memory'] = cm
+        except Exception as e:
+            logger.debug(f"container_tables skipped: {e}")
+
+        # 5. Execution-window enrichment (range queries — only if window given)
+        start_iso, end_iso = (execution_window or (None, None))
+        if start_iso and end_iso:
+            try:
+                start_epoch = self._iso_to_epoch(start_iso)
+                end_epoch = self._iso_to_epoch(end_iso)
+                if start_epoch and end_epoch and end_epoch > start_epoch:
+                    health['execution_window'] = {
+                        'start': start_iso, 'end': end_iso,
+                        'duration_seconds': int(end_epoch - start_epoch),
+                    }
+                    health['window_pod_cpu_max'] = self._cov_window_pod_cpu_max(
+                        url, start_epoch, end_epoch
+                    )
+                    health['window_pod_memory_max'] = self._cov_window_pod_memory_max(
+                        url, start_epoch, end_epoch
+                    )
+                    health['window_restarts'] = self._cov_window_restarts(
+                        url, start_epoch, end_epoch
+                    )
+                    health['window_oom_events'] = self._cov_window_oom_events(
+                        url, start_epoch, end_epoch
+                    )
+            except Exception as e:
+                logger.debug(f"execution_window enrichment skipped: {e}")
+
+    @staticmethod
+    def _iso_to_epoch(iso: str) -> Optional[float]:
+        if not iso:
+            return None
+        try:
+            s = str(iso).replace('Z', '+00:00')
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return None
+
+    def _cov_cluster_summary(self, url: str) -> Dict[str, int]:
+        """Counts of nodes / namespaces / pods / containers (matches the
+        reference performance_report_v4.html ``Cluster Summary`` block)."""
+
+        def _scalar(q: str) -> int:
+            res = self._prom_query(url, q)
+            if not res:
+                return 0
+            try:
+                return int(float(res[0].get('value', [0, 0])[1]))
+            except (TypeError, ValueError, IndexError):
+                return 0
+
+        return {
+            'nodes': _scalar('count(kube_node_info)'),
+            'namespaces': _scalar('count(count by (namespace) (kube_pod_info))'),
+            'pods': _scalar('count(kube_pod_info)'),
+            'containers': _scalar('count(kube_pod_container_info)'),
+        }
+
+    def _cov_cluster_allocation(self, url: str) -> Dict[str, float]:
+        """Cluster-wide CPU and memory capacity / requests / limits / live usage.
+
+        Returns absolute values AND percentages-of-capacity so the UI can
+        render either form. Memory is reported in GiB to match the reference
+        report's units.
+        """
+
+        def _sum(q: str) -> float:
+            res = self._prom_query(url, q)
+            if not res:
+                return 0.0
+            try:
+                return float(res[0].get('value', [0, 0])[1])
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+
+        cpu_cap = _sum('sum(kube_node_status_capacity{resource="cpu"})')
+        cpu_req = _sum('sum(kube_pod_container_resource_requests{resource="cpu"})')
+        cpu_lim = _sum('sum(kube_pod_container_resource_limits{resource="cpu"})')
+        cpu_use = _sum(
+            'sum(rate(container_cpu_usage_seconds_total'
+            '{container!="", container!="POD"}[5m]))'
+        )
+
+        mem_cap = _sum('sum(kube_node_status_capacity{resource="memory"})')
+        mem_req = _sum('sum(kube_pod_container_resource_requests{resource="memory"})')
+        mem_lim = _sum('sum(kube_pod_container_resource_limits{resource="memory"})')
+        mem_use = _sum(
+            'sum(container_memory_working_set_bytes'
+            '{container!="", container!="POD"})'
+        )
+
+        gib = 1024 ** 3
+
+        def _pct(num: float, denom: float) -> float:
+            return round(num / denom * 100, 2) if denom > 0 else 0.0
+
+        return {
+            'cpu_capacity_cores': round(cpu_cap, 2),
+            'cpu_requests_cores': round(cpu_req, 2),
+            'cpu_limits_cores': round(cpu_lim, 2),
+            'cpu_usage_cores': round(cpu_use, 3),
+            'cpu_requests_pct': _pct(cpu_req, cpu_cap),
+            'cpu_limits_pct': _pct(cpu_lim, cpu_cap),
+            'cpu_utilization_pct': _pct(cpu_use, cpu_cap),
+            'memory_capacity_gib': round(mem_cap / gib, 2),
+            'memory_requests_gib': round(mem_req / gib, 2),
+            'memory_limits_gib': round(mem_lim / gib, 2),
+            'memory_usage_gib': round(mem_use / gib, 2),
+            'memory_requests_pct': _pct(mem_req, mem_cap),
+            'memory_limits_pct': _pct(mem_lim, mem_cap),
+            'memory_utilization_pct': _pct(mem_use, mem_cap),
+        }
+
+    def _cov_node_breakdown(self, url: str, health: Dict) -> List[Dict]:
+        """Per-node table: pods, containers, CPU/Mem capacity/requests/limits/usage.
+
+        Reuses ``health['node_cpu']`` / ``health['node_memory']`` (already
+        collected above) for the live usage% so we don't redundantly query
+        Prometheus.
+        """
+        # Pod / container counts per node
+        pods_per_node: Dict[str, int] = {}
+        for r in self._prom_query(url, 'count by (node) (kube_pod_info)'):
+            try:
+                pods_per_node[r['metric'].get('node', '')] = int(float(r['value'][1]))
+            except (KeyError, ValueError, TypeError):
+                continue
+        containers_per_node: Dict[str, int] = {}
+        for r in self._prom_query(url, 'count by (node) (kube_pod_container_info)'):
+            try:
+                containers_per_node[r['metric'].get('node', '')] = int(float(r['value'][1]))
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        # Per-node capacity / requests / limits (joined via kube_pod_info)
+        def _by_node_sum(q: str) -> Dict[str, float]:
+            out: Dict[str, float] = {}
+            for r in self._prom_query(url, q):
+                try:
+                    out[r['metric'].get('node', '')] = float(r['value'][1])
+                except (KeyError, ValueError, TypeError):
+                    continue
+            return out
+
+        cpu_cap = _by_node_sum('sum by (node) (kube_node_status_capacity{resource="cpu"})')
+        cpu_req = _by_node_sum(
+            'sum by (node) (kube_pod_container_resource_requests{resource="cpu"} '
+            '* on(pod, namespace) group_left(node) kube_pod_info)'
+        )
+        cpu_lim = _by_node_sum(
+            'sum by (node) (kube_pod_container_resource_limits{resource="cpu"} '
+            '* on(pod, namespace) group_left(node) kube_pod_info)'
+        )
+        mem_cap = _by_node_sum('sum by (node) (kube_node_status_capacity{resource="memory"})')
+        mem_req = _by_node_sum(
+            'sum by (node) (kube_pod_container_resource_requests{resource="memory"} '
+            '* on(pod, namespace) group_left(node) kube_pod_info)'
+        )
+        mem_lim = _by_node_sum(
+            'sum by (node) (kube_pod_container_resource_limits{resource="memory"} '
+            '* on(pod, namespace) group_left(node) kube_pod_info)'
+        )
+
+        # Live CPU% / Mem% from the existing arrays. Their key is ``instance``
+        # (e.g. "10.0.0.1:9100"), which is rarely the same string as the K8s
+        # node name. We try to map via kube_node_info; if unmapped, leave the
+        # usage column as None and the UI shows "—".
+        instance_to_node: Dict[str, str] = {}
+        for r in self._prom_query(url, 'kube_node_info'):
+            m = r.get('metric', {})
+            ip = m.get('internal_ip') or m.get('node_ip') or ''
+            node = m.get('node', '')
+            if ip and node:
+                # Match prometheus instance like "10.0.0.1:9100" → "10.0.0.1"
+                instance_to_node[ip] = node
+                instance_to_node[f"{ip}:9100"] = node
+                instance_to_node[f"{ip}:9101"] = node
+
+        node_cpu_usage: Dict[str, float] = {}
+        for row in (health.get('node_cpu') or []):
+            inst = row.get('instance', '')
+            mapped = instance_to_node.get(inst) or instance_to_node.get(inst.split(':')[0])
+            if mapped:
+                node_cpu_usage[mapped] = row.get('cpu_percent', 0.0)
+        node_mem_usage: Dict[str, float] = {}
+        for row in (health.get('node_memory') or []):
+            inst = row.get('instance', '')
+            mapped = instance_to_node.get(inst) or instance_to_node.get(inst.split(':')[0])
+            if mapped:
+                node_mem_usage[mapped] = row.get('memory_percent', 0.0)
+
+        gib = 1024 ** 3
+        nodes = sorted(set(cpu_cap.keys()) | set(mem_cap.keys()) | set(pods_per_node.keys()))
+        out: List[Dict] = []
+
+        def _pct(num: float, denom: float) -> Optional[float]:
+            return round(num / denom * 100, 2) if denom > 0 else None
+
+        for node in nodes:
+            if not node:
+                continue
+            cap_cpu = cpu_cap.get(node, 0.0)
+            cap_mem = mem_cap.get(node, 0.0)
+            out.append({
+                'node': node,
+                'pods': pods_per_node.get(node, 0),
+                'containers': containers_per_node.get(node, 0),
+                'cpu_capacity_cores': round(cap_cpu, 2),
+                'cpu_requests_cores': round(cpu_req.get(node, 0.0), 2),
+                'cpu_limits_cores': round(cpu_lim.get(node, 0.0), 2),
+                'cpu_requests_pct': _pct(cpu_req.get(node, 0.0), cap_cpu),
+                'cpu_limits_pct': _pct(cpu_lim.get(node, 0.0), cap_cpu),
+                'cpu_usage_pct': node_cpu_usage.get(node),
+                'memory_capacity_gib': round(cap_mem / gib, 2),
+                'memory_requests_gib': round(mem_req.get(node, 0.0) / gib, 2),
+                'memory_limits_gib': round(mem_lim.get(node, 0.0) / gib, 2),
+                'memory_requests_pct': _pct(mem_req.get(node, 0.0), cap_mem),
+                'memory_limits_pct': _pct(mem_lim.get(node, 0.0), cap_mem),
+                'memory_usage_pct': node_mem_usage.get(node),
+            })
+        return out
+
+    def _cov_container_tables(self, url: str) -> Tuple[List[Dict], List[Dict]]:
+        """Per-(container, pod, namespace) CPU and Memory snapshots.
+
+        Returns two lists (cpu_rows, memory_rows). Each row carries the
+        container's current usage AND its limit/request (when defined), plus a
+        ``cpu_pct`` / ``memory_pct`` of-limit percentage that the UI uses for
+        threshold colour-coding (>=80% red per product doc).
+        """
+        # CPU usage per container
+        cpu_use_q = (
+            'sum(rate(container_cpu_usage_seconds_total'
+            '{container!="", container!="POD"}[1m])) by (container, pod, namespace)'
+        )
+        cpu_lim_q = (
+            'sum(kube_pod_container_resource_limits'
+            '{resource="cpu", container!=""}) by (container, pod, namespace)'
+        )
+        cpu_req_q = (
+            'sum(kube_pod_container_resource_requests'
+            '{resource="cpu", container!=""}) by (container, pod, namespace)'
+        )
+
+        def _by_ckey(q: str) -> Dict[Tuple[str, str, str], float]:
+            out: Dict[Tuple[str, str, str], float] = {}
+            for r in self._prom_query(url, q):
+                m = r.get('metric', {})
+                key = (
+                    m.get('container', ''),
+                    m.get('pod', ''),
+                    m.get('namespace', ''),
+                )
+                try:
+                    out[key] = float(r['value'][1])
+                except (KeyError, ValueError, TypeError):
+                    continue
+            return out
+
+        cpu_use = _by_ckey(cpu_use_q)
+        cpu_lim = _by_ckey(cpu_lim_q)
+        cpu_req = _by_ckey(cpu_req_q)
+
+        cpu_rows: List[Dict] = []
+        for key, cores in cpu_use.items():
+            container, pod, ns = key
+            limit = cpu_lim.get(key)
+            request = cpu_req.get(key)
+            pct = (
+                min(cores / limit * 100, 100.0)
+                if (limit and limit > 0)
+                else min(cores * 100, 100.0)
+            )
+            cpu_rows.append({
+                'container': container,
+                'pod': pod,
+                'namespace': ns,
+                'cpu_cores': round(cores, 4),
+                'cpu_limit_cores': round(limit, 4) if limit else None,
+                'cpu_request_cores': round(request, 4) if request else None,
+                'cpu_pct': round(pct, 2),
+            })
+        cpu_rows.sort(key=lambda x: x.get('cpu_pct', 0), reverse=True)
+        cpu_rows = cpu_rows[:POD_COVERAGE_MAX_ROWS]
+
+        # Memory per container
+        mem_use_q = (
+            'sum(container_memory_working_set_bytes'
+            '{container!="", container!="POD"}) by (container, pod, namespace)'
+        )
+        mem_lim_q = (
+            'sum(kube_pod_container_resource_limits'
+            '{resource="memory", container!=""}) by (container, pod, namespace)'
+        )
+        mem_req_q = (
+            'sum(kube_pod_container_resource_requests'
+            '{resource="memory", container!=""}) by (container, pod, namespace)'
+        )
+        mem_use = _by_ckey(mem_use_q)
+        mem_lim = _by_ckey(mem_lim_q)
+        mem_req = _by_ckey(mem_req_q)
+
+        mb = 1024 * 1024
+        mem_rows: List[Dict] = []
+        for key, mem_bytes in mem_use.items():
+            container, pod, ns = key
+            limit_b = mem_lim.get(key)
+            req_b = mem_req.get(key)
+            pct = (
+                min(mem_bytes / limit_b * 100, 100.0)
+                if (limit_b and limit_b > 0)
+                else 0.0
+            )
+            row = {
+                'container': container,
+                'pod': pod,
+                'namespace': ns,
+                'memory_mb': round(mem_bytes / mb, 1),
+            }
+            if limit_b:
+                row['memory_limit_mb'] = round(limit_b / mb, 1)
+                row['memory_pct'] = round(pct, 2)
+            if req_b:
+                row['memory_request_mb'] = round(req_b / mb, 1)
+            mem_rows.append(row)
+        mem_rows.sort(
+            key=lambda x: x.get('memory_pct', 0) or 0, reverse=True
+        )
+        mem_rows = mem_rows[:POD_COVERAGE_MAX_ROWS]
+
+        return cpu_rows, mem_rows
+
+    def _cov_window_pod_cpu_max(
+        self, url: str, start_epoch: float, end_epoch: float
+    ) -> List[Dict]:
+        """Per-pod max CPU% (of limit) over the execution window.
+
+        Range query at 60s step → compute max in Python so we also capture the
+        timestamp of the peak. Skips pods with no recorded samples in the
+        window (Prometheus only stores series that produced points).
+        """
+        q = (
+            'sum(rate(container_cpu_usage_seconds_total'
+            '{container!="", container!="POD"}[1m])) by (pod, namespace) / on(pod, namespace) '
+            'sum(kube_pod_container_resource_limits'
+            '{resource="cpu", container!=""}) by (pod, namespace) * 100'
+        )
+        step = self._range_step_for(end_epoch - start_epoch)
+        rows = self._prom_range_query(url, q, start_epoch, end_epoch, step=step)
+        out: List[Dict] = []
+        for series in rows:
+            m = series.get('metric', {})
+            pod = m.get('pod', 'unknown')
+            ns = m.get('namespace', 'unknown')
+            best_val = -1.0
+            best_ts = 0.0
+            for ts_str, val_str in series.get('values', []):
+                try:
+                    v = float(val_str)
+                except (TypeError, ValueError):
+                    continue
+                if v != v:  # skip NaN
+                    continue
+                if v > best_val:
+                    best_val = v
+                    try:
+                        best_ts = float(ts_str)
+                    except (TypeError, ValueError):
+                        best_ts = 0.0
+            if best_val < 0:
+                continue
+            out.append({
+                'pod': pod,
+                'namespace': ns,
+                'cpu_pct_max': round(min(best_val, 100.0), 2),
+                'cpu_pct_max_at': (
+                    datetime.fromtimestamp(best_ts, tz=timezone.utc).isoformat()
+                    if best_ts else ''
+                ),
+            })
+        out.sort(key=lambda x: x.get('cpu_pct_max', 0), reverse=True)
+        return out[:POD_COVERAGE_MAX_ROWS]
+
+    def _cov_window_pod_memory_max(
+        self, url: str, start_epoch: float, end_epoch: float
+    ) -> List[Dict]:
+        """Per-pod max Memory% (of limit) over the execution window."""
+        q = (
+            'sum(container_memory_working_set_bytes'
+            '{container!="", container!="POD"}) by (pod, namespace) / on(pod, namespace) '
+            'sum(kube_pod_container_resource_limits'
+            '{resource="memory", container!=""}) by (pod, namespace) * 100'
+        )
+        step = self._range_step_for(end_epoch - start_epoch)
+        rows = self._prom_range_query(url, q, start_epoch, end_epoch, step=step)
+        out: List[Dict] = []
+        for series in rows:
+            m = series.get('metric', {})
+            best_val = -1.0
+            best_ts = 0.0
+            for ts_str, val_str in series.get('values', []):
+                try:
+                    v = float(val_str)
+                except (TypeError, ValueError):
+                    continue
+                if v != v:
+                    continue
+                if v > best_val:
+                    best_val = v
+                    try:
+                        best_ts = float(ts_str)
+                    except (TypeError, ValueError):
+                        best_ts = 0.0
+            if best_val < 0:
+                continue
+            out.append({
+                'pod': m.get('pod', 'unknown'),
+                'namespace': m.get('namespace', 'unknown'),
+                'memory_pct_max': round(min(best_val, 100.0), 2),
+                'memory_pct_max_at': (
+                    datetime.fromtimestamp(best_ts, tz=timezone.utc).isoformat()
+                    if best_ts else ''
+                ),
+            })
+        out.sort(key=lambda x: x.get('memory_pct_max', 0), reverse=True)
+        return out[:POD_COVERAGE_MAX_ROWS]
+
+    # ------------------------------------------------------------------
+    #  v3 — per-pod sparkline series (CPU% / Mem% over execution window)
+    # ------------------------------------------------------------------
+    def _collect_pod_series(
+        self,
+        cluster_health: Dict[str, Any],
+        execution_window: Tuple[Optional[str], Optional[str]],
+        max_pods: int,
+        points: int,
+    ) -> Dict[Tuple[str, str], Dict[str, List]]:
+        """Per-pod CPU% / Mem% sparkline payload for the v3 report.
+
+        Returns ``{(namespace, pod): {'cpu': [[iso_ts, pct], …],
+        'memory': [[iso_ts, pct], …]}}`` for the top ``max_pods`` non-healthy
+        pods (by usage). Each series is downsampled to ~``points`` points
+        (Prometheus picks the step) so the inline SVG stays tiny.
+
+        Returning an empty dict is fine — the renderer just skips the
+        sparkline section for pods with no series.
+        """
+        if not self.prometheus_url:
+            return {}
+        start_iso, end_iso = execution_window
+        if not start_iso:
+            return {}
+        try:
+            start_epoch = self._iso_to_epoch(start_iso)
+            end_epoch = (
+                self._iso_to_epoch(end_iso) if end_iso
+                else datetime.now(tz=timezone.utc).timestamp()
+            )
+        except Exception:  # noqa: BLE001
+            return {}
+        duration = max(end_epoch - start_epoch, 60.0)
+        # Pick the step so we land near the requested point count.
+        step_sec = max(int(duration / max(points, 5)), 30)
+        step = f'{step_sec}s'
+
+        # Pick the candidate pods — anything in the existing cpu/mem snapshot
+        # above the watch line, plus any pod that already has a window peak.
+        # Falling back to the top by current usage when those are empty so
+        # we still produce *something* useful for healthy clusters.
+        candidates: List[Tuple[str, str, float]] = []
+        seen: set = set()
+
+        def _add(ns: str, pod: str, score: float):
+            key = (ns, pod)
+            if not ns or not pod or key in seen:
+                return
+            seen.add(key)
+            candidates.append((ns, pod, score))
+
+        for r in (cluster_health.get('window_pod_cpu_max') or []):
+            _add(r.get('namespace'), r.get('pod'), float(r.get('cpu_pct_max') or 0))
+        for r in (cluster_health.get('window_pod_memory_max') or []):
+            _add(r.get('namespace'), r.get('pod'), float(r.get('memory_pct_max') or 0))
+        for r in (cluster_health.get('pod_cpu') or []):
+            _add(r.get('namespace'), r.get('pod'), float(r.get('cpu_pct') or 0))
+        for r in (cluster_health.get('pod_memory') or []):
+            _add(r.get('namespace'), r.get('pod'), float(r.get('memory_pct') or 0))
+
+        candidates.sort(key=lambda c: c[2], reverse=True)
+        candidates = candidates[:max_pods]
+        if not candidates:
+            return {}
+
+        url = self.prometheus_url
+
+        # Build a label-matcher that only fetches series for the chosen pods —
+        # one batched range query each for CPU and Memory keeps round-trips
+        # to two regardless of pod count. Escape regex specials in names.
+        def _re_escape(s: str) -> str:
+            return re.escape(s).replace('/', r'\/')
+
+        pod_re = '|'.join(_re_escape(c[1]) for c in candidates)
+        ns_re = '|'.join(sorted({_re_escape(c[0]) for c in candidates}))
+
+        cpu_q = (
+            f'sum(rate(container_cpu_usage_seconds_total'
+            f'{{container!="",container!="POD",pod=~"{pod_re}",namespace=~"{ns_re}"}}[1m])) '
+            f'by (pod, namespace) / on(pod, namespace) '
+            f'sum(kube_pod_container_resource_limits'
+            f'{{resource="cpu", container!="", pod=~"{pod_re}", namespace=~"{ns_re}"}}) '
+            f'by (pod, namespace) * 100'
+        )
+        mem_q = (
+            f'sum(container_memory_working_set_bytes'
+            f'{{container!="",container!="POD",pod=~"{pod_re}",namespace=~"{ns_re}"}}) '
+            f'by (pod, namespace) / on(pod, namespace) '
+            f'sum(kube_pod_container_resource_limits'
+            f'{{resource="memory", container!="", pod=~"{pod_re}", namespace=~"{ns_re}"}}) '
+            f'by (pod, namespace) * 100'
+        )
+
+        cpu_rows = self._prom_range_query(url, cpu_q, start_epoch, end_epoch, step=step)
+        mem_rows = self._prom_range_query(url, mem_q, start_epoch, end_epoch, step=step)
+
+        out: Dict[Tuple[str, str], Dict[str, List]] = {}
+
+        def _to_series(values: List) -> List[List[Any]]:
+            series: List[List[Any]] = []
+            for ts_str, val_str in values or []:
+                try:
+                    v = float(val_str)
+                    if v != v:                       # skip NaN
+                        continue
+                    ts = float(ts_str)
+                except (TypeError, ValueError):
+                    continue
+                series.append([
+                    datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    round(min(v, 100.0), 1),
+                ])
+            return series
+
+        for s in cpu_rows:
+            m = s.get('metric', {})
+            key = (m.get('namespace', ''), m.get('pod', ''))
+            if not key[0] or not key[1]:
+                continue
+            out.setdefault(key, {'cpu': [], 'memory': []})['cpu'] = _to_series(s.get('values'))
+
+        for s in mem_rows:
+            m = s.get('metric', {})
+            key = (m.get('namespace', ''), m.get('pod', ''))
+            if not key[0] or not key[1]:
+                continue
+            out.setdefault(key, {'cpu': [], 'memory': []})['memory'] = _to_series(s.get('values'))
+
+        return out
+
+    # ------------------------------------------------------------------
+    #  v4 — full-cluster pod metadata (Node, Uptime, Phase) for the table
+    # ------------------------------------------------------------------
+    def _collect_pod_meta(self) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """One-shot Prometheus pull for every pod in the cluster.
+
+        Returns ``{(namespace, pod): {'node': str, 'uptime_seconds': float,
+        'phase': str}}``. The map is the canonical "full pod inventory"
+        the v4 table uses to guarantee no missing rows — even pods with
+        zero per-pod metric samples will get an entry here.
+
+        Falls back to an empty dict on any query failure; callers treat
+        an empty meta as "no metadata available, render '—' in the
+        table" so the report never breaks.
+        """
+        if not self.prometheus_url:
+            return {}
+        # ``_prom_query`` expects the fully-qualified ``/api/v1/query`` URL,
+        # not the base host. Earlier we passed the base URL by mistake which
+        # silently returned 0 rows because Prometheus rejected the request.
+        url = urljoin(self.prometheus_url.rstrip('/') + '/', 'api/v1/query')
+        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        # 1. kube_pod_info → pod ↔ node mapping (and seeds the inventory).
+        try:
+            for r in (self._prom_query(url, 'kube_pod_info') or []):
+                m = r.get('metric', {})
+                ns = m.get('namespace')
+                pod = m.get('pod')
+                if not ns or not pod:
+                    continue
+                out.setdefault((ns, pod), {})['node'] = m.get('node') or m.get('host_ip') or None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("kube_pod_info query failed: %s", exc)
+
+        # 2. kube_pod_start_time (epoch seconds) → uptime.
+        try:
+            now_ts = datetime.now(tz=timezone.utc).timestamp()
+            for r in (self._prom_query(url, 'kube_pod_start_time') or []):
+                m = r.get('metric', {})
+                ns = m.get('namespace')
+                pod = m.get('pod')
+                if not ns or not pod:
+                    continue
+                val = (r.get('value') or [None, None])[1]
+                try:
+                    start_epoch = float(val)
+                except (TypeError, ValueError):
+                    continue
+                uptime = max(now_ts - start_epoch, 0.0)
+                slot = out.setdefault((ns, pod), {})
+                slot['uptime_seconds'] = round(uptime, 1)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("kube_pod_start_time query failed: %s", exc)
+
+        # 3. kube_pod_status_phase{phase=…}=1 → current phase.
+        try:
+            for r in (self._prom_query(url, 'kube_pod_status_phase == 1') or []):
+                m = r.get('metric', {})
+                ns = m.get('namespace')
+                pod = m.get('pod')
+                phase = m.get('phase')
+                if not ns or not pod or not phase:
+                    continue
+                slot = out.setdefault((ns, pod), {})
+                # Last writer wins, but Prometheus only emits the row whose
+                # value is 1 so there's effectively just one phase per pod.
+                slot['phase'] = phase
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("kube_pod_status_phase query failed: %s", exc)
+
+        return out
+
+    @staticmethod
+    def _iso_to_epoch(iso: str) -> float:
+        """ISO 8601 → Unix epoch (UTC). Naive-aware safe."""
+        dt = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+
+    def _cov_window_restarts(
+        self, url: str, start_epoch: float, end_epoch: float
+    ) -> List[Dict]:
+        """Restart events that happened DURING the execution window only.
+
+        Range-queries the cumulative restart counter and detects upward steps
+        in the series (delta > 0). Output: one row per (pod, ns, container)
+        that restarted at least once in the window, with first/last restart
+        timestamps and the count.
+        """
+        step = self._range_step_for(end_epoch - start_epoch, prefer_dense=True)
+        rows = self._prom_range_query(
+            url,
+            'kube_pod_container_status_restarts_total{container!=""}',
+            start_epoch, end_epoch, step=step,
+        )
+        out: List[Dict] = []
+        for series in rows:
+            m = series.get('metric', {})
+            values = series.get('values', [])
+            timestamps: List[float] = []
+            prev: Optional[float] = None
+            for ts_str, val_str in values:
+                try:
+                    cur = float(val_str)
+                    ts = float(ts_str)
+                except (TypeError, ValueError):
+                    continue
+                if prev is not None and cur > prev:
+                    timestamps.append(ts)
+                prev = cur
+            if not timestamps:
+                continue
+            out.append({
+                'pod': m.get('pod', 'unknown'),
+                'namespace': m.get('namespace', 'unknown'),
+                'container': m.get('container', 'unknown'),
+                'restarts_in_window': len(timestamps),
+                'first_restart_at': datetime.fromtimestamp(
+                    min(timestamps), tz=timezone.utc).isoformat(),
+                'last_restart_at': datetime.fromtimestamp(
+                    max(timestamps), tz=timezone.utc).isoformat(),
+            })
+        out.sort(key=lambda x: x.get('restarts_in_window', 0), reverse=True)
+        return out[:POD_COVERAGE_MAX_ROWS]
+
+    def _cov_window_oom_events(
+        self, url: str, start_epoch: float, end_epoch: float
+    ) -> List[Dict]:
+        """OOMKilled events whose ``last_terminated_finished_at`` falls inside
+        the execution window. (Prometheus doesn't expose a counter of OOM
+        events, only the ``last_terminated_reason``, so we filter by the
+        sampled timestamp on each series.)
+        """
+        rows = self._prom_query(
+            url,
+            'kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}',
+        )
+        if not rows:
+            return []
+        ts_rows = self._prom_query(
+            url,
+            'kube_pod_container_status_last_terminated_finished_at{container!=""} > 0',
+        )
+        ts_map: Dict[str, float] = {}
+        for r in ts_rows:
+            m = r.get('metric', {})
+            try:
+                ts_map[
+                    f"{m.get('pod','')}/{m.get('namespace','')}/{m.get('container','')}"
+                ] = float(r['value'][1])
+            except (KeyError, ValueError, TypeError):
+                continue
+        out: List[Dict] = []
+        for r in rows:
+            m = r.get('metric', {})
+            try:
+                val = float(r['value'][1])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if val < 1:
+                continue
+            key = f"{m.get('pod','')}/{m.get('namespace','')}/{m.get('container','')}"
+            ts = ts_map.get(key)
+            if ts is None or not (start_epoch <= ts <= end_epoch):
+                continue
+            out.append({
+                'pod': m.get('pod', 'unknown'),
+                'namespace': m.get('namespace', 'unknown'),
+                'container': m.get('container', 'unknown'),
+                'oom_at': datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+            })
+        out.sort(key=lambda x: x.get('oom_at', ''), reverse=True)
+        return out
+
+    @staticmethod
+    def _range_step_for(duration_sec: float, prefer_dense: bool = False) -> str:
+        """Pick a sane Prometheus step for a range query.
+
+        The Prometheus default series cap is 11 000 samples per series, so we
+        size the step to keep us under it. Short runs (<1 h) use 30 s for
+        smooth max-detection; multi-hour runs scale up to 60 s/5 m/15 m.
+        ``prefer_dense=True`` pushes one notch finer (used for restart-event
+        detection where missing a step can lose a restart).
+        """
+        if duration_sec <= 60 * 60:           # ≤1 h
+            return '30s' if prefer_dense else '60s'
+        if duration_sec <= 6 * 3600:          # ≤6 h
+            return '60s' if prefer_dense else '120s'
+        if duration_sec <= 24 * 3600:         # ≤1 d
+            return '120s' if prefer_dense else '300s'
+        if duration_sec <= 72 * 3600:         # ≤3 d
+            return '300s' if prefer_dense else '600s'
+        return '600s' if prefer_dense else '900s'
 
     def _prom_query(self, url: str, query: str) -> List:
         try:
@@ -1378,12 +2644,16 @@ class EnhancedReportService:
                 mem_map[pod] = entry.get('memory_mb', 0)
                 _ensure_pod(pod, entry.get('namespace', 'unknown'))
 
-        # Fill cpu_max/memory_max_mb from Prometheus when pod_correlation didn't provide values
+        # Fill cpu_max/memory_max_mb from Prometheus when pod_correlation didn't provide values.
+        # cpu_pct may now be None when the pod has neither limit nor request set
+        # (cpu_basis='unspecified') — preserve None so the report can render
+        # "1.02 cores (no limit)" instead of fabricating a misleading "100%".
         for pod_name, info in pod_map.items():
             if info['cpu_max'] == 0 and pod_name in cpu_map:
-                info['cpu_max'] = cpu_map[pod_name].get('cpu_pct', 0)
+                info['cpu_max'] = cpu_map[pod_name].get('cpu_pct')  # may be None
                 info['cpu_cores'] = cpu_map[pod_name].get('cpu_cores', 0)
                 info['cpu_limit_cores'] = cpu_map[pod_name].get('cpu_limit_cores')
+                info['cpu_basis'] = cpu_map[pod_name].get('cpu_basis', 'limit')
             if info['memory_max_mb'] == 0 and pod_name in mem_map:
                 info['memory_max_mb'] = mem_map[pod_name]
 
@@ -1397,10 +2667,106 @@ class EnhancedReportService:
         for tr in cluster_health.get('total_restarts', []):
             total_restart_map[tr['pod']] = max(total_restart_map[tr['pod']], tr.get('total_restarts', 0))
 
-        # Use max throttle ratio across all containers in the same pod
-        throttle_map: Dict[str, float] = defaultdict(float)
+        # Usage-weighted pod throttle — v2 (bug fix 2026-06-03).
+        #
+        # CPU throttling is per-CONTAINER in the source data. Old code took
+        # ``max()`` across containers — let a 26m sidecar at 99% poison a
+        # 1.4-core main container at 0%.
+        #
+        # Aggregation:
+        #
+        #   throttle_pod = Σ(throttle_i × cores_i) / Σ(cores_i)
+        #
+        # CRITICAL — the sum has to span EVERY container in the pod, not
+        # only the throttled ones. cAdvisor only emits
+        # ``container_cpu_cfs_throttled_periods_total`` for containers
+        # that have throttled at least once. v1 of this fix iterated only
+        # ``cpu_throttling``, so the unthrottled main container's
+        # 0% × big-cores never entered the denominator and the weighted
+        # average collapsed back to ~max(). Example caught on
+        # ncm-policy-7ffc9994f9-2khr2:
+        #   sidecar: 1.1m cores, 81.8% throttled (1 row)
+        #   main:    4.2m cores,  0% throttled (NO row)
+        #   v1 said: (81.8×1.1)/1.1 = 81.8%   (sidecar-only denominator)
+        #   v2 says: (81.8×1.1 + 0×4.2)/5.3 = 17.0%   (correct)
+        #
+        # v2 algorithm:
+        #   1. Build full per-pod container roster from container_cpu
+        #      (every container's cores, throttled or not).
+        #   2. Look up throttle ratio per container; default 0 when no row.
+        #   3. weight_sum = Σ(cores_i) over ALL containers in the pod.
+        #   4. weighted_sum = Σ(ratio_i × cores_i) over ALL containers.
+        # Fallback to max() only when container_cpu is empty (no usage
+        # data) so idle pods with cAdvisor-reported throttling still
+        # surface a non-zero signal.
+        pod_containers: Dict[str, Dict[str, float]] = defaultdict(dict)
+        for entry in cluster_health.get('container_cpu', []) or []:
+            try:
+                cores = float(entry.get('cpu_cores') or 0)
+            except (TypeError, ValueError):
+                continue
+            pod_containers[entry.get('pod', '')][entry.get('container', '')] = cores
+
+        throttle_for_pod: Dict[str, Dict[str, float]] = defaultdict(dict)
         for t in cluster_health.get('cpu_throttling', []):
-            throttle_map[t['pod']] = max(throttle_map[t['pod']], t.get('throttle_ratio', 0))
+            pod = t.get('pod', '')
+            container = t.get('container', '')
+            ratio = float(t.get('throttle_ratio') or 0)
+            throttle_for_pod[pod][container] = ratio
+
+        throttle_map: Dict[str, float] = {}
+        throttle_top: Dict[str, Dict[str, Any]] = {}
+        for pod, throttles in throttle_for_pod.items():
+            containers = pod_containers.get(pod, {})
+
+            weighted_sum = 0.0
+            weight_sum = 0.0
+            max_ratio = 0.0
+            top_info: Optional[Dict[str, Any]] = None
+
+            if containers:
+                # Primary path: weight every container by its cores so an
+                # unthrottled main container correctly dilutes a tiny
+                # over-throttled sidecar.
+                for container, cores in containers.items():
+                    ratio = throttles.get(container, 0.0)
+                    weighted_sum += ratio * cores
+                    weight_sum += cores
+                    if ratio > max_ratio:
+                        max_ratio = ratio
+                        top_info = {
+                            'container': container,
+                            'throttle_ratio': round(ratio, 1),
+                            'cpu_cores': round(cores, 3),
+                        }
+                # Pick up containers with throttling but no container_cpu
+                # row (rare collection race) — for "top container"
+                # provenance only; they have 0 weight.
+                for container, ratio in throttles.items():
+                    if container not in containers and ratio > max_ratio:
+                        max_ratio = ratio
+                        top_info = {
+                            'container': container,
+                            'throttle_ratio': round(ratio, 1),
+                            'cpu_cores': 0.0,
+                        }
+            else:
+                # No container_cpu data — fall back to max() so we don't
+                # silently drop signals for idle pods.
+                for container, ratio in throttles.items():
+                    if ratio > max_ratio:
+                        max_ratio = ratio
+                        top_info = {
+                            'container': container,
+                            'throttle_ratio': round(ratio, 1),
+                            'cpu_cores': 0.0,
+                        }
+                weighted_sum = max_ratio
+                weight_sum = 1.0
+
+            throttle_map[pod] = weighted_sum / weight_sum if weight_sum > 0 else max_ratio
+            if top_info is not None:
+                throttle_top[pod] = top_info
 
         oom_set = {o['pod'] for o in cluster_health.get('oom_killed', [])}
 
@@ -1462,10 +2828,15 @@ class EnhancedReportService:
                 score -= 20
             if not_ready:
                 score -= 10
-            if info['cpu_max'] > 90:
-                score -= 10
-            elif info['cpu_max'] > 70:
-                score -= 5
+            # cpu_max may be None when the pod has no CPU limit/request
+            # (cpu_basis='unspecified'). In that case we genuinely don't know
+            # whether the pod is overloaded — don't dock the score on a guess.
+            cpu_max_val = info.get('cpu_max')
+            if cpu_max_val is not None:
+                if cpu_max_val > 90:
+                    score -= 10
+                elif cpu_max_val > 70:
+                    score -= 5
             score = max(0, round(score))
 
             results.append({
@@ -1475,12 +2846,16 @@ class EnhancedReportService:
                 'restarts': restarts,
                 'total_restarts': total_restarts,
                 'cpu_throttle_pct': round(throttle, 1),
+                # Per-container provenance for the pod-level throttle value.
+                # Empty when no container in this pod has throttling > 1%.
+                'throttle_top_container': throttle_top.get(pod_name),
                 'oom_killed': oom,
                 'unhealthy_reason': unhealthy_reason,
                 'termination_reasons': term_reasons,
                 'pod_phase': phase,
                 'not_ready': not_ready,
-                'max_cpu_pct': round(info['cpu_max'], 1),
+                'max_cpu_pct': round(cpu_max_val, 1) if cpu_max_val is not None else None,
+                'cpu_basis': info.get('cpu_basis'),
                 'cpu_cores': round(info.get('cpu_cores', 0), 3),
                 'cpu_limit_cores': info.get('cpu_limit_cores'),
                 'max_memory_mb': round(info['memory_max_mb'], 1),

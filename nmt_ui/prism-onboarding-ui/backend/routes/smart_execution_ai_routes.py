@@ -679,7 +679,12 @@ def _run_ai_control_loop(ai_engine: Any, testbed_info: Dict[str, Any]) -> None:
             else:
                 metrics_after = metrics_before.copy()
 
-            ai_engine.record_operation_result(et, op, metrics_before, metrics_after, success, duration, entity_name=entity_name)
+            ai_engine.record_operation_result(
+                et, op, metrics_before, metrics_after, success, duration,
+                entity_name=entity_name,
+                iteration=i,
+                result=result if isinstance(result, dict) else None,
+            )
 
             if ai_engine.phase == 'sustaining':
                 ai_engine._sustain_stats['ops_during_sustain'] = \
@@ -1795,7 +1800,37 @@ def _complete_execution_in_db(execution_id, engine, testbed_info):
                 ch = getattr(engine, '_cluster_health_snapshot', None)
                 if ch and isinstance(ch, dict):
                     full_data['cluster_health_snapshot'] = ch
+                # ── Resilient Prometheus URL persistence ─────────────────
+                # Always persist a best-derivable URL — not just the one the
+                # live loop happened to resolve. Rationale: if Prometheus was
+                # briefly unreachable when ``_run_ai_control_loop`` did its
+                # probe (line ~351), ``engine._prometheus_url`` stays None.
+                # Then later, when the user downloads the report AFTER the
+                # backend restarts (so the in-mem ``active_ai_executions``
+                # entry is gone and the download takes the DB-loaded path),
+                # ``full_execution_data.prometheus_url`` is empty and the
+                # report fallback chain ALSO needs the testbed lookup to
+                # succeed. Persisting the derived URL up-front means future
+                # downloads always have a URL to try, and the report's live
+                # Prometheus probe (port 30546 standard NodePort) populates
+                # the Cluster Health Snapshot card instead of rendering
+                # "prometheus_url_not_configured" — the exact symptom the
+                # Sizing_2.1_GF (10.53.56.44) VM run hit on 2026-05-16.
                 prom_url = getattr(engine, '_prometheus_url', None)
+                if not prom_url:
+                    _tb = getattr(engine, 'testbed_info', None) or {}
+                    if isinstance(_tb, dict):
+                        prom_url = (
+                            (_tb.get('prometheus_url') or '').strip() or None
+                            or (_tb.get('prometheus_endpoint') or '').strip() or None
+                        )
+                        if not prom_url:
+                            _pc_ip = (_tb.get('pc_ip') or '').strip()
+                            _ncm_ip = (_tb.get('ncm_ip') or '').strip()
+                            if _pc_ip:
+                                prom_url = f'https://{_pc_ip}:30546'
+                            elif _ncm_ip:
+                                prom_url = f'https://{_ncm_ip}:30546'
                 if prom_url:
                     full_data['prometheus_url'] = prom_url
 

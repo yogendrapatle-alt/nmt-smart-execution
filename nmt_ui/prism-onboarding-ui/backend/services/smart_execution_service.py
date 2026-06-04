@@ -201,7 +201,12 @@ class SmartExecutionController:
         
         self.parallel_execution_enabled = adv.get('parallel_execution', True)
         self.max_parallel_operations = adv.get('max_parallel_operations', 8)
-        self.workload_generation_enabled = adv.get('workload_generation', True)
+        # Synthetic load injection (in-VM stress-ng when creating VMs) is OPT-IN.
+        # By default a run drives the cluster only with the entity operations the
+        # user selected; we never fabricate CPU/memory load, since doing so would
+        # contaminate the throttle/utilisation numbers the report is meant to
+        # measure. Enable explicitly via advanced.workload_generation=true.
+        self.workload_generation_enabled = adv.get('workload_generation', False)
         self.stress_vms = []
         
         # Workload profile: ramp_up | burst | sustained | chaos | custom
@@ -317,11 +322,18 @@ class SmartExecutionController:
         # Graceful drain: track in-flight operation count
         self._inflight_ops = 0
         
-        # K8s stress escalation: deploy stress pods when API ops alone can't reach target
+        # K8s stress escalation: deploy busybox stress pods to force the cluster
+        # toward the CPU/memory target when the selected API operations alone
+        # don't reach it. This is OPT-IN (default OFF): injecting synthetic pods
+        # into a live/shared cluster perturbs the very metrics we report and can
+        # starve real workloads. When disabled, the target threshold acts purely
+        # as an alert/stop condition — if real operations never reach it the run
+        # simply keeps going until its duration elapses or the user stops it.
+        # Enable explicitly via advanced.stress_escalation=true.
         self._stress_pods_deployed = []
         self._max_stress_pods_deployed = 0
         self._stagnation_count = 0
-        self._stress_escalation_enabled = adv.get('stress_escalation', True)
+        self._stress_escalation_enabled = adv.get('stress_escalation', False)
         self._max_stress_pods = adv.get('max_stress_pods', 5)
         self._ssh_password = testbed_info.get('ssh_password', 'nutanix/4u')
         self._pc_ip = testbed_info.get('pc_ip', '')
@@ -379,6 +391,29 @@ class SmartExecutionController:
         self._pod_restart_summary: Dict[str, Dict] = {}  # per-pod aggregated restart info
         self._last_pod_restart_check: Optional[datetime] = None
         self._pod_restart_check_interval = 300  # check every 5 minutes
+
+        # ── Phase 5: First-fire-then-silent Slack gating ──────────────────
+        # Per (rule_id, namespace, pod_or_node) we remember the highest
+        # severity already announced to Slack. The next evaluation only
+        # re-fires Slack if the severity ESCALATES (e.g. Moderate → Critical)
+        # or if the pod fully heals (drops below threshold) and then violates
+        # again. The Alerts page / DB still receives every per-iteration
+        # violation — Slack just gets the meaningful state changes.
+        #
+        # This addresses the user feedback "if anything continuously failing
+        # so if we generate non stop slack alert thats not good, in alert page
+        # if showing that okay also".
+        #
+        # Disable per-deployment via SLACK_FIRE_THEN_SILENT=false.
+        self._slack_alert_state: Dict[Tuple[str, str, str], Dict] = {}
+        try:
+            import os as _os_local
+            self._slack_fire_then_silent = (
+                _os_local.environ.get('SLACK_FIRE_THEN_SILENT', 'true').strip().lower()
+                in {'1', 'true', 'yes', 'on', 'y', 't'}
+            )
+        except Exception:
+            self._slack_fire_then_silent = True
         
         # Control parameters
         self.poll_interval = 15  # seconds between metric checks
@@ -1294,13 +1329,64 @@ class SmartExecutionController:
 
     # ── Pod restart continuous monitoring ──────────────────────────────
 
+    def _maybe_recover_prometheus_url(self) -> None:
+        """Self-heal the Prometheus URL if it has been failing.
+
+        Called periodically from the main iteration loop. The recovery
+        helper internally:
+          * Probes the current URL (fast no-op if healthy)
+          * Tries HTTP↔HTTPS scheme flips
+          * Tries port 9090 fallback on pc_ip/ncm_ip
+          * Re-runs kubectl on the PC to find the current NodePort if
+            credentials are present on the testbed row
+        And persists a freshly-discovered URL to the testbed JSON so
+        subsequent runs short-circuit.
+
+        Honours a 10-minute cooldown internally; safe to invoke every
+        iteration without melting the PC over SSH.
+        """
+        from services.prometheus_url import attempt_url_recovery
+
+        testbed_ctx = {
+            'unique_testbed_id': self.testbed_info.get('unique_testbed_id'),
+            'pc_ip': self.testbed_info.get('pc_ip'),
+            'ncm_ip': self.testbed_info.get('ncm_ip'),
+            'username': self.testbed_info.get('username'),
+            'password': self.testbed_info.get('password'),
+            'testbed_json': self.testbed_info,
+        }
+        new_url, ts, changed = attempt_url_recovery(
+            self.prometheus_url,
+            testbed_ctx,
+            last_attempt_ts=getattr(self, '_last_prom_recovery_at', 0.0),
+        )
+        self._last_prom_recovery_at = ts
+        if changed and new_url:
+            logger.info(
+                f"[{self.execution_id}] 🔄 self-healed prometheus_url: "
+                f"{self.prometheus_url} -> {new_url}"
+            )
+            self.prometheus_url = new_url
+            # Clear the cached http<->https flip; it'll be regenerated
+            # lazily by the next _query_prometheus call if needed.
+            self.prometheus_url_https = None
+            # Reset the "dead" flag so the next query actually tries.
+            self._prometheus_dead = False
+
     def _query_prometheus_multi(self, query: str) -> List[Dict]:
         """Query Prometheus and return all result entries (not just the first scalar)."""
         if getattr(self, '_prometheus_dead', False):
             return []
         urls_to_try = [self.prometheus_url]
-        if self.prometheus_url_https:
-            urls_to_try.append(self.prometheus_url_https)
+        # ``prometheus_url_https`` is only set inside ``__init__``. Callers that
+        # construct a controller via ``__new__`` (e.g. monitor-only's
+        # ``_build_evaluator`` and ``test_rule``) bypass __init__, so this
+        # attribute can legitimately be missing. Use getattr so the missing
+        # attribute degrades to "only try the primary URL" instead of raising
+        # AttributeError and silently returning an empty result for every poll.
+        https_url = getattr(self, 'prometheus_url_https', None)
+        if https_url:
+            urls_to_try.append(https_url)
         for url_base in urls_to_try:
             try:
                 url = urljoin(url_base, '/api/v1/query')
@@ -2135,6 +2221,19 @@ class SmartExecutionController:
                 
                 # Periodic pod restart check (interval-gated internally)
                 self._check_pod_restarts()
+
+                # Layer-C circuit breaker: every 30 iterations (~5 min at 10s
+                # cadence) try to self-heal the Prometheus URL if it's stale.
+                # The recovery helper is a fast no-op when the URL works —
+                # only does kubectl I/O when a probe fails AND its 10-minute
+                # internal cooldown has elapsed. This catches the case where
+                # the NodePort changes mid-run (NCM VM reboot, svc delete/
+                # recreate) without bringing down the execution.
+                if iteration % 30 == 0 and getattr(self, 'prometheus_url', None):
+                    try:
+                        self._maybe_recover_prometheus_url()
+                    except Exception as e:
+                        logger.debug(f"prometheus recovery hook failed: {e}")
                 
                 # Memory trimming: prevent unbounded growth of in-memory lists
                 if iteration % 10 == 0:
@@ -2240,6 +2339,56 @@ class SmartExecutionController:
         elif self.status == "TIMEOUT":
             logger.info("Execution timed out")
     
+    def _classify_error_type(self, http_status_code, error_text: str) -> str:
+        """Derive a human-readable error_type bucket from HTTP code + body.
+
+        The enhanced report's ``error_code_breakdown`` groups failures by
+        ``error_type``. Most NCM error paths only set ``http_status_code``
+        and a message — without this helper every such failure rolls up
+        into the catch-all ``Unknown`` bucket and triage is impossible.
+
+        Mapping mirrors the buckets QA cares about:
+          * 401/403  → ``AuthError``
+          * 404      → ``NotFound``
+          * 405      → ``MethodNotAllowed``
+          * 408/429  → ``Throttled``
+          * 5xx      → ``ServerError``
+          * timeout  → ``Timeout``  (text-match fallback when no code)
+          * conn refused / DNS → ``Network``
+        Falls back to ``HTTP <code>`` or ``ApiError`` so the user always sees
+        SOMETHING actionable rather than ``Unknown``.
+        """
+        try:
+            code = int(http_status_code) if http_status_code is not None else None
+        except (TypeError, ValueError):
+            code = None
+        text = (error_text or '').lower()
+        if code is not None:
+            if code in (401, 403):
+                return 'AuthError'
+            if code == 404:
+                return 'NotFound'
+            if code == 405:
+                return 'MethodNotAllowed'
+            if code in (408, 429):
+                return 'Throttled'
+            if 500 <= code < 600:
+                return 'ServerError'
+            if 400 <= code < 500:
+                return f'ClientError({code})'
+            return f'HTTP {code}'
+        if 'timed out' in text or 'timeout' in text:
+            return 'Timeout'
+        if 'connection refused' in text or 'connection reset' in text:
+            return 'Network'
+        if 'name or service not known' in text or 'temporary failure in name resolution' in text:
+            return 'DNS'
+        if 'ssl' in text or 'certificate' in text:
+            return 'TLS'
+        if text:
+            return 'ApiError'
+        return 'Unknown'
+
     def _extract_api_error(self, response) -> str:
         """Extract a readable error message from an NCM API response"""
         if not response:
@@ -2987,6 +3136,15 @@ class SmartExecutionController:
             execution_mode = 'REAL' if is_real else 'SIMULATED'
             http_status_code = result.get('http_status_code') or result.get('error_code')
             op_status = result.get('status', 'SUCCESS')
+            # Derive a meaningful error_type from HTTP code / error text when
+            # the underlying NCM helper didn't set one. Without this every
+            # failure rolls up under "Unknown" in the report's
+            # ``error_code_breakdown`` even when we have an HTTP 401/404/500.
+            derived_error_type = result.get('error_type')
+            if op_status == 'FAILED' and not derived_error_type:
+                derived_error_type = self._classify_error_type(
+                    http_status_code, result.get('error') or ''
+                )
 
             self._emit_event(
                 'operation_completed' if op_status == 'SUCCESS' else 'operation_failed',
@@ -3009,7 +3167,7 @@ class SmartExecutionController:
                 'entity_name': entity_name,
                 'entity_uuid': result.get('uuid', f"simulated-{self.total_operations}"),
                 'error': result.get('error'),
-                'error_type': result.get('error_type'),
+                'error_type': derived_error_type,
                 'error_code': result.get('error_code'),
                 'http_status_code': http_status_code,
                 'iteration': iteration,
@@ -3501,8 +3659,22 @@ class SmartExecutionController:
             target_mem = self.target_config.get('memory_threshold', 80)
             cpu_gap = max(target_cpu - current_cpu, 0)
             mem_gap = max(target_mem - current_mem, 0)
-            
-            if enable_stress or cpu_gap > 30:
+
+            # Optional explicit profile override (skips the cpu_gap-based sizing logic).
+            # Allowed values: 'micro' (1 vCPU + 256 MiB), 'small' (1+1024), 'medium' (2+2048), 'large' (4+4096).
+            # Lookup order: target_config.advanced.vm_profile -> target_config.vm_profile.
+            _adv = self.target_config.get('advanced', {}) if isinstance(self.target_config.get('advanced'), dict) else {}
+            vm_profile = (_adv.get('vm_profile') or self.target_config.get('vm_profile') or '').strip().lower()
+            _profile_specs = {
+                'micro':  (1, 1, 256),
+                'small':  (1, 1, 1024),
+                'medium': (2, 1, 2048),
+                'large':  (2, 2, 4096),
+            }
+
+            if vm_profile in _profile_specs:
+                num_sockets, num_vcpus_per_socket, memory_mib = _profile_specs[vm_profile]
+            elif enable_stress or cpu_gap > 30:
                 num_sockets = 2
                 num_vcpus_per_socket = 2
                 memory_mib = 4096
@@ -6778,8 +6950,12 @@ class SmartExecutionController:
             return None
 
         urls_to_try = [self.prometheus_url]
-        if self.prometheus_url_https:
-            urls_to_try.append(self.prometheus_url_https)
+        # See note in _query_prometheus_multi: monitor-only constructs this
+        # controller via __new__ and never goes through __init__, so
+        # prometheus_url_https may not exist. getattr keeps that path working.
+        https_url = getattr(self, 'prometheus_url_https', None)
+        if https_url:
+            urls_to_try.append(https_url)
 
         for url_base in urls_to_try:
             try:
@@ -6825,19 +7001,69 @@ class SmartExecutionController:
                 logger.warning(f"❌ Prometheus query failed for {url_base}: {e}")
                 continue
 
-        self._prometheus_dead = True
+        # Don't permanently mark Prometheus dead just because a single query
+        # returned empty results (this is normal — e.g. rate() during the first
+        # 30s after start, or a non-matching pod_name filter). Only flip to
+        # dead when every URL we tried actually failed at the network layer.
+        # The previous behavior would silently disable every subsequent
+        # _query_prometheus call (per-rule and cluster-aggregate sample
+        # captures) after the very first empty result, leaving monitor reports
+        # with empty cluster_cpu/mem timeseries.
+        logger.warning(
+            f"⚠️ _query_prometheus returned no usable value for query={query!r} "
+            f"(tried {len(urls_to_try)} URL(s); not flipping _prometheus_dead)"
+        )
         return None
-    
+
     # ── Monitoring Rule Evaluation ─────────────────────────────────────
     # NOTE: keys with (pod, namespace) labels are pod-scoped; queries with
     # `by (instance)` are node-scoped; bare aggregates are cluster-scoped.
     QUERY_NAME_TO_PROMETHEUS = {
         # Pod / container
-        'PodCPUUsage': 'sum(rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (pod, namespace) * 100',
+        #
+        # ``PodCPUUsage`` returns the pod's CPU usage as a percentage of its
+        # CPU LIMIT (not "cores × 100" — that older form made any pod with
+        # ~1 core of usage and no limit defined look like it was pegged at
+        # 100%, producing constant false positives on burstable QoS pods).
+        # Pods with no limit emit no series → "CPU > 80%" rules don't fire
+        # on them. Use ``PodCPUUsageCores`` if you want absolute-cores
+        # alerting regardless of limit configuration.
+        'PodCPUUsage': (
+            'sum(rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (pod, namespace) '
+            '/ on(pod, namespace) '
+            'sum(kube_pod_container_resource_limits{resource="cpu",container!=""}) by (pod, namespace) '
+            '* 100'
+        ),
+        'PodCPUUsageCores': 'sum(rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (pod, namespace)',
         'PodMemoryUsage': 'sum(container_memory_working_set_bytes{container!="POD",container!=""}) by (pod, namespace) / 1024 / 1024 / 1024',
         'PodRestarts': 'sum(kube_pod_container_status_restarts_total) by (pod, namespace)',
         'ContainerRestarts': 'sum(kube_pod_container_status_restarts_total) by (container, pod, namespace)',
-        'ContainerCPUThrottling': 'sum(rate(container_cpu_cfs_throttled_periods_total[5m])) by (pod, namespace) / sum(rate(container_cpu_cfs_periods_total[5m])) by (pod, namespace) * 100',
+        # Per-CONTAINER throttle ratio. Returns one series per container so
+        # rules can fire on the actual offending container instead of a
+        # pod-level number that's averaged across sidecars. The existing
+        # per-series fast path in ``_eval_rule_per_series`` already supports
+        # this — alerts will name the throttled container in the message.
+        'ContainerCPUThrottling': (
+            'rate(container_cpu_cfs_throttled_periods_total{container!="POD",container!=""}[5m]) '
+            '/ rate(container_cpu_cfs_periods_total{container!="POD",container!=""}[5m]) * 100'
+        ),
+        # Pod-level rollup, usage-weighted in PromQL: throttle ratio of every
+        # container is scaled by its CPU usage so a tiny sidecar throttled at
+        # 99% but using <50m CPU can't make the pod look starved. Pods with
+        # zero usage emit no series (consistent with PodCPUUsage above).
+        'PodCPUThrottling': (
+            'sum(rate(container_cpu_cfs_throttled_periods_total{container!="POD",container!=""}[5m]) '
+            '* on(pod,namespace,container) group_left '
+            'rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (pod, namespace) '
+            '/ on(pod, namespace) '
+            'sum(rate(container_cpu_cfs_periods_total{container!="POD",container!=""}[5m]) '
+            '* on(pod,namespace,container) group_left '
+            'rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (pod, namespace) '
+            '* 100'
+        ),
+        # Cluster-wide throttle ratio (legacy bare-sum form). Kept for the
+        # cluster-level "HighCPUThrottling" rule — there's no sidecar bias
+        # at cluster scope (it averages over thousands of containers).
         'HighCPUThrottling': 'sum(rate(container_cpu_cfs_throttled_periods_total[5m])) / sum(rate(container_cpu_cfs_periods_total[5m])) * 100',
         'CHCPUUsage': 'sum(rate(container_cpu_usage_seconds_total{container=~"cluster_health.*"}[5m])) * 100',
         'CHMemoryUsage': 'sum(container_memory_working_set_bytes{container=~"cluster_health.*"}) / 1024 / 1024 / 1024',
@@ -6858,8 +7084,9 @@ class SmartExecutionController:
     # Categorise templates by scope so the Phase-1/2 evaluator can pick the right
     # label injection (pod vs instance) without the UI having to send `scope`.
     POD_SCOPED_QUERIES = {
-        'PodCPUUsage', 'PodMemoryUsage', 'PodRestarts', 'ContainerRestarts',
-        'ContainerCPUThrottling', 'HighCPUThrottling',
+        'PodCPUUsage', 'PodCPUUsageCores', 'PodMemoryUsage', 'PodRestarts',
+        'ContainerRestarts',
+        'ContainerCPUThrottling', 'PodCPUThrottling', 'HighCPUThrottling',
         'CHCPUUsage', 'CHMemoryUsage', 'IDFCPUUsage', 'IDFMemoryUsage',
     }
     NODE_SCOPED_QUERIES = {
@@ -6867,6 +7094,31 @@ class SmartExecutionController:
     }
     CLUSTER_SCOPED_QUERIES = {
         'ClusterAvgCPU', 'ClusterAvgMemory', 'ClusterMaxCPU', 'ClusterMaxMemory',
+    }
+
+    # Friendly short names testers/old fake-data files often used. We resolve
+    # them to the canonical templates above so rule definitions like
+    # ``query: "NodeCPU"`` don't silently turn into literal Prometheus queries
+    # that always return empty (which used to leave rules permanently in
+    # ``fired=0, last_value=null`` with no log line explaining why).
+    QUERY_NAME_ALIASES = {
+        'NodeCPU': 'NodeCPUUsage',
+        'NodeMemory': 'NodeMemoryUsage',
+        'NodeDisk': 'NodeDiskUsage',
+        'NodeLoad5m': 'NodeLoadAvg5m',
+        'NodeLoad': 'NodeLoadAvg5m',
+        'ClusterHealthCPU': 'CHCPUUsage',
+        'ClusterHealthMemory': 'CHMemoryUsage',
+        'ClusterHealthMem': 'CHMemoryUsage',
+        'IDFCPU': 'IDFCPUUsage',
+        'IDFMemory': 'IDFMemoryUsage',
+        'IDFMem': 'IDFMemoryUsage',
+        'CPUThrottling': 'ContainerCPUThrottling',
+        'PodCPU': 'PodCPUUsage',
+        'PodMemory': 'PodMemoryUsage',
+        'PodMem': 'PodMemoryUsage',
+        'PodRestart': 'PodRestarts',
+        'ContainerRestart': 'ContainerRestarts',
     }
 
     @staticmethod
@@ -6972,16 +7224,34 @@ class SmartExecutionController:
         operator = cond.get('operator', '>')
         threshold = float(cond.get('threshold', 0))
 
+        # Apply tester-friendly aliases (e.g. NodeCPU -> NodeCPUUsage). Without
+        # this an alias name lands at the next ``.get(raw, raw)`` lookup,
+        # falls back to the literal string, gets sent to Prometheus as PromQL,
+        # returns empty, and the rule silently never fires.
+        canonical = self.QUERY_NAME_ALIASES.get(raw, raw)
+
         # Auto-detect scope from named template if user/UI didn't set one
         if not scope:
-            if raw in self.NODE_SCOPED_QUERIES:
+            if canonical in self.NODE_SCOPED_QUERIES:
                 scope = 'node'
-            elif raw in self.CLUSTER_SCOPED_QUERIES:
+            elif canonical in self.CLUSTER_SCOPED_QUERIES:
                 scope = 'cluster'
             else:
                 scope = 'pod'
 
-        prom_query = self.QUERY_NAME_TO_PROMETHEUS.get(raw, raw)
+        prom_query = self.QUERY_NAME_TO_PROMETHEUS.get(canonical, canonical)
+        # If the user passed a name that looks like a template (alphanumeric,
+        # no PromQL operators) but is still unresolved, log it loudly so the
+        # tester can correct the rule rather than chasing a silent no-data
+        # bug for the whole monitor run.
+        if (prom_query == canonical
+                and canonical.replace('_', '').isalnum()
+                and not any(c in canonical for c in '()[]{} +-*/=<>"~,')):
+            logger.warning(
+                f"⚠️ Rule query name '{raw}' did not resolve to a PromQL template "
+                f"(known names: {sorted(self.QUERY_NAME_TO_PROMETHEUS)[:5]}...). "
+                f"Sending the literal string to Prometheus — it will return empty."
+            )
 
         # Collect target filters — each can be single (legacy) or list (modern multi-select)
         ns_v = cond.get('namespaces') or cond.get('namespace_list') or cond.get('namespace')
@@ -7039,6 +7309,84 @@ class SmartExecutionController:
         node = ((metric.get('instance', '') if isinstance(metric, dict) else '')
                 or (metric.get('node', '') if isinstance(metric, dict) else ''))
         return f"{rule_id}|{ns}|{pod}|{container}|{node}"
+
+    # Severity rank for Slack gating. Higher = more urgent — see
+    # ``_slack_should_fire`` for how this is used to detect escalation.
+    _SLACK_SEV_RANK: Dict[str, int] = {
+        'low': 0, 'info': 0,
+        'moderate': 1, 'medium': 1, 'warning': 1, 'warn': 1,
+        'critical': 2, 'high': 2, 'severe': 2,
+    }
+
+    def _slack_should_fire(
+        self,
+        rule_id: str,
+        ns: str,
+        target: str,
+        severity: str,
+        now_ts: float,
+    ) -> bool:
+        """Decide whether THIS (rule_id, namespace, target) violation should
+        produce a Slack message.
+
+        Returns True for:
+          1. The very first violation (no state recorded yet).
+          2. An escalation — severity rank now exceeds the highest rank we
+             ever sent for this triplet.
+
+        Returns False for repeat violations at the same/lower severity. The
+        DB / Alerts page still gets the full per-iteration violation row;
+        only the chat notification is throttled.
+
+        State is cleared explicitly via :meth:`_slack_mark_healed` whenever a
+        pod stops violating in an iteration — so heal-then-relapse re-fires.
+        """
+        if not self._slack_fire_then_silent:
+            return True
+        sev_key = (severity or '').strip().lower()
+        sev_rank = self._SLACK_SEV_RANK.get(sev_key, 1)
+        state_key = (rule_id or '', ns or '', target or '')
+        prev = self._slack_alert_state.get(state_key)
+        if prev is None:
+            return True
+        if sev_rank > int(prev.get('severity_rank', -1)):
+            return True
+        return False
+
+    def _slack_mark_fired(
+        self,
+        rule_id: str,
+        ns: str,
+        target: str,
+        severity: str,
+        now_ts: float,
+        iteration: int,
+    ) -> None:
+        """Record that a Slack message was just sent for (rule, ns, target)."""
+        sev_key = (severity or '').strip().lower()
+        sev_rank = self._SLACK_SEV_RANK.get(sev_key, 1)
+        state_key = (rule_id or '', ns or '', target or '')
+        self._slack_alert_state[state_key] = {
+            'severity_rank': sev_rank,
+            'severity': severity,
+            'last_sent_ts': now_ts,
+            'iteration': iteration,
+        }
+
+    def _slack_mark_healed(
+        self,
+        rule_id: str,
+        ns: str,
+        target: str,
+    ) -> None:
+        """Drop state for a (rule, ns, target) so the next violation re-fires.
+
+        Called for series that PASS the threshold this iteration after having
+        previously violated — i.e. the pod recovered.
+        """
+        state_key = (rule_id or '', ns or '', target or '')
+        if state_key in self._slack_alert_state:
+            del self._slack_alert_state[state_key]
 
     def _eval_rule_per_series(
         self,
@@ -7124,6 +7472,13 @@ class SmartExecutionController:
         # Dedup by (ns, pod) so a pod with N containers doesn't show up N times
         # in the Slack summary — keep the worst container's value per pod.
         violating_summary_by_pod: Dict[tuple, tuple] = {}  # (ns,pod_or_node) -> (ns,pod,node,value)
+        # Phase 5: separate "this round violated" set from "should send Slack"
+        # set. Every violator goes into the DB / Alerts page; only NEW or
+        # ESCALATED offenders enter ``slack_summary_offenders``.
+        slack_summary_offenders: list = []
+        # Track every (ns, target) we *saw* (whether violating or not) so we
+        # can clear state for ones that healed below threshold this round.
+        targets_seen_this_round: set = set()
         first_violation_for_slack: Optional[Dict] = None
 
         for s in series:
@@ -7138,6 +7493,10 @@ class SmartExecutionController:
             ns = metric.get('namespace', '') or ''
             pod = metric.get('pod', '') or metric.get('container', '') or ''
             node = metric.get('instance', '') or metric.get('node', '') or ''
+            # Track this target so we can heal-clear at the end if it ends
+            # up NOT violating. Use the same dedup key as the Slack summary.
+            target_label = pod or node or '<cluster>'
+            targets_seen_this_round.add((ns, target_label))
 
             # Baseline subtraction for cumulative counters: alert ONLY on
             # increases since execution start. If pod had 4 restarts when we
@@ -7225,6 +7584,15 @@ class SmartExecutionController:
             if first_violation_for_slack is None:
                 first_violation_for_slack = violation
 
+            # Phase 5 Slack gating: this offender only goes into the Slack
+            # summary if it's a NEW (rule, ns, target) combination OR the
+            # severity escalated. Repeat violations at the same severity are
+            # silently dropped — the Alerts page still shows them.
+            target_label = pod or node or '<cluster>'
+            if self._slack_should_fire(rule_id, ns, target_label, severity, now_ts):
+                slack_summary_offenders.append((ns, pod, node, value))
+                self._slack_mark_fired(rule_id, ns, target_label, severity, now_ts, iteration)
+
             logger.warning(
                 f"🚨 Monitoring rule violated: {rule_name}{scope_label} "
                 f"(value={value:.3f} {operator} {threshold})"
@@ -7252,16 +7620,30 @@ class SmartExecutionController:
             except Exception as e:
                 logger.debug(f"persist alert failed for {rule_name}{scope_label}: {e}")
 
+        # ── Phase 5: Heal-and-clear pass ───────────────────────────────
+        # For every (ns, target) we *saw* this round but did NOT add to
+        # ``violating_summary_by_pod``, drop the Slack state. That way the
+        # next time it crosses threshold we re-fire (otherwise a one-time
+        # blip would silence Slack forever for that pod).
+        if self._slack_fire_then_silent:
+            for (ns, target_label) in (targets_seen_this_round - set(violating_summary_by_pod.keys())):
+                self._slack_mark_healed(rule_id, ns, target_label)
+
         # ── ONE rolled-up Slack message per rule per evaluation ──────
         # Per-pod violations all land in `alert_summaries` (UI Alerts page +
         # Report still show every offender). Slack just gets a digest so the
         # channel is signal-rich rather than spammed with 25 near-duplicate
         # messages every iteration.
-        if (not slack_silenced) and first_violation_for_slack and violating_summary_by_pod:
+        #
+        # Phase 5 refinement: ``slack_summary_offenders`` is already filtered
+        # to NEW or ESCALATED entries — repeat violations at the same severity
+        # have been dropped. So if the entire violator list was suppressed,
+        # we send NOTHING (the Alerts page already has the full picture).
+        if (not slack_silenced) and first_violation_for_slack and slack_summary_offenders:
             try:
                 self._send_rule_violation_slack_summary(
                     first_violation_for_slack,
-                    list(violating_summary_by_pod.values()),
+                    list(slack_summary_offenders),
                     is_delta=is_restart_counter,
                 )
             except Exception as e:
@@ -7274,11 +7656,14 @@ class SmartExecutionController:
         if fired or skipped_due_cooldown or skipped_due_baseline:
             if fired or skipped_due_cooldown:
                 self._rule_cooldowns[rule_id] = now_ts
+            slack_total = len(violating_summary_by_pod)
+            slack_sent = len(slack_summary_offenders)
+            slack_suppressed = max(0, slack_total - slack_sent)
             logger.info(
                 f"📋 Rule '{rule_name}' per-series eval: evaluated={evaluated} "
                 f"fired={fired} cooldown_suppressed={skipped_due_cooldown} "
                 f"baseline_suppressed={skipped_due_baseline} "
-                f"slack={'1 summary' if (fired and not slack_silenced) else 'silenced'}"
+                f"slack={'silenced' if slack_silenced else (f'1 summary ({slack_sent} offenders, {slack_suppressed} repeat-suppressed)' if slack_sent else 'fully-suppressed (all repeats)')}"
             )
         return True
 
@@ -7504,19 +7889,40 @@ class SmartExecutionController:
                     else f"{rule_name}{primary['scope_label']}"
                 )
                 logger.warning(f"🚨 Monitoring rule violated: {display_name}")
-                self._log_event('WARNING',
-                                f'Monitoring rule violated: {display_name}',
-                                rule_violation=violation)
-                self._emit_event('monitoring_rule_violated',
-                                 display_name,
-                                 severity=severity.lower(), iteration=iteration,
-                                 metadata={'rule_id': rule_id, 'composite': is_composite})
+                # ── Defensive isolation ──────────────────────────────────
+                # Each of these side-effect helpers (timeline log, SocketIO
+                # emit, DB persist, Slack post) is independent. A failure in
+                # one MUST NOT swallow the others — otherwise an upstream
+                # AttributeError (e.g. ``_event_counter`` missing on a
+                # bypass-init controller, as monitor-only does) silently
+                # prevents the alert from ever reaching ``alert_summaries``,
+                # which is exactly how the "restart rules fire but no DB row"
+                # regression happened.
+                try:
+                    self._log_event('WARNING',
+                                    f'Monitoring rule violated: {display_name}',
+                                    rule_violation=violation)
+                except Exception as e:
+                    logger.debug(f"_log_event failed for '{rule_name}': {e}")
+                try:
+                    self._emit_event('monitoring_rule_violated',
+                                     display_name,
+                                     severity=severity.lower(), iteration=iteration,
+                                     metadata={'rule_id': rule_id, 'composite': is_composite})
+                except Exception as e:
+                    logger.debug(f"_emit_event failed for '{rule_name}': {e}")
 
                 # Persist violation as an alert in alert_summaries
-                self._persist_rule_violation_alert(violation)
+                try:
+                    self._persist_rule_violation_alert(violation)
+                except Exception as e:
+                    logger.warning(f"_persist_rule_violation_alert failed for '{rule_name}': {e}")
 
                 # Send Slack notification for the violation
-                self._send_rule_violation_slack(violation, primary['scope_label'])
+                try:
+                    self._send_rule_violation_slack(violation, primary['scope_label'])
+                except Exception as e:
+                    logger.debug(f"_send_rule_violation_slack failed for '{rule_name}': {e}")
 
             except Exception as e:
                 logger.warning(f"Failed to evaluate monitoring rule '{rule_name}': {e}")
