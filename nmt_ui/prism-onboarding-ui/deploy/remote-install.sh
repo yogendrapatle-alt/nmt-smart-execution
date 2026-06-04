@@ -227,8 +227,16 @@ echo "==> nginx..."
 install_nginx_site "$NGINX_SRC"
 strip_rhel_nginx_conf_welcome_default_server
 nginx -t
-systemctl reload nginx 2>/dev/null || systemctl restart nginx
-systemctl enable nginx
+# systemd services with PrivateTmp=true (nginx on RHEL) need /tmp AND /var/tmp;
+# a missing /var/tmp makes the unit fail to start with 226/NAMESPACE. Ensure it.
+mkdir -p /var/tmp && chmod 1777 /var/tmp 2>/dev/null || true
+restorecon -R /var/tmp 2>/dev/null || true
+# Keep nginx failures from aborting the rest of the deploy (the backend restart
+# below must still run). A clear warning is printed instead of exiting.
+if ! systemctl reload nginx 2>/dev/null; then
+  systemctl restart nginx || echo "WARN: nginx failed to start — check 'journalctl -u nginx -xe' (e.g. missing /var/tmp)"
+fi
+systemctl enable nginx 2>/dev/null || true
 
 if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
   firewall-cmd --permanent --add-service=http 2>/dev/null || true
