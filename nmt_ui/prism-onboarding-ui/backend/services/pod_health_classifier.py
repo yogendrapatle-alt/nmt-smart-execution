@@ -125,10 +125,12 @@ def _envf(name: str, default: float) -> float:
 class ClassifierThresholds:
     """All severity cut-offs in one place. Override per-deployment via env:
 
-      POD_HEALTH_CRIT_PCT          (default 80)   CPU/Mem critical line
-      POD_HEALTH_WATCH_PCT         (default 60)   CPU/Mem watch line
-      POD_HEALTH_CRIT_THROTTLE_PCT (default 50)   CPU throttling critical line
-      POD_HEALTH_WATCH_THROTTLE_PCT(default 25)   CPU throttling watch line
+      POD_HEALTH_CRIT_PCT          (default 80)    CPU/Mem critical line
+      POD_HEALTH_WATCH_PCT         (default 60)    CPU/Mem watch line
+      POD_HEALTH_CRIT_THROTTLE_PCT (default 50)    CPU throttling critical line
+      POD_HEALTH_WATCH_THROTTLE_PCT(default 25)    CPU throttling watch line
+      POD_HEALTH_MIN_CPU_CORES     (default 0.25)  abs-CPU floor for CPU crit
+      POD_HEALTH_MIN_THROTTLE_CORES(default 0.10)  abs-CPU floor for throttle crit
     """
 
     # CPU / memory usage % of limit
@@ -139,6 +141,19 @@ class ClassifierThresholds:
     crit_throttle_pct: float = 50.0
     watch_throttle_pct: float = 25.0
 
+    # Absolute-CPU floors (in cores). "% of limit" and "throttle %" are
+    # relative metrics: a pod with a tiny CPU limit can sit at 100% of that
+    # limit (or a sidecar can be throttled 99%) while consuming a negligible
+    # slice of the node — which is exactly what operators see as "fine" in a
+    # Grafana node/cores view. Those cases are NOT node-significant, so we
+    # refuse to escalate them past WATCH:
+    #   * a pod whose CPU *limit* is below ``min_cpu_cores`` can never be a
+    #     meaningful node CPU consumer → its CPU%/peak-CPU stays ≤ WATCH.
+    #   * a throttled container using fewer than ``min_throttle_cores`` cores
+    #     (e.g. a 22-millicore logging sidecar) → its throttle stays ≤ WATCH.
+    min_cpu_cores: float = 0.25
+    min_throttle_cores: float = 0.10
+
     @classmethod
     def from_env(cls) -> 'ClassifierThresholds':
         return cls(
@@ -146,6 +161,8 @@ class ClassifierThresholds:
             watch_pct=_envf('POD_HEALTH_WATCH_PCT', 60.0),
             crit_throttle_pct=_envf('POD_HEALTH_CRIT_THROTTLE_PCT', 50.0),
             watch_throttle_pct=_envf('POD_HEALTH_WATCH_THROTTLE_PCT', 25.0),
+            min_cpu_cores=_envf('POD_HEALTH_MIN_CPU_CORES', 0.25),
+            min_throttle_cores=_envf('POD_HEALTH_MIN_THROTTLE_CORES', 0.10),
         )
 
     def to_dict(self) -> Dict[str, float]:
@@ -154,6 +171,8 @@ class ClassifierThresholds:
             'watch_pct': self.watch_pct,
             'crit_throttle_pct': self.crit_throttle_pct,
             'watch_throttle_pct': self.watch_throttle_pct,
+            'min_cpu_cores': self.min_cpu_cores,
+            'min_throttle_cores': self.min_throttle_cores,
         }
 
 
@@ -284,6 +303,11 @@ class PodHealth:
     cpu_limit_cores_pod: Optional[float] = None
     memory_limit_mb_pod: Optional[float] = None
     container_count: int = 0
+    # Pod CPU limit (cores) as reported by the ``pod_cpu`` query — i.e. the
+    # exact denominator ``cpu_pct`` was computed against. Kept separate from
+    # the container-aggregated ``cpu_limit_cores_pod`` (v5 table) so the
+    # absolute-CPU floor can gate severity without disturbing that contract.
+    cpu_limit_cores_src: Optional[float] = None
     # v5 — unified pod-table fields. The single table replaces the v4 tiers
     # AND the legacy "Pod Restarts & OOM Kills" / "Pod Stability" / per-pod
     # cluster-infrastructure sub-tables, so every per-pod fact those views
@@ -607,19 +631,24 @@ class PodHealthClassifier:
                 'healthy': len(healthy),
                 'with_restarts_in_run': sum(1 for p in sorted_pods if p.restarts_in_run),
                 'with_oom_in_run': sum(1 for p in sorted_pods if p.oom_in_run),
+                # KPIs key off the CRITICAL signals actually raised (post
+                # absolute-CPU floor) rather than the raw percentages, so a
+                # tiny-limit pod / negligible-core sidecar that was correctly
+                # downgraded to WATCH doesn't inflate the "critical" counters.
                 'with_high_throttle': sum(
                     1 for p in sorted_pods
-                    if (p.cpu_throttle_pct or 0) >= self.thresholds.crit_throttle_pct
+                    if any(s.name == 'throttle' and s.severity == Severity.CRITICAL
+                           for s in p.signals)
                 ),
                 'with_critical_cpu': sum(
                     1 for p in sorted_pods
-                    if (p.cpu_pct or 0) >= self.thresholds.crit_pct
-                    or (p.cpu_pct_max_in_run or 0) >= self.thresholds.crit_pct
+                    if any(s.name in ('cpu', 'cpu_window') and s.severity == Severity.CRITICAL
+                           for s in p.signals)
                 ),
                 'with_critical_memory': sum(
                     1 for p in sorted_pods
-                    if (p.memory_pct or 0) >= self.thresholds.crit_pct
-                    or (p.memory_pct_max_in_run or 0) >= self.thresholds.crit_pct
+                    if any(s.name in ('memory', 'memory_window') and s.severity == Severity.CRITICAL
+                           for s in p.signals)
                 ),
                 # v5 — quick counters the unified-table filter chips key off.
                 'with_issues': sum(1 for p in sorted_pods if p.concern_score > 0),
@@ -661,6 +690,26 @@ class PodHealthClassifier:
             return Severity.WATCH
         return Severity.HEALTHY
 
+    def _apply_cpu_core_floor(
+        self, sev: Severity, limit_cores: Optional[float]
+    ) -> Tuple[Severity, str]:
+        """Downgrade a CPU %-of-limit CRITICAL to WATCH when the pod's CPU
+        limit is below the absolute-CPU floor.
+
+        Rationale: "% of limit" is relative — a pod with a 0.2-core limit can
+        peg 100% of *its* limit while using ~0.2 cores, i.e. ~nothing on the
+        node (and showing as fine in a Grafana node/cores view). Such a pod is
+        not a node-level concern, so it must not be flagged CRITICAL. Returns
+        ``(severity, reason_suffix)`` — the suffix explains the downgrade.
+        """
+        if (sev == Severity.CRITICAL and limit_cores is not None
+                and limit_cores < self.thresholds.min_cpu_cores):
+            return Severity.WATCH, (
+                f" — low abs CPU (limit {limit_cores:.3g}c "
+                f"< {self.thresholds.min_cpu_cores:g}c floor)"
+            )
+        return sev, ''
+
     # ------------------------------------------------------------------
     #  Per-signal mutators
     # ------------------------------------------------------------------
@@ -672,7 +721,16 @@ class PodHealthClassifier:
             pct = row.get('cpu_pct')
             ph.cpu_pct = pct
             ph.cpu_basis = row.get('cpu_basis')
+            # Stash the pod-level CPU limit (cores) so the window-CPU,
+            # concern-score and summary paths can apply the absolute-CPU floor
+            # without re-reading the source array. Stored in a DEDICATED field
+            # (not cpu_limit_cores_pod, which the v5 table aggregates from
+            # containers) so the two semantics don't collide.
+            limit_cores = row.get('cpu_limit_cores')
+            if limit_cores is not None:
+                ph.cpu_limit_cores_src = limit_cores
             sev = self._severity_for_pct(pct)
+            sev, floor_note = self._apply_cpu_core_floor(sev, limit_cores)
             if sev != Severity.HEALTHY:
                 # ``cpu_basis`` ('limit', 'request', or 'unspecified') tells us
                 # which denominator the percentage was computed against — say
@@ -681,7 +739,7 @@ class PodHealthClassifier:
                 basis = row.get('cpu_basis') or 'limit'
                 ph.add(Signal(
                     name='cpu', severity=sev, value=pct,
-                    reason=f"CPU {pct:.1f}% of {basis}",
+                    reason=f"CPU {pct:.1f}% of {basis}{floor_note}",
                 ))
 
     def _apply_pod_memory(self, pods, ch):
@@ -699,6 +757,12 @@ class PodHealthClassifier:
                 ))
 
     def _apply_window_cpu(self, pods, ch):
+        # Pod-level CPU-limit lookup for the absolute-CPU floor (window rows
+        # carry only the peak %, not cores).
+        cpu_limit_by_pod = {
+            (r.get('namespace'), r.get('pod')): r.get('cpu_limit_cores')
+            for r in (ch.get('pod_cpu') or [])
+        }
         for row in (ch.get('window_pod_cpu_max') or []):
             ph = pods.get((row.get('namespace'), row.get('pod')))
             if not ph:
@@ -707,10 +771,14 @@ class PodHealthClassifier:
             ph.cpu_pct_max_in_run = pct
             ph.cpu_pct_max_at = row.get('cpu_pct_max_at')
             sev = self._severity_for_pct(pct)
+            limit_cores = cpu_limit_by_pod.get((row.get('namespace'), row.get('pod')))
+            if limit_cores is None:
+                limit_cores = ph.cpu_limit_cores_src
+            sev, floor_note = self._apply_cpu_core_floor(sev, limit_cores)
             if sev != Severity.HEALTHY:
                 ph.add(Signal(
                     name='cpu_window', severity=sev, value=pct,
-                    reason=f"Peak CPU {pct:.1f}% during run",
+                    reason=f"Peak CPU {pct:.1f}% during run{floor_note}",
                 ))
 
     def _apply_window_memory(self, pods, ch):
@@ -771,6 +839,19 @@ class PodHealthClassifier:
                 entry.get('container', '')
             ] = float(entry.get('cpu_cores') or 0)
 
+        # Pod total CPU usage (cores). Used as a denominator FLOOR so an
+        # incomplete ``container_cpu`` roster (topk truncation or a collection
+        # race) can't collapse the usage-weighted average back to ~max(): if
+        # the roster we summed is smaller than the pod's real total usage, the
+        # missing (un-throttled) cores still count against the average.
+        pod_total_cores: Dict[Tuple[str, str], float] = {}
+        for entry in (ch.get('pod_cpu') or []):
+            c = entry.get('cpu_cores')
+            if c is not None:
+                pod_total_cores[
+                    (entry.get('namespace', ''), entry.get('pod', ''))
+                ] = float(c)
+
         throttle_lookup: Dict[Tuple[str, str, str], float] = {}
         for row in (ch.get('cpu_throttling') or []):
             throttle_lookup[(
@@ -799,6 +880,12 @@ class PodHealthClassifier:
             weight_sum = 0.0
             max_ratio = 0.0
             top_info: Optional[Dict[str, Any]] = None
+            # Whether the worst-throttled container's CPU usage is actually
+            # KNOWN (came from a container_cpu row) vs an unknown placeholder.
+            # The absolute-CPU floor must only downgrade on positive evidence
+            # the container is tiny — never when usage data is merely missing
+            # (that would risk a false negative on a genuinely-starved pod).
+            top_cores_known = False
 
             if containers_in_pod:
                 # Primary path: weighted average across every container
@@ -815,6 +902,7 @@ class PodHealthClassifier:
                             'throttle_ratio': round(ratio, 1),
                             'cpu_cores': round(cores, 3),
                         }
+                        top_cores_known = True
                 # Defensive: pick up containers that have throttling
                 # data but no container_cpu row (rare race during
                 # collection — count them as 0 weight but still surface
@@ -827,6 +915,10 @@ class PodHealthClassifier:
                             'throttle_ratio': round(ratio, 1),
                             'cpu_cores': 0.0,
                         }
+                        top_cores_known = False  # no container_cpu row → unknown
+                # Denominator floor — never let an incomplete roster shrink the
+                # denominator below the pod's actual total usage.
+                weight_sum = max(weight_sum, pod_total_cores.get((ns, pod), 0.0))
             else:
                 # No container_cpu data at all for this pod — fall back to
                 # max() over the throttling rows so we still surface SOMETHING.
@@ -848,6 +940,19 @@ class PodHealthClassifier:
             ph.throttle_top_container = top_info
 
             sev = self._severity_for_throttle(pct)
+            # Absolute-CPU floor: a high throttle % on a container that uses a
+            # negligible slice of CPU (e.g. a 22-millicore logging sidecar) is
+            # not an operational concern — the workload that matters isn't
+            # starved. Keep it visible as WATCH but never escalate to CRITICAL.
+            top_cores = float((top_info or {}).get('cpu_cores') or 0.0)
+            floor_note = ''
+            if (sev == Severity.CRITICAL and top_cores_known
+                    and top_cores < self.thresholds.min_throttle_cores):
+                sev = Severity.WATCH
+                floor_note = (
+                    f" — low abs CPU ({top_cores:.3g}c "
+                    f"< {self.thresholds.min_throttle_cores:g}c floor)"
+                )
             if sev != Severity.HEALTHY:
                 top_note = (
                     f" (top: {top_info.get('container')} "
@@ -857,7 +962,7 @@ class PodHealthClassifier:
                 )
                 ph.add(Signal(
                     name='throttle', severity=sev, value=pct,
-                    reason=f"CPU throttled {pct:.1f}% of scheduling periods{top_note}",
+                    reason=f"CPU throttled {pct:.1f}% of scheduling periods{top_note}{floor_note}",
                 ))
 
     def _apply_restarts(self, pods, ch):
@@ -1344,8 +1449,7 @@ class PodHealthClassifier:
     # ------------------------------------------------------------------
     #  v5 — Concern score (cross-tier, drives unified-table sort)
     # ------------------------------------------------------------------
-    @staticmethod
-    def _concern_score(ph: PodHealth) -> float:
+    def _concern_score(self, ph: PodHealth) -> float:
         """Compute a single 0…N score that ranks pods worst-first across
         the entire cluster. Higher = worse.
 
@@ -1372,15 +1476,26 @@ class PodHealthClassifier:
         if ph.waiting_reason and ph.waiting_reason in _CRITICAL_PHASES:
             score += 220
 
-        # Tier 2 — at-risk (lands somewhere in 100…500)
+        # Tier 2 — at-risk (lands somewhere in 100…500). The absolute-CPU
+        # floors mirror the severity logic: a high throttle % on a negligible-
+        # core container, or a high CPU% on a tiny-limit pod, only earns the
+        # WATCH-tier contribution (not the CRITICAL one) so it can't dominate
+        # the unified-table ordering.
         thr = ph.cpu_throttle_pct or 0
-        if thr >= 50:
+        top_cores = float((ph.throttle_top_container or {}).get('cpu_cores') or 0.0)
+        # Suppress the critical contribution only on positive evidence the
+        # container is tiny (a real, measured 0 < cores < floor). A 0.0 here
+        # means usage was unknown, so we keep the critical weight.
+        throttle_significant = not (0.0 < top_cores < self.thresholds.min_throttle_cores)
+        if thr >= 50 and throttle_significant:
             score += 60 + (thr - 50) * 4
         elif thr >= 25:
             score += 30 + (thr - 25) * 1.2
 
         cpu_peak = ph.cpu_pct_max_in_run or ph.cpu_pct or 0
-        if cpu_peak >= 80:
+        cpu_limit = ph.cpu_limit_cores_src
+        cpu_significant = cpu_limit is None or cpu_limit >= self.thresholds.min_cpu_cores
+        if cpu_peak >= 80 and cpu_significant:
             score += 40 + (cpu_peak - 80) * 3
         elif cpu_peak >= 60:
             score += 15 + (cpu_peak - 60) * 1
