@@ -1882,11 +1882,20 @@ class EnhancedReportService:
         timestamp of the peak. Skips pods with no recorded samples in the
         window (Prometheus only stores series that produced points).
         """
+        # NOTE the ``max_over_time(... limits ...[10m])`` on the denominator.
+        # kube-state-metrics occasionally drops a container's limit series for
+        # a single scrape (pod churn / KSM restart). With a plain per-timestamp
+        # ``sum(limits) by (pod)`` denominator, that momentarily collapses the
+        # pod limit to whatever container's series survived — e.g. just a tiny
+        # 26-millicore logging sidecar — which makes an otherwise-idle pod read
+        # a false 100% peak. Taking the max limit over a 10-minute lookback per
+        # container keeps the denominator stable across such gaps. For a pod
+        # whose limit is genuinely stable this is identical to the raw limit.
         q = (
             'sum(rate(container_cpu_usage_seconds_total'
             '{container!="", container!="POD"}[1m])) by (pod, namespace) / on(pod, namespace) '
-            'sum(kube_pod_container_resource_limits'
-            '{resource="cpu", container!=""}) by (pod, namespace) * 100'
+            'sum(max_over_time(kube_pod_container_resource_limits'
+            '{resource="cpu", container!=""}[10m])) by (pod, namespace) * 100'
         )
         step = self._range_step_for(end_epoch - start_epoch)
         rows = self._prom_range_query(url, q, start_epoch, end_epoch, step=step)
@@ -1928,11 +1937,14 @@ class EnhancedReportService:
         self, url: str, start_epoch: float, end_epoch: float
     ) -> List[Dict]:
         """Per-pod max Memory% (of limit) over the execution window."""
+        # max_over_time on the denominator — see _cov_window_pod_cpu_max for
+        # why (guards against a transient kube-state-metrics limit-series gap
+        # collapsing the pod limit to a single small container).
         q = (
             'sum(container_memory_working_set_bytes'
             '{container!="", container!="POD"}) by (pod, namespace) / on(pod, namespace) '
-            'sum(kube_pod_container_resource_limits'
-            '{resource="memory", container!=""}) by (pod, namespace) * 100'
+            'sum(max_over_time(kube_pod_container_resource_limits'
+            '{resource="memory", container!=""}[10m])) by (pod, namespace) * 100'
         )
         step = self._range_step_for(end_epoch - start_epoch)
         rows = self._prom_range_query(url, q, start_epoch, end_epoch, step=step)
@@ -2045,20 +2057,22 @@ class EnhancedReportService:
         pod_re = '|'.join(_re_escape(c[1]) for c in candidates)
         ns_re = '|'.join(sorted({_re_escape(c[0]) for c in candidates}))
 
+        # max_over_time on the limit denominators — see _cov_window_pod_cpu_max
+        # for the rationale (stable pod limit across transient KSM gaps).
         cpu_q = (
             f'sum(rate(container_cpu_usage_seconds_total'
             f'{{container!="",container!="POD",pod=~"{pod_re}",namespace=~"{ns_re}"}}[1m])) '
             f'by (pod, namespace) / on(pod, namespace) '
-            f'sum(kube_pod_container_resource_limits'
-            f'{{resource="cpu", container!="", pod=~"{pod_re}", namespace=~"{ns_re}"}}) '
+            f'sum(max_over_time(kube_pod_container_resource_limits'
+            f'{{resource="cpu", container!="", pod=~"{pod_re}", namespace=~"{ns_re}"}}[10m])) '
             f'by (pod, namespace) * 100'
         )
         mem_q = (
             f'sum(container_memory_working_set_bytes'
             f'{{container!="",container!="POD",pod=~"{pod_re}",namespace=~"{ns_re}"}}) '
             f'by (pod, namespace) / on(pod, namespace) '
-            f'sum(kube_pod_container_resource_limits'
-            f'{{resource="memory", container!="", pod=~"{pod_re}", namespace=~"{ns_re}"}}) '
+            f'sum(max_over_time(kube_pod_container_resource_limits'
+            f'{{resource="memory", container!="", pod=~"{pod_re}", namespace=~"{ns_re}"}}[10m])) '
             f'by (pod, namespace) * 100'
         )
 
