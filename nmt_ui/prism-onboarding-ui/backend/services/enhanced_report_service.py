@@ -1551,11 +1551,28 @@ class EnhancedReportService:
                         'start': start_iso, 'end': end_iso,
                         'duration_seconds': int(end_epoch - start_epoch),
                     }
+                    # Build STABLE per-pod limit maps from the already-collected
+                    # pod_cpu / pod_memory rows so the window peak % is computed
+                    # against a fixed denominator (avoids the per-timestamp KSM
+                    # limit-gap 100% artifact). pod_cpu carries cpu_limit_cores;
+                    # pod_memory carries memory_limit_mb (→ bytes).
+                    cpu_limits_map: Dict[Tuple[str, str], float] = {}
+                    for r in (health.get('pod_cpu') or []):
+                        lim = r.get('cpu_limit_cores')
+                        if lim:
+                            cpu_limits_map[(r.get('pod', ''), r.get('namespace', ''))] = float(lim)
+                    mem_limits_map: Dict[Tuple[str, str], float] = {}
+                    for r in (health.get('pod_memory') or []):
+                        lim_mb = r.get('memory_limit_mb')
+                        if lim_mb:
+                            mem_limits_map[(r.get('pod', ''), r.get('namespace', ''))] = (
+                                float(lim_mb) * 1024 * 1024
+                            )
                     health['window_pod_cpu_max'] = self._cov_window_pod_cpu_max(
-                        url, start_epoch, end_epoch
+                        url, start_epoch, end_epoch, cpu_limits=cpu_limits_map,
                     )
                     health['window_pod_memory_max'] = self._cov_window_pod_memory_max(
-                        url, start_epoch, end_epoch
+                        url, start_epoch, end_epoch, mem_limits=mem_limits_map,
                     )
                     health['window_restarts'] = self._cov_window_restarts(
                         url, start_epoch, end_epoch
@@ -1874,28 +1891,29 @@ class EnhancedReportService:
         return cpu_rows, mem_rows
 
     def _cov_window_pod_cpu_max(
-        self, url: str, start_epoch: float, end_epoch: float
+        self, url: str, start_epoch: float, end_epoch: float,
+        cpu_limits: Optional[Dict[Tuple[str, str], float]] = None,
     ) -> List[Dict]:
         """Per-pod max CPU% (of limit) over the execution window.
 
-        Range query at 60s step → compute max in Python so we also capture the
-        timestamp of the peak. Skips pods with no recorded samples in the
-        window (Prometheus only stores series that produced points).
+        The numerator (peak CPU *usage* in cores) is queried from Prometheus;
+        the percentage is computed in Python against a STABLE per-pod CPU limit
+        (``cpu_limits``, captured once for the whole report). We deliberately do
+        NOT divide by a per-timestamp ``sum(limits) by (pod)`` inside PromQL:
+        kube-state-metrics intermittently drops a container's limit series for
+        a scrape (pod churn / KSM restart), which momentarily collapses that
+        denominator to whatever container survived — e.g. a tiny 26-millicore
+        logging sidecar — making an idle pod read a false 100% peak (observed
+        on ntnx-ncm-self-service/ncm-calm-2, idle at ~0.025c yet "100%").
+        Dividing by the stable limit removes that class of artifact entirely.
+
+        Pods with no known CPU limit are skipped (can't express "% of limit").
         """
-        # NOTE the ``max_over_time(... limits ...[10m])`` on the denominator.
-        # kube-state-metrics occasionally drops a container's limit series for
-        # a single scrape (pod churn / KSM restart). With a plain per-timestamp
-        # ``sum(limits) by (pod)`` denominator, that momentarily collapses the
-        # pod limit to whatever container's series survived — e.g. just a tiny
-        # 26-millicore logging sidecar — which makes an otherwise-idle pod read
-        # a false 100% peak. Taking the max limit over a 10-minute lookback per
-        # container keeps the denominator stable across such gaps. For a pod
-        # whose limit is genuinely stable this is identical to the raw limit.
+        cpu_limits = cpu_limits or {}
+        # Numerator only: peak CPU usage in cores per pod over the window.
         q = (
             'sum(rate(container_cpu_usage_seconds_total'
-            '{container!="", container!="POD"}[1m])) by (pod, namespace) / on(pod, namespace) '
-            'sum(max_over_time(kube_pod_container_resource_limits'
-            '{resource="cpu", container!=""}[10m])) by (pod, namespace) * 100'
+            '{container!="", container!="POD"}[1m])) by (pod, namespace)'
         )
         step = self._range_step_for(end_epoch - start_epoch)
         rows = self._prom_range_query(url, q, start_epoch, end_epoch, step=step)
@@ -1904,7 +1922,10 @@ class EnhancedReportService:
             m = series.get('metric', {})
             pod = m.get('pod', 'unknown')
             ns = m.get('namespace', 'unknown')
-            best_val = -1.0
+            limit = cpu_limits.get((pod, ns)) or cpu_limits.get((pod, ''))
+            if not limit or limit <= 0:
+                continue  # no stable limit → cannot express as % of limit
+            best_cores = -1.0
             best_ts = 0.0
             for ts_str, val_str in series.get('values', []):
                 try:
@@ -1913,18 +1934,20 @@ class EnhancedReportService:
                     continue
                 if v != v:  # skip NaN
                     continue
-                if v > best_val:
-                    best_val = v
+                if v > best_cores:
+                    best_cores = v
                     try:
                         best_ts = float(ts_str)
                     except (TypeError, ValueError):
                         best_ts = 0.0
-            if best_val < 0:
+            if best_cores < 0:
                 continue
             out.append({
                 'pod': pod,
                 'namespace': ns,
-                'cpu_pct_max': round(min(best_val, 100.0), 2),
+                'cpu_pct_max': round(min((best_cores / limit) * 100.0, 100.0), 2),
+                'cpu_cores_max': round(best_cores, 4),
+                'cpu_limit_cores': round(limit, 4),
                 'cpu_pct_max_at': (
                     datetime.fromtimestamp(best_ts, tz=timezone.utc).isoformat()
                     if best_ts else ''
@@ -1934,24 +1957,32 @@ class EnhancedReportService:
         return out[:POD_COVERAGE_MAX_ROWS]
 
     def _cov_window_pod_memory_max(
-        self, url: str, start_epoch: float, end_epoch: float
+        self, url: str, start_epoch: float, end_epoch: float,
+        mem_limits: Optional[Dict[Tuple[str, str], float]] = None,
     ) -> List[Dict]:
-        """Per-pod max Memory% (of limit) over the execution window."""
-        # max_over_time on the denominator — see _cov_window_pod_cpu_max for
-        # why (guards against a transient kube-state-metrics limit-series gap
-        # collapsing the pod limit to a single small container).
+        """Per-pod max Memory% (of limit) over the execution window.
+
+        Peak working-set BYTES are queried, percentage computed in Python
+        against the STABLE per-pod memory limit — same rationale as
+        ``_cov_window_pod_cpu_max`` (avoids the per-timestamp KSM limit-gap
+        artifact). Pods with no known memory limit are skipped.
+        """
+        mem_limits = mem_limits or {}
         q = (
             'sum(container_memory_working_set_bytes'
-            '{container!="", container!="POD"}) by (pod, namespace) / on(pod, namespace) '
-            'sum(max_over_time(kube_pod_container_resource_limits'
-            '{resource="memory", container!=""}[10m])) by (pod, namespace) * 100'
+            '{container!="", container!="POD"}) by (pod, namespace)'
         )
         step = self._range_step_for(end_epoch - start_epoch)
         rows = self._prom_range_query(url, q, start_epoch, end_epoch, step=step)
         out: List[Dict] = []
         for series in rows:
             m = series.get('metric', {})
-            best_val = -1.0
+            pod = m.get('pod', 'unknown')
+            ns = m.get('namespace', 'unknown')
+            limit = mem_limits.get((pod, ns)) or mem_limits.get((pod, ''))
+            if not limit or limit <= 0:
+                continue
+            best_bytes = -1.0
             best_ts = 0.0
             for ts_str, val_str in series.get('values', []):
                 try:
@@ -1960,18 +1991,18 @@ class EnhancedReportService:
                     continue
                 if v != v:
                     continue
-                if v > best_val:
-                    best_val = v
+                if v > best_bytes:
+                    best_bytes = v
                     try:
                         best_ts = float(ts_str)
                     except (TypeError, ValueError):
                         best_ts = 0.0
-            if best_val < 0:
+            if best_bytes < 0:
                 continue
             out.append({
-                'pod': m.get('pod', 'unknown'),
-                'namespace': m.get('namespace', 'unknown'),
-                'memory_pct_max': round(min(best_val, 100.0), 2),
+                'pod': pod,
+                'namespace': ns,
+                'memory_pct_max': round(min((best_bytes / limit) * 100.0, 100.0), 2),
                 'memory_pct_max_at': (
                     datetime.fromtimestamp(best_ts, tz=timezone.utc).isoformat()
                     if best_ts else ''
